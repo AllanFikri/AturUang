@@ -1,0 +1,8 @@
+PASS — 5 nav items
+PASS — safe hero
+PASS — no expected true income visible
+PASS — no funding gap visible
+PASS — budget Indonesian
+PASS — more page
+PASS — advanced tx
+PASS — V12 title

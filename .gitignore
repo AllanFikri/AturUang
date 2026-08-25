@@ -1,0 +1,52 @@
+# Database & Backups (Contains private live financial data)
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+money_tracks.db
+backups/
+scratch/
+
+# Environments & Secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+*.pem
+*.key
+
+# Sensitive data seeds & exports
+canonical_ledger_seed.csv
+*canonical_ledger_seed*
+*statement*
+*e_statement*
+*financial_plan*
+*private*
+*snapshot*
+cloud/worker/scripts/seed*.sql
+cloud/worker/scripts/*export*.sql
+cloud/worker/scripts/production*.sql
+
+# Python Cache & Build
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Node & Cloudflare
+node_modules/
+.wrangler/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+update_source.json

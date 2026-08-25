@@ -1,0 +1,655 @@
+MONEY TRACKS — LIMA PROMPT LANJUTAN SETELAH PROMPT 11
+
+Urutan wajib:
+1. Prompt 12
+2. Prompt 13A
+3. Prompt 13B
+4. Prompt 14
+5. Prompt 17
+
+Jalankan satu prompt sampai selesai dan verifikasi laporannya sebelum mengirim prompt berikutnya.
+Nomor 15–16 sengaja tidak dibuat. Otomasi operasional diserap ke Prompt 14, sedangkan perencanaan dan penutupan periode diserap ke Prompt 17.
+
+Keputusan arsitektur final:
+- Repository kanonikal: C:\A User Main Storage\Documents\GitHub\AturUang
+- Aplikasi sekarang: Python + Vanilla JS + SQLite lokal.
+- Cloudflare Worker sudah dibuat: aturuang-api.
+- Cloudflare D1 sudah dibuat: aturuang-db.
+- Binding D1 pada Worker: DB.
+- Google Sheets dilarang menjadi database, staging, atau sumber kebenaran.
+- Gmail dibaca Google Apps Script, kemudian dikirim langsung ke Worker.
+- Telegram berkomunikasi langsung dengan Worker melalui webhook.
+- SQLite lokal tetap sumber kebenaran sampai Prompt 14 melakukan cutover resmi.
+- D1 hanya shadow database pada Prompt 13A–13B.
+- Dilarang melakukan dual-write ke SQLite dan D1.
+- Hash SQLite terakhir yang diketahui setelah Prompt 11 adalah 1fa3f6d5d7c87b6dd865ed34afc4458bc5dd8b6601b606a783faaa6306d1f976. Angka ini hanya catatan baseline manusia; jangan hardcode hash produksi ke test umum. Selalu bandingkan hash sebelum dan sesudah eksekusi aktual.
+- Fingerprint finansial terakhir yang diketahui: 1.149 transaksi aktif; Total Aset Likuid Rp2.379.368,80; Dana Darurat teralokasi Rp500.000; Komitmen pasti Rp250.000; Bus PKL Rp650.000 tentative reserve_now=0; Dana Tersedia Rp1.629.368,80. Verifikasi ulang dari database, jangan menganggapnya benar bila data pengguna sudah bertambah.
+
+
+PROMPT 12 — POLA TRANSAKSI, PROYEKSI 7/30 HARI, DAN KESEGARAN DATA
+
+MODE IMPLEMENTASI TERBATAS + HEMAT TOKEN.
+
+Kerjakan di repository kanonikal GitHub. Baca AGENTS.md seluruhnya, lalu baca hanya bagian relevan dari money-tracks-spec.md, audit-tahap-0.md, prompt-antigravity.md, services.py, money_tracks_server.py, app.js, core.js, index.html, dan test terkait. Gunakan rg untuk pencarian. Jangan membaca ulang file yang tidak berkaitan.
+
+Tujuan:
+Menambahkan insight deterministik yang benar-benar membantu keputusan harian tanpa machine learning, tanpa mengubah transaksi, saldo, alokasi, komitmen, atau formula Dana Tersedia.
+
+Jangan:
+- mengubah money_tracks.db;
+- menambah dependency ML, model cloud, tracking, atau telemetry;
+- membuat prediksi sebagai transaksi/komitmen nyata;
+- memasukkan Transfer, Adjustment, Third-party, Historical Research, Pass-through legacy, soft-deleted, reversal, atau transaksi provisional ke pola belanja pribadi;
+- mengubah Safe-to-Spend/Dana Tersedia;
+- melakukan deploy Cloudflare;
+- membuat tabel produksi baru jika kebutuhan dapat dihitung read-only;
+- menebak pola dengan support kurang dari 3.
+
+A. BASELINE
+1. Pastikan working tree bersih atau identifikasi perubahan pengguna dan jangan menimpanya.
+2. Catat HEAD, path database, hash dinamis sebelum kerja, integrity_check, foreign_key_check, jumlah transaksi aktif, saldo setiap Owned account, alokasi, komitmen, utang/piutang, dan KPI dashboard.
+3. Semua test mutasi wajib memakai database temporary/in-memory.
+
+B. KONTRAK DATA ELIGIBLE
+1. Pola kategori dan rekening hanya belajar dari transaksi:
+   - money_context='Personal';
+   - status Confirmed atau Auto-classified;
+   - is_deleted=0;
+   - bukan Adjustment, Third-party, Historical Research, atau Pass-through legacy.
+2. Expense dipakai untuk pola pengeluaran; Income dipakai untuk pola pemasukan; Transfer dianalisis terpisah hanya sebagai kebiasaan perpindahan rekening dan tidak disebut belanja.
+3. Gunakan normalisasi counterparty yang sudah ada. Jangan membuat normalizer paralel.
+4. Terapkan chronological cutoff: rekomendasi/proyeksi untuk tanggal D dilarang memakai transaksi setelah D.
+
+C. DETEKSI TRANSAKSI RUTIN
+1. Buat service murni/read-only untuk mendeteksi pola dengan minimum support 3.
+2. Identitas pola minimal mempertimbangkan transaction_type, normalized counterparty, account_from/account_to yang relevan, dan kategori.
+3. Hitung median nominal, rentang nominal, median interval hari, tanggal terakhir, tanggal perkiraan berikutnya, support, dan confidence yang dapat dijelaskan.
+4. Pola bulanan boleh memakai jendela tanggal kalender, bukan asumsi tepat 30 hari.
+5. Bila variasi interval/nominal terlalu besar, abstain.
+6. Jangan membuat upcoming otomatis. Tampilkan sebagai "Pola terdeteksi" dan beri aksi opsional "Buat komitmen" yang tetap membutuhkan konfirmasi pengguna.
+
+D. PROYEKSI 7 DAN 30 HARI
+1. Buat proyeksi arus keluar dan masuk 7/30 hari dari:
+   - upcoming Confirmed/Tentative sesuai reserve_now;
+   - pola rutin yang memenuhi confidence;
+   - bukan target tujuan yang belum didanai.
+2. Deduplicate pola rutin terhadap upcoming nyata berdasarkan tipe, normalized counterparty/title, nominal bertoleransi, dan jendela tanggal.
+3. Pisahkan hasil:
+   - komitmen pasti;
+   - komitmen tentatif;
+   - perkiraan transaksi rutin;
+   - pemasukan perkiraan.
+4. Forecast tidak boleh mengubah Dana Tersedia dan tidak boleh dicatat sebagai transaksi.
+5. Tampilkan rentang/skenario, bukan satu angka seolah pasti.
+
+E. DETEKSI KEJANGGALAN RINGAN
+1. Tandai nominal yang jauh dari median merchant/pola historis hanya bila support memadai.
+2. Gunakan aturan robust yang dapat diuji, misalnya median dan MAD/rasio; jangan memakai model black-box.
+3. Label harus "Perlu dicek", bukan "Salah" atau "Fraud".
+4. Tidak ada koreksi otomatis.
+
+F. KESEGARAN DATA
+1. Tampilkan tanggal/jam transaksi ledger terbaru dan selisih waktunya terhadap WIB sekarang.
+2. Jika belum ada connector, sumber diberi label "Input manual" dan bukan "Tersinkron".
+3. Sediakan kontrak respons source_freshness yang kelak dapat menerima Gmail dan Telegram tanpa merombak UI.
+4. Jangan mengklaim data mutakhir bila connector belum berjalan.
+
+G. API DAN UI
+1. Tambahkan endpoint read-only terpusat, misalnya /api/insights, yang mengembalikan recurring_patterns, forecast_7d, forecast_30d, anomalies, dan source_freshness.
+2. Tambahkan panel ringkas pada Beranda atau Laporan; jangan menambah menu utama baru.
+3. Prioritaskan paling banyak 3 insight penting, dengan tombol "Lihat rincian".
+4. Gunakan istilah Indonesia kanonis, esc() untuk semua teks dinamis, focus-visible, ARIA, loading, empty state, dan tampilan mobile.
+5. Jangan membuat angka forecast menyerupai saldo aktual.
+
+H. TEST WAJIB
+Buat test_prompt12_insights.py yang mengimpor kode produksi dan mencakup minimal:
+1. Support <3 menghasilkan abstain.
+2. Pola bulanan lintas jumlah hari bulan.
+3. Tidak ada future leakage.
+4. Transfer tidak menjadi belanja.
+5. Third-party/Historical/Pass-through/Adjustment/deleted/provisional terisolasi.
+6. Dedup forecast versus upcoming.
+7. Goal target belum didanai tidak masuk forecast maupun Dana Tersedia.
+8. Forecast tidak memutasi database.
+9. Anomali nominal dan kasus MAD nol.
+10. WIB dan batas tanggal 7/30 hari.
+11. Respons API stabil dan semua teks dinamis aman.
+12. Hash produksi sebelum/sesudah identik.
+
+Jalankan test baru, seluruh regression suite yang ada, run_prompt2_all.py, run_smoke_tests.py, python -m compileall -q ., dan git diff --check.
+
+I. DOKUMENTASI DAN COMMIT
+1. Perbarui money-tracks-spec.md, audit-tahap-0.md, dan prompt-antigravity.md secara ringkas.
+2. Commit hanya jika seluruh test hijau:
+   feat(insights): tambah pola transaksi dan proyeksi deterministik
+3. Jangan memasukkan data privat, hasil profiling mentah, atau database ke Git.
+
+STOP CONDITION:
+Jika forecast mengubah KPI, terjadi future leakage, atau database produksi berubah, rollback perubahan eksekusi yang tidak sah, jangan commit, dan laporkan blocker.
+
+FORMAT JAWABAN MAKSIMAL 300 KATA:
+Verdict; rumus/kontrak; fitur UI; test; hash/integritas; file; commit; blocker.
+
+
+PROMPT 13A — FONDASI CLOUDFLARE, AUTENTIKASI DASAR, DAN MIGRASI SHADOW D1
+
+MODE IMPLEMENTASI CLOUD TERBATAS + HEMAT TOKEN.
+
+Kondisi Cloudflare yang sudah dibuat pengguna:
+- Worker: aturuang-api
+- D1: aturuang-db
+- Binding: DB
+- Worker saat ini hanya Hello World.
+- Akun Cloudflare sudah terhubung ke GitHub, tetapi repository belum boleh dijadikan deployment production sebelum struktur cloud lolos test.
+
+Tujuan:
+Membangun backend Cloudflare berbasis repository, memigrasikan snapshot logis SQLite ke D1 sebagai shadow database, dan membuktikan parity read-only. SQLite lokal tetap sumber kebenaran. Belum ada cutover dan belum ada dual-write.
+
+Jangan:
+- mengubah atau menulis money_tracks.db;
+- menghapus server Python lokal;
+- mengaktifkan write route finansial publik;
+- menjadikan D1 sumber kebenaran;
+- membuat Google Sheets;
+- menaruh token, database ID, password, email, chat ID, atau secret di Git;
+- mengedit Worker manual dari dashboard setelah source repository tersedia;
+- menyalin frontend menjadi dua versi permanen;
+- menurunkan aturan finansial, toleransi 0,005, atomicity, idempotency, dan audit trail;
+- menganggap SHA file SQLite harus sama dengan D1. Gunakan logical fingerprint.
+
+A. PREFLIGHT
+1. Baca AGENTS.md, spesifikasi formula Prompt 11, skema db.py, service finansial, route produksi, dan test invarian; jangan membaca file tidak relevan.
+2. Catat HEAD, working tree, hash dinamis SQLite, integrity/FK, seluruh row count, max ID, aggregate amount/budget_effect per bulan, saldo, snapshots, reconciliations, debts/events, upcoming, allocation_goals, idempotency, dan KPI.
+3. Buat backup kanonis memakai backup_db(), bukan copy mentah saat WAL aktif.
+4. Pastikan Wrangler authentication dilakukan melalui browser/CLI resmi. Bila login manual diperlukan, berhenti hanya pada langkah tersebut dan berikan satu instruksi jelas. Jangan meminta user mengirim token ke chat.
+
+B. STRUKTUR REPOSITORY CLOUD
+1. Buat subtree terisolasi, misalnya cloud/worker/, berisi TypeScript, wrangler config, migrations, scripts, tests, dan README operasional.
+2. Gunakan Cloudflare Workers standard Fetch API dan dependency minimum. Framework hanya boleh dipakai bila ada manfaat terukur dan dijelaskan.
+3. Pin versi dependency dan commit lockfile. npm/build step hanya berlaku pada subtree cloud; aplikasi lokal tetap no-build.
+4. Konfigurasi name=aturuang-api dan binding DB. Ambil database_id secara lokal melalui Wrangler; jangan tampilkan atau hardcode secret.
+5. Tambahkan environment MODE=shadow. Dalam mode ini seluruh route yang dapat mengubah ledger harus ditolak dengan 503 SHADOW_READ_ONLY.
+
+C. MIGRASI SKEMA D1
+1. Konversi skema SQLite aktif ke migration SQL D1 berurutan dan idempoten.
+2. Pertahankan nama tabel/kolom, primary key, foreign key, unique constraint, CHECK yang kompatibel, indeks, status, audit trail, canonical_id, operation_key/idempotency, reversal, allocation_goals, upcoming reserve_now/linked_goal_id, debt events, snapshots, dan reconciliation.
+3. Jangan menghapus metadata legacy yang masih diperlukan untuk membaca histori.
+4. Terapkan REAL, pembulatan dua desimal, dan tolerance 0,005 sama seperti lokal sampai ada migrasi nominal terpisah di masa depan.
+5. Buat schema_migrations yang mencatat versi sekali saja.
+
+D. EXPORT DAN IMPORT SHADOW
+1. Buat exporter deterministik yang membaca SQLite dalam mode read-only dan menghasilkan paket import D1 tanpa mengubah sumber.
+2. Urutkan parent sebelum child, pertahankan ID dan nilai NULL, serta jangan menyertakan secrets.
+3. Import ke D1 hanya setelah dry-run pada D1 lokal/miniflare lulus.
+4. Import remote harus idempoten dan mempunyai operation/migration key. Pengulangan tidak boleh menggandakan baris.
+5. Setelah import, D1 tetap shadow read-only.
+
+E. READ API PARITY
+1. Port service read-only minimum untuk dashboard, accounts, transactions/filter, reports, budgets, upcoming, debts/events, allocation goals, reconciliation status, balance reconstruction, insights Prompt 12, dan health/schema version.
+2. Jangan menyalin rumus ke banyak handler. Buat modul domain terpusat.
+3. Tanggal, batas bulan, dan current time wajib Asia/Jakarta.
+4. Jangan mengekspos raw source_refs, email body, notes sensitif, internal errors, atau stack traces ke client.
+5. Semua query harus parameterized.
+
+F. AUTENTIKASI DASAR STAGING
+1. Seluruh endpoint shadow selain /health dilindungi token admin staging yang disimpan sebagai Wrangler secret, bukan source code.
+2. Terapkan constant-time comparison, generic 401, no token logging, dan CORS default deny.
+3. Jangan membangun login production final di tahap ini; itu dikerjakan Prompt 14 bersama Telegram login/session.
+4. Tambahkan security headers dasar dan redaksi log.
+
+G. PARITY GATE
+Bandingkan SQLite vs D1 menggunakan logical fingerprint:
+1. Jumlah baris, max ID, soft delete, dan aggregate per tabel.
+2. Total amount/budget_effect per bulan.
+3. Semua saldo akun.
+4. Balance reconstruction setiap Owned account.
+5. Total aset likuid, Dana Darurat/tujuan teralokasi, komitmen efektif, Titipan, Dana Tersedia.
+6. Debts outstanding dan debt event signed balance.
+7. Upcoming Confirmed/Tentative dan reserve_now.
+8. Snapshot, reconciliation, reversal, canonical_id, dan idempotency uniqueness.
+9. Respons JSON golden untuk bulan berjalan, lampau, dan mendatang.
+Semua nominal harus identik sampai 2 desimal; toleransi perbandingan <0,005.
+
+H. TEST WAJIB
+Buat test cloud yang mencakup:
+1. Migration fresh dan migration ulang no-op.
+2. Export source benar-benar read-only.
+3. Import ulang tidak duplikat.
+4. Semua foreign key/unique/check penting.
+5. Read API parity.
+6. Shadow write routes ditolak.
+7. Query injection dan path traversal ditolak.
+8. Token staging salah/hilang ditolak dan tidak tercatat di log.
+9. Timezone/batas bulan WIB.
+10. D1 failure menghasilkan respons aman.
+11. Database produksi lokal hash sebelum/sesudah identik.
+12. Seluruh suite lokal tetap hijau.
+
+I. DEPLOY STAGING
+1. Deploy Worker aturuang-api hanya dalam MODE=shadow setelah semua test lulus.
+2. Verifikasi binding DB dan /health schema version.
+3. Jangan menghubungkan auto-deploy GitHub ke production branch dahulu.
+4. Jangan mengaktifkan frontend publik atau write route.
+
+J. DOKUMENTASI DAN COMMIT
+1. Tambahkan docs/cloud-architecture.md, runbook migration, threat model ringkas, dan rollback plan.
+2. Perbarui dokumen roadmap.
+3. Commit terpisah bila lulus:
+   feat(cloud): tambah Worker dan migrasi shadow D1
+   docs(cloud): catat parity dan runbook shadow
+
+STOP CONDITION:
+Jika satu fingerprint berbeda, satu write route terbuka, secret masuk diff/log, atau SQLite berubah, jangan lanjut deploy/cutover. Laporkan mismatch tepat dan biarkan D1 sebagai shadow.
+
+FORMAT JAWABAN MAKSIMAL 350 KATA:
+Verdict; preflight/backup; struktur; migration; parity; auth; deployment; tests; hash SQLite; commits; manual action; blocker.
+
+
+PROMPT 13B — INGESTION 24/7: GMAIL APPS SCRIPT DAN TELEGRAM BOT
+
+MODE IMPLEMENTASI CONNECTOR TERBATAS + HEMAT TOKEN.
+
+Prasyarat:
+- Prompt 13A PASS.
+- Worker aturuang-api berjalan MODE=shadow.
+- D1 aturuang-db terikat sebagai DB.
+- SQLite lokal masih sumber kebenaran.
+- Connector hanya boleh menulis raw event/candidate staging di D1; belum boleh mengubah ledger finansial sampai cutover Prompt 14.
+
+Tujuan:
+Menangkap notifikasi Gmail dan input Telegram selama 24/7 tanpa laptop, secara idempoten, privat, dapat diaudit, dan human-in-the-loop. Google Sheets tidak digunakan.
+
+Jangan:
+- membaca seluruh mailbox tanpa filter;
+- mengirim email body/attachment yang tidak diperlukan;
+- mencatat token bot, Apps Script secret, email, nomor rekening lengkap, chat ID, atau payload mentah ke log/Git;
+- auto-confirm screenshot atau teks ambigu;
+- memposting candidate ke ledger selama MODE=shadow;
+- memakai OCR berbayar/cloud tambahan;
+- memakai thread-level Gmail label sebagai satu-satunya dedupe;
+- mengubah email pengguna;
+- menjadikan Apps Script sumber kebenaran.
+
+A. SKEMA INGESTION D1
+Tambahkan migration untuk:
+1. raw_events: source, external_id, received_at, occurred_at, payload minimal terenkripsi/teredaksi bila perlu, checksum, parser_version, state.
+2. ingestion_candidates: raw_event_id, proposed type/amount/accounts/category/context/person/date/time, confidence per field, status Pending/Approved/Rejected/AutoApproved/Applied, reasons, reviewed_at, applied_transaction_id.
+3. source_sync_state: source, last_attempt_at, last_success_at, last_event_at, cursor/checkpoint, status, error_code aman.
+4. ingestion_audit_log: append-only transition tanpa secret/PII sensitif.
+5. Unique(source, external_id), checksum guard, operation key, dan state-transition constraints.
+
+B. ENDPOINT WORKER
+Implementasikan minimal:
+1. POST /api/ingest/gmail
+2. POST /api/telegram/webhook
+3. GET /api/ingestion/pending
+4. POST /api/ingestion/{id}/approve
+5. POST /api/ingestion/{id}/reject
+6. GET /api/sources/freshness
+Dalam MODE=shadow, approve hanya boleh mengubah status review; dilarang membuat transaksi ledger.
+
+C. KEAMANAN GMAIL RELAY
+1. Apps Script menandatangani body dengan HMAC-SHA256 atas timestamp + nonce + raw body.
+2. Worker menolak timestamp basi, nonce replay, signature salah, content type salah, payload terlalu besar, dan sender/source tak dikenal.
+3. Shared secret disimpan di Apps Script PropertiesService dan Wrangler secret.
+4. Jangan menampilkan secret di output. Buat instruksi user satu kali untuk memasukkannya melalui UI/CLI resmi.
+
+D. GOOGLE APPS SCRIPT TANPA SHEETS
+1. Buat integrations/gmail-apps-script/Code.gs, appsscript.json, parser fixtures tersanitasi, dan SETUP.md.
+2. Trigger time-driven setiap 5–10 menit.
+3. Gmail query harus menggunakan allowlist sender/domain/subject bank yang benar-benar dipakai pengguna.
+4. Ambil message ID, internal date, from, subject, dan body text minimum yang diperlukan parser.
+5. Gunakan message ID sebagai external_id; PropertiesService hanya checkpoint optimasi, sedangkan unique key D1 tetap otoritas dedupe.
+6. Bila pengiriman gagal, jangan tandai selesai permanen; retry dengan exponential backoff terbatas.
+7. Jangan membuat spreadsheet.
+
+E. PARSER EMAIL
+1. Satu adapter per sumber; jangan satu regex universal.
+2. Mulai hanya dari fixture notifikasi yang tersedia dan terverifikasi. Jangan mengarang pola BCA/Jago/e-wallet.
+3. Ekstrak nominal dengan format Indonesia, tanggal/jam WIB, debit/kredit, reference ID, rekening tersamarkan, merchant/tujuan, dan biaya admin bila tersedia.
+4. Simpan parser_version dan alasan confidence.
+5. Bila account mapping, arah dana, atau nominal ambigu, status Pending.
+6. Email yang identik/retry tidak boleh menghasilkan candidate kedua.
+
+F. TELEGRAM BOT
+1. Token dibuat pengguna melalui BotFather dan dimasukkan langsung sebagai secret; jangan meminta token dikirim ke chat atau commit.
+2. Set webhook HTTPS ke Worker dengan secret_token; validasi header X-Telegram-Bot-Api-Secret-Token.
+3. Allowlist satu Telegram user_id/chat_id milik pengguna. Tolak yang lain tanpa membocorkan data.
+4. Dukungan minimum:
+   - /status: kesehatan connector tanpa data sensitif berlebih;
+   - /saldo: ringkasan setelah autentikasi;
+   - /pending: candidate menunggu review;
+   - /batal: membatalkan draft terakhir;
+   - teks terstruktur pemasukan/pengeluaran/transfer;
+   - inline Approve/Reject pada candidate;
+   - callback idempotent.
+5. Contoh teks: "keluar 12000 dari ShopeePay untuk makan" dan "transfer 100000 BCA Main ke Jago".
+6. Foto/screenshot disimpan sebagai Telegram file_id + metadata minimal untuk bukti. Tanpa OCR, bot harus meminta nominal, akun, tipe, dan tanggal yang belum jelas. Jangan auto-confirm hanya dari gambar.
+7. Pesan bot memakai istilah Indonesia kanonis dan tidak menampilkan nomor rekening penuh.
+
+G. KEBIJAKAN AUTO-APPROVAL UNTUK PROMPT 14
+Implementasikan decision function dan test, tetapi jangan apply ledger saat MODE=shadow.
+AutoApproved hanya boleh bila seluruh syarat terpenuhi:
+1. sender exact allowlist;
+2. parser fixture/version teruji;
+3. external reference, tanggal, nominal, arah, dan akun unik tersedia;
+4. tidak ada duplicate/collision;
+5. semua field wajib confidence tinggi;
+6. bukan utang/piutang/titipan, cash, screenshot, atau transaksi ambigu;
+7. transfer internal terpasang sebagai satu transaksi Transfer, bukan Income+Expense.
+Selain itu wajib Pending.
+
+H. SOURCE FRESHNESS DAN NOTIFIKASI
+1. Update last_attempt, last_success, last_event, status, dan error code.
+2. Dashboard Prompt 12 membaca D1 source state ketika cloud aktif.
+3. Telegram hanya memberi notifikasi untuk candidate pending, auto-approval penting, connector gagal/stale, komitmen jatuh tempo, dan rekonsiliasi; jangan spam setiap scan kosong.
+
+I. TEST WAJIB
+Buat test fixture dan integration untuk minimal:
+1. HMAC valid/salah/kedaluwarsa/replay.
+2. Gmail message retry idempoten.
+3. Dua message dalam thread tetap diproses terpisah.
+4. Parser BCA fixture aktual dan format nominal Indonesia.
+5. Unknown sender dan ambiguous direction masuk Pending/ditolak sesuai kontrak.
+6. Transfer internal tidak menjadi dua transaksi.
+7. Telegram user asing ditolak.
+8. Telegram callback replay tidak mengubah state dua kali.
+9. Screenshot tanpa metadata tidak auto-confirm.
+10. Secret dan PII tidak muncul dalam log/API.
+11. Source freshness sukses/gagal/stale.
+12. MODE=shadow tidak pernah menambah/mengubah transactions/accounts/snapshots/allocation/debt.
+13. D1 failure dapat retry tanpa duplicate.
+14. SQLite produksi hash sebelum/sesudah identik.
+
+J. DEPLOY DAN MANUAL SETUP
+1. Deploy connector endpoint hanya setelah test lulus.
+2. Berikan checklist singkat untuk user:
+   - membuat Apps Script project;
+   - mengisi Script Properties;
+   - membuat trigger;
+   - membuat Telegram Bot;
+   - mengisi Wrangler secrets;
+   - memasang webhook.
+3. Jangan meminta user menempelkan secret ke percakapan.
+4. Lakukan smoke test menggunakan payload fixture, bukan transaksi produksi.
+
+K. COMMIT
+Commit hanya bila lulus:
+   feat(ingestion): tambah Gmail relay dan Telegram review bot
+   docs(ingestion): tambah setup connector privat
+
+STOP CONDITION:
+Jika connector menulis ledger dalam MODE=shadow, membaca Gmail di luar allowlist, menerima Telegram user asing, atau menyebabkan duplicate, rollback deployment connector dan jangan commit status selesai.
+
+FORMAT JAWABAN MAKSIMAL 350 KATA:
+Verdict; schema/endpoints; Gmail; Telegram; security; tests; deployment; secrets/manual actions; SQLite hash; commits; blocker.
+
+
+PROMPT 14 — CUTOVER CLOUD, WEB ONLINE, OTOMASI, BACKUP, DAN RELEASE
+
+MODE MIGRASI PRODUKSI TERKENDALI + HEMAT TOKEN.
+
+Prasyarat wajib:
+- Prompt 12, 13A, dan 13B PASS.
+- D1 shadow parity 100% terhadap SQLite pada logical fingerprint.
+- Gmail dan Telegram staging idempoten.
+- Worker aturuang-api dan binding DB benar.
+- Tidak ada secret di Git/log.
+
+Tujuan:
+Menyelesaikan port write-path, membuat aplikasi Money Tracks dapat dipakai 24/7 tanpa laptop, melakukan cutover satu kali dari SQLite ke D1, mengaktifkan connector secara aman, serta menyediakan backup dan rollback. Setelah cutover, D1 menjadi satu-satunya sumber kebenaran produksi; SQLite dipertahankan sebagai backup read-only.
+
+Jangan:
+- melakukan cutover bila satu test/parity check gagal;
+- menjalankan dual-write;
+- menghapus/menimpa SQLite lokal atau backup;
+- membuka API finansial tanpa autentikasi;
+- mengekspos app publik sebelum auth/session/CSRF/rate guard lulus;
+- menyimpan backup atau secrets di Git;
+- mengaktifkan auto-approval longgar;
+- membuat tag/release publik tanpa instruksi pengguna;
+- mengubah formula finansial Prompt 11 dan Prompt 12.
+
+A. PRE-CUTOVER FREEZE DAN BACKUP
+1. Tetapkan maintenance window singkat dan hentikan server lokal/write input.
+2. Catat HEAD, hash dinamis, integrity/FK, logical fingerprint lengkap, dan waktu cutoff WIB.
+3. Buat backup kanonis SQLite via backup_db() dan verifikasi dapat dipulihkan.
+4. Ekspor D1 shadow sebelum final sync.
+5. Identifikasi raw event/candidate setelah snapshot awal agar tidak hilang.
+
+B. PORT WRITE-PATH PRODUKSI
+Port seluruh operasi yang digunakan UI, bukan hanya happy path:
+1. create/edit/reversal/delete transaction;
+2. transfer internal;
+3. reconcile/anchor/snapshot;
+4. accounts;
+5. budgets/categories;
+6. upcoming create/link/unlink/skip/pay;
+7. allocation goals fund/release/spend;
+8. debts and debt events;
+9. ingestion approval/apply;
+10. idempotency requests;
+11. audit logs.
+Gunakan D1 batch/transaction semantics yang benar sehingga operasi multi-tabel atomik. Semua route mutasi wajib idempotency key, validasi state, dan audit event.
+
+C. AUTH PRODUCTION TANPA LAYANAN BERBAYAR
+1. Gunakan Telegram allowlisted sebagai faktor login dashboard:
+   - browser meminta one-time code;
+   - pengguna mengonfirmasi kode melalui bot;
+   - code satu kali, short-lived, hashed, dan terikat browser attempt;
+   - Worker menerbitkan session cookie HttpOnly, Secure, SameSite=Strict.
+2. Terapkan session expiry/revoke, CSRF protection pada semua write request, origin validation, login throttling, dan generic error.
+3. Sediakan recovery credential offline sekali pakai, tampilkan hanya saat setup dan jangan log/commit.
+4. Health publik hanya mengembalikan status umum tanpa saldo/schema detail.
+
+D. FRONTEND ONLINE SATU SUMBER
+1. Gunakan frontend Vanilla JS/CSS yang sama, bukan membuat dashboard Tailwind/Apps Script baru.
+2. Refactor static assets ke satu direktori bersama bila diperlukan sehingga lokal dan cloud tidak memiliki dua UI yang divergen.
+3. Utamakan Workers Static Assets dan same-origin API untuk menghindari CORS/cookie complexity. Gunakan Pages hanya bila ada batas teknis yang dibuktikan.
+4. Hilangkan endpoint localhost hardcoded; gunakan relative API origin.
+5. Pertahankan responsive UI, format Rupiah, ARIA, focus trap, loading, istilah kanonis, no-cache untuk shell versi baru, dan version marker.
+6. Tambahkan halaman/status koneksi yang jujur: Online, Sinkronisasi tertunda, Connector stale, atau Offline read-only.
+
+E. FINAL SYNC DAN CUTOVER
+1. Buat final export SQLite setelah freeze.
+2. Import delta secara idempoten ke D1.
+3. Rekonsiliasi raw/candidate connector yang tiba selama freeze.
+4. Jalankan logical parity lengkap lagi.
+5. Ubah MODE shadow menjadi production hanya jika seluruh gate lulus.
+6. Aktifkan write routes dan ingestion apply secara bersamaan setelah cutover marker tercatat.
+7. Local START_MONEY_TRACKS.bat tidak boleh membuka server write lama. Ubah menjadi pembuka URL cloud atau beri nama launcher lokal sebagai emergency-read-only.
+8. Jangan menghapus folder/repository/database lokal.
+
+F. INGESTION PRODUCTION
+1. Candidate high-confidence sesuai aturan 13B boleh AutoApproved dan Applied tepat sekali.
+2. Candidate lain masuk review Telegram/dashboard.
+3. Approval membuat transaksi melalui service kanonis yang sama dengan UI manual.
+4. Bila posting gagal, state tetap retryable dan tidak menandai Applied.
+5. Auto-post selalu mengirim ringkasan Telegram dengan tombol koreksi/reversal, bukan silent mutation.
+
+G. SCHEDULER DAN NOTIFIKASI
+Gunakan Cloudflare Cron/trigger yang relevan untuk:
+1. source stale check;
+2. upcoming due reminder;
+3. daily pending review digest;
+4. forecast 7 hari ringkas;
+5. backup health check;
+6. cleanup nonce/session/idempotency retention.
+Semua jadwal menggunakan Asia/Jakarta dan idempoten. Hindari notifikasi saat tidak ada perubahan.
+
+H. BACKUP DAN RECOVERY
+1. Gunakan D1 Time Travel bila tersedia pada plan aktif, tetapi jangan menjadikannya satu-satunya backup.
+2. Buat logical export berkala melalui workflow/cron resmi, enkripsi sebelum penyimpanan, dan jangan commit file backup.
+3. Sediakan manual download backup dari dashboard yang memerlukan re-auth.
+4. Tetapkan retensi yang masuk akal dan dokumentasikan recovery point.
+5. Recovery drill pada database/environment temporary harus membuktikan row count, aggregate, balances, goals, debts, transactions, candidates, dan idempotency identik.
+
+I. OBSERVABILITY DAN PRIVASI
+1. Log hanya request ID, route, status, latency, safe error code, parser version, dan event ID tersamarkan.
+2. Dilarang log deskripsi transaksi, email body, token, cookie, nomor rekening, Telegram payload mentah, atau saldo penuh.
+3. Tambahkan alert Telegram untuk repeated auth failure, connector stale, backup gagal, dan invariant failure.
+4. Sediakan /health internal terautentikasi untuk schema version, last backup, last source sync, dan queue count.
+
+J. TEST DAN RELEASE GATE
+Wajib menguji minimal:
+1. Seluruh write-path parity lokal vs D1 pada database temporary.
+2. Atomic rollback setiap operasi multi-tabel.
+3. Concurrent duplicate idempotency.
+4. Reconciliation dan balance reconstruction.
+5. Formula Prompt 11 dan insight Prompt 12.
+6. Ingestion auto/pending/reject/reversal.
+7. Telegram login code replay/expiry/wrong user.
+8. CSRF, CORS/origin, session revoke, brute-force throttle.
+9. Static assets/API same version.
+10. Desktop dan mobile browser.
+11. Recovery drill.
+12. Final SQLite–D1 logical parity pada cutoff.
+13. Seluruh regression suite lokal.
+14. Tidak ada secret/PII dalam git diff dan logs.
+
+K. GITHUB DAN DEPLOYMENT
+1. Jadikan repository GitHub satu-satunya source code cloud.
+2. Aktifkan deployment hanya setelah branch/config/build command benar dan staging pass.
+3. Production deployment harus berasal dari commit terverifikasi, bukan dashboard editor.
+4. Simpan Cloudflare credentials hanya di encrypted GitHub/Cloudflare secrets dengan least privilege.
+5. Uji rollback ke deployment sebelumnya tanpa memulihkan data secara destruktif.
+
+L. DOKUMENTASI DAN COMMIT
+1. Perbarui spec, audit, roadmap, cloud runbook, incident response, backup/restore, dan user guide.
+2. Commit yang disarankan bila lulus:
+   feat(cloud): port write path dan autentikasi production
+   chore(release): cutover Money Tracks ke Cloudflare D1
+   docs(release): catat runbook cloud dan recovery
+3. Jangan membuat tag tanpa instruksi pengguna.
+
+STOP CONDITION:
+Satu mismatch nominal >=0,005, route tak terlindungi, atomicity gagal, connector duplicate, backup tak dapat dipulihkan, atau local DB termutasi tak terencana membatalkan cutover. Pertahankan MODE=shadow dan laporkan blocker.
+
+FORMAT JAWABAN MAKSIMAL 400 KATA:
+Verdict; backup/freeze; parity; auth; frontend; ingestion; scheduler; recovery; tests; deployment URL tanpa secret; commits; local DB status; manual HP check; blocker.
+
+
+PROMPT 17 — TUJUAN KEUANGAN, RENCANA KONTRIBUSI, DAN PENUTUPAN BULANAN
+
+MODE IMPLEMENTASI PRODUK TERBATAS + HEMAT TOKEN.
+
+Prasyarat:
+- Prompt 14 PASS dan D1 sudah menjadi sumber kebenaran tunggal.
+- Connector Gmail/Telegram sehat.
+- Backup dan rollback teruji.
+
+Tujuan:
+Membantu pengguna merencanakan Dana Darurat, tujuan jangka pendek/panjang, dan komitmen rutin tanpa mencampur target dengan uang yang benar-benar dialokasikan; sekaligus menyediakan monthly close yang menjaga ledger dapat diaudit.
+
+Jangan:
+- mengurangi Dana Tersedia hanya karena target dibuat;
+- menganggap piutang sebagai aset likuid;
+- membuat transaksi, transfer, atau kontribusi otomatis tanpa konfirmasi;
+- mengubah histori in-place setelah bulan ditutup;
+- memaksa target Pernikahan atau target lain dibuat tanpa input pengguna;
+- membuat investasi/rekomendasi finansial personal otomatis;
+- menggunakan ML;
+- merusak formula Prompt 11.
+
+A. KONTRAK TUJUAN KEUANGAN
+1. Bedakan:
+   - target_amount: jumlah yang ingin dicapai;
+   - allocated_amount: uang yang benar-benar dialokasikan;
+   - funding plan: rencana kontribusi masa depan;
+   - linked account: lokasi uang, bukan sumber status alokasi.
+2. Hanya allocated_amount yang mengurangi Dana Tersedia.
+3. Transfer antar Owned account netral terhadap Total Aset dan alokasi.
+4. Fund/release/spend goal harus berupa allocation event append-only dengan audit trail dan idempotency.
+5. Goal kind minimum: Emergency, ShortTerm, LongTerm, dan SinkingFund.
+6. Status minimum: Draft, Active, Paused, Completed, Cancelled.
+
+B. RENCANA KONTRIBUSI
+1. Pengguna dapat memilih target date, nominal target, allocated awal, frekuensi, dan kontribusi rencana.
+2. Sistem menghitung kebutuhan kontribusi per minggu/bulan, gap, progress, dan perkiraan tanggal tercapai.
+3. Hasil adalah saran, bukan pemindahan uang otomatis.
+4. Bila kemampuan dana tidak cukup, tampilkan selisih dan opsi menurunkan nominal/memperpanjang waktu; jangan menyatakan gagal.
+5. Dana Darurat memakai milestone bertahap yang dapat dikonfigurasi, bukan angka universal yang dipaksakan.
+
+C. KAITAN DENGAN KOMITMEN DAN FORECAST
+1. Goal linked ke upcoming mengurangi komitmen efektif hanya sebesar allocated coverage aktif.
+2. Hindari double deduction antara goal allocation, upcoming, dan forecast.
+3. Tentative reserve_now=0 tetap tidak memotong Dana Tersedia.
+4. Forecast 7/30 hari menunjukkan planned contribution terpisah dari confirmed commitment.
+5. Pembayaran komitmen yang covered mengonsumsi allocation secara atomik dan menjaga invarian Dana Tersedia sesuai kontrak.
+
+D. MONTHLY CLOSE
+Sebelum bulan ditutup, checklist wajib:
+1. semua sumber menunjukkan freshness yang dapat diterima atau diberi acknowledgement;
+2. seluruh Owned account direkonsiliasi atau memiliki alasan belum;
+3. pending ingestion direview atau ditunda secara eksplisit;
+4. duplicate/invariant check bersih;
+5. commitments, debts, titipan, dan goals diverifikasi;
+6. monthly income/expense/category aggregate disimpan sebagai snapshot laporan;
+7. backup berhasil.
+
+E. LOCK, REOPEN, DAN BACKDATED EVENT
+1. Setelah close, data bulan tidak boleh diedit in-place.
+2. Koreksi memakai reversal/correction event dengan audit trail.
+3. Reopen memerlukan re-auth, alasan wajib, timestamp, dan audit log.
+4. Backdated transaction ke bulan closed harus ditolak atau melalui controlled reopen; jangan diam-diam mengubah laporan.
+5. Closing ulang membuat versi baru, tidak menghapus snapshot lama.
+
+F. UI
+1. Tambahkan halaman atau subhalaman "Rencana" hanya bila audit navigasi membuktikan perlu; alternatifnya integrasikan ke Anggaran/Lainnya tanpa duplikasi.
+2. Tampilkan:
+   - Dana Darurat;
+   - tujuan aktif;
+   - progress funded vs target;
+   - kebutuhan kontribusi;
+   - upcoming terkait;
+   - forecast impact;
+   - status monthly close.
+3. Bedakan jelas "Target", "Sudah Dialokasikan", dan "Rencana Setoran".
+4. Gunakan nominal utuh, format Rupiah, mobile responsive, accessible labels, loading, empty/error state.
+5. Jangan menggunakan progress bar yang menyesatkan saat allocated > liquid balance atau data stale; tampilkan warning.
+
+G. TELEGRAM
+Tambahkan command/aksi aman:
+1. /rencana untuk ringkasan tujuan;
+2. /alokasi untuk membuat draft allocation yang harus dikonfirmasi;
+3. /tutupbulan untuk menampilkan checklist, bukan langsung menutup;
+4. Approve close hanya setelah re-auth dan seluruh gate lulus;
+5. Jangan menampilkan data sensitif ke chat selain allowlisted.
+
+H. TEST WAJIB
+Buat suite yang menguji minimal:
+1. target tanpa allocation tidak mengurangi Dana Tersedia.
+2. funding/release/spend goal akurat dan idempoten.
+3. transfer antar Owned netral.
+4. partial coverage dan anti-double deduction upcoming.
+5. tentative reserve_now=0.
+6. planned contribution hanya forecast.
+7. goal complete/cancel/pause transitions.
+8. close ditolak bila pending/freshness/reconciliation/backup gate gagal.
+9. close berhasil membuat immutable versioned snapshot.
+10. edit bulan closed ditolak.
+11. correction/reopen memiliki audit trail.
+12. timezone dan batas bulan WIB.
+13. concurrency dan atomic rollback.
+14. Telegram command authorization/idempotency.
+15. seluruh KPI finansial dan historical reports tidak berubah tanpa event sah.
+16. recovery dari backup mempertahankan close snapshots dan allocation events.
+
+I. DOKUMENTASI DAN COMMIT
+1. Perbarui spec, audit, roadmap, user guide, dan monthly-close runbook.
+2. Commit hanya setelah seluruh test cloud dan lokal hijau:
+   feat(planning): tambah tujuan keuangan dan monthly close
+   docs(planning): catat aturan tujuan dan penutupan periode
+3. Jangan membuat target finansial produksi atas nama pengguna pada tahap implementasi; gunakan fixture temporary.
+
+STOP CONDITION:
+Jika target non-funded mengurangi Dana Tersedia, bulan closed masih dapat diedit tanpa audit, goal/upcoming terpotong dua kali, atau produksi berubah karena test, jangan commit dan laporkan blocker.
+
+FORMAT JAWABAN MAKSIMAL 350 KATA:
+Verdict; contract tujuan; monthly close; UI/Telegram; tests; backup/integritas; files; commits; manual checks; blocker.
+
+
+CATATAN UNTUK PENGGUNA
+
+Kirim prompt satu per satu. Jangan mengirim kelimanya sekaligus ke Antigravity.
+Setelah setiap jawaban Antigravity, verifikasi laporannya sebelum lanjut. Jangan memberikan token Cloudflare, token Telegram, shared secret Apps Script, database ID, recovery credential, atau isi email ke percakapan. Masukkan secret hanya melalui Cloudflare/Wrangler, GitHub Secrets, Apps Script Properties, atau BotFather sesuai instruksi resmi.
