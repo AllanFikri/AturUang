@@ -1,4 +1,5 @@
-# Database & Backups (Contains private live financial data)
+# Runtime Directory (Contains private live financial database and backups)
+runtime/
 *.db
 *.db-*
 *.sqlite
