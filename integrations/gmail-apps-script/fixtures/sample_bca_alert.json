@@ -1,0 +1,6 @@
+{
+  "from": "notifikasi@bca.co.id",
+  "subject": "Notifikasi Transaksi m-BCA",
+  "body": "Transaksi Rekening 1234567890: Pembayaran QRIS sebesar Rp 45.000,00 di Warung Nasi tanggal 25/08/2026 12:30:00 BERHASIL.",
+  "internal_date": "2026-08-25T05:30:00.000Z"
+}

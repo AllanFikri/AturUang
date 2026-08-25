@@ -1,4 +1,4 @@
-// domain.ts: Modul domain kalkulasi finansial AturUang untuk D1
+// domain.ts: Modul domain kalkulasi finansial AturUang untuk D1 dan Parser Ingestion
 import { Env } from "./auth";
 
 export function round2(num: number): number {
@@ -47,39 +47,43 @@ export async function reconstructBalance(
   // 1. Get latest anchor snapshot
   const snapRes = await db
     .prepare(
-      `SELECT snapshot_date, snapshot_time, balance, snapshot_kind 
-       FROM balance_snapshots 
-       WHERE account_name = ? AND snapshot_date <= ? AND snapshot_kind = 'anchor'
-       ORDER BY snapshot_date DESC, snapshot_time DESC, id DESC LIMIT 1`
+      `SELECT snapshot_date, snapshot_time, balance, snapshot_kind
+       FROM balance_snapshots
+       WHERE account_name = ? AND snapshot_date <= ? AND is_anchor = 1
+       ORDER BY snapshot_date DESC, snapshot_time DESC LIMIT 1`
     )
     .bind(accountName, targetDate)
     .first<{ snapshot_date: string; snapshot_time: string; balance: number; snapshot_kind: string }>();
 
-  let anchorDate = "1970-01-01";
-  let anchorTime = "00:00:00";
-  let anchorBal = 0.0;
-
-  if (snapRes) {
-    anchorDate = snapRes.snapshot_date;
-    anchorTime = snapRes.snapshot_time || "00:00:00";
-    anchorBal = Number(snapRes.balance || 0);
+  if (!snapRes) {
+    return {
+      status: "unverifiable",
+      calculated_balance: 0.0,
+      anchor_balance: 0.0,
+      anchor_date: "",
+    };
   }
 
-  // 2. Sum mutations after anchor
-  const mutRes = await db
+  const anchorDate = snapRes.snapshot_date;
+  const anchorTime = snapRes.snapshot_time || "00:00:00";
+  const anchorBal = Number(snapRes.balance || 0);
+
+  // 2. Sum delta since anchor
+  const sumRes = await db
     .prepare(
-      `SELECT 
-         COALESCE(SUM(CASE WHEN transaction_type = 'Income' AND account_to = ? THEN amount ELSE 0 END), 0) -
-         COALESCE(SUM(CASE WHEN transaction_type = 'Expense' AND account_from = ? THEN amount ELSE 0 END), 0) +
-         COALESCE(SUM(CASE WHEN transaction_type = 'Transfer' AND account_to = ? THEN amount 
-                           WHEN transaction_type = 'Transfer' AND account_from = ? THEN -amount ELSE 0 END), 0) +
-         COALESCE(SUM(CASE WHEN transaction_type = 'Adjustment' AND account_to = ? THEN amount 
-                           WHEN transaction_type = 'Adjustment' AND account_from = ? THEN -amount ELSE 0 END), 0) as net_mutation
+      `SELECT
+         COALESCE(SUM(CASE
+           WHEN to_account = ? THEN amount
+           WHEN account = ? AND transaction_type = 'Income' THEN amount
+           WHEN account = ? AND transaction_type = 'Expense' THEN -amount
+           WHEN account = ? AND transaction_type = 'Transfer' THEN -amount
+           ELSE 0
+         END), 0) as delta
        FROM transactions
-       WHERE is_deleted = 0 
+       WHERE (account = ? OR to_account = ?)
+         AND is_deleted = 0
          AND (date > ? OR (date = ? AND time > ?))
-         AND date <= ?
-         AND (account_from = ? OR account_to = ?)`
+         AND date <= ?`
     )
     .bind(
       accountName,
@@ -91,203 +95,329 @@ export async function reconstructBalance(
       anchorDate,
       anchorDate,
       anchorTime,
-      targetDate,
-      accountName,
-      accountName
+      targetDate
     )
-    .first<{ net_mutation: number }>();
+    .first<{ delta: number }>();
 
-  const netMutation = Number(mutRes?.net_mutation || 0);
-  const calculatedBalance = round2(anchorBal + netMutation);
+  const delta = Number(sumRes?.delta || 0);
+  const calculated = round2(anchorBal + delta);
 
   return {
-    status: snapRes ? "verified" : "unverifiable",
-    calculated_balance: calculatedBalance,
+    status: "verified",
+    calculated_balance: calculated,
     anchor_balance: anchorBal,
     anchor_date: anchorDate,
   };
 }
 
-export async function getDashboard(db: D1Database, monthParam?: string): Promise<Record<string, any>> {
-  const { dateStr: todayStr, monthStr: currentMonth } = getWibDate();
-  const selectedMonth = monthParam && /^\d{4}-\d{2}$/.test(monthParam) ? monthParam : currentMonth;
-
-  // 1. Total liquid balance from active Owned accounts
-  const liquidRes = await db
-    .prepare(
-      `SELECT COALESCE(SUM(current_balance), 0) as total_liquid
-       FROM accounts WHERE active = 1 AND kind = 'Owned'`
-    )
-    .first<{ total_liquid: number }>();
-  const totalLiquid = round2(Number(liquidRes?.total_liquid || 0));
-
-  // 2. Goal & Emergency Fund Allocations
-  const allocRes = await db
-    .prepare(
-      `SELECT COALESCE(SUM(allocated_amount), 0) as total_allocated,
-              COALESCE(SUM(CASE WHEN name = 'Dana Darurat' THEN allocated_amount ELSE 0 END), 0) as emergency_fund
-       FROM allocation_goals WHERE status = 'Active'`
-    )
-    .first<{ total_allocated: number; emergency_fund: number }>();
-  const totalAllocated = round2(Number(allocRes?.total_allocated || 0));
-  const emergencyFund = round2(Number(allocRes?.emergency_fund || 0));
-
-  // 3. Upcoming Obligations (Confirmed vs Tentative)
-  const upRes = await db
-    .prepare(
-      `SELECT 
-         COALESCE(SUM(CASE WHEN status = 'Confirmed' THEN amount ELSE 0 END), 0) as confirmed_outflow,
-         COALESCE(SUM(CASE WHEN status = 'Tentative' AND reserve_now = 1 THEN amount ELSE 0 END), 0) as tentative_reserved,
-         COALESCE(SUM(CASE WHEN status = 'Tentative' AND reserve_now = 0 THEN amount ELSE 0 END), 0) as tentative_unreserved
-       FROM upcoming WHERE status IN ('Upcoming', 'Confirmed', 'Tentative')`
-    )
-    .first<{ confirmed_outflow: number; tentative_reserved: number; tentative_unreserved: number }>();
-
-  const confirmedObligations = round2(Number(upRes?.confirmed_outflow || 0));
-  const tentativeReserved = round2(Number(upRes?.tentative_reserved || 0));
-  const tentativeUnreserved = round2(Number(upRes?.tentative_unreserved || 0));
-
-  // Safe-to-Spend (Dana Tersedia Saat Ini) Formula Prompt 11
-  const safeToSpend = round2(totalLiquid - totalAllocated - confirmedObligations - tentativeReserved);
-
-  // 4. Monthly Inflow & Outflow for selected month
-  const monthlyRes = await db
-    .prepare(
-      `SELECT 
-         COALESCE(SUM(CASE WHEN transaction_type = 'Income' AND money_context = 'Personal' THEN amount ELSE 0 END), 0) as income,
-         COALESCE(SUM(CASE WHEN transaction_type = 'Expense' AND money_context = 'Personal' THEN amount ELSE 0 END), 0) as expense
-       FROM transactions 
-       WHERE is_deleted = 0 AND date LIKE ?`
-    )
-    .bind(`${selectedMonth}%`)
-    .first<{ income: number; expense: number }>();
-
-  const monthIncome = round2(Number(monthlyRes?.income || 0));
-  const monthExpense = round2(Number(monthlyRes?.expense || 0));
-  const netCashflow = round2(monthIncome - monthExpense);
-
-  // Months available
-  const monthsRows = await db
-    .prepare(
-      `SELECT DISTINCT substr(date, 1, 7) as m FROM transactions 
-       WHERE is_deleted = 0 ORDER BY m DESC`
-    )
-    .all<{ m: string }>();
-  const months = (monthsRows.results || []).map((r) => r.m);
-
-  return {
-    kpis: {
-      safeToSpend: safeToSpend,
-      totalBalance: totalLiquid,
-      allocatedGoals: totalAllocated,
-      emergencyFund: emergencyFund,
-      confirmedObligations: confirmedObligations,
-      tentativeReserved: tentativeReserved,
-      tentativeUnreserved: tentativeUnreserved,
-      monthIncome: monthIncome,
-      monthExpense: monthExpense,
-      netCashflow: netCashflow,
-      selectedMonth: selectedMonth,
-      asOfDate: todayStr,
-    },
-    months: months,
-  };
-}
-
-export async function getAccountsList(db: D1Database): Promise<Record<string, any>> {
-  const accountsRes = await db
-    .prepare(
-      `SELECT name, kind, type, current_balance, balance_date, last_reconciled_at, active 
-       FROM accounts ORDER BY kind ASC, name ASC`
-    )
-    .all();
-
-  return {
-    status: "ok",
-    accounts: accountsRes.results || [],
-  };
-}
-
-export async function getTransactionsList(
+export async function computeDashboardKpis(
   db: D1Database,
-  limit = 50,
-  offset = 0,
-  monthParam?: string
-): Promise<Record<string, any>> {
-  let query = `SELECT * FROM transactions WHERE is_deleted = 0`;
-  const params: any[] = [];
+  monthStr?: string
+): Promise<{
+  safeToSpend: number;
+  totalBalance: number;
+  protectedSavings: number;
+  passThroughOutstanding: number;
+  currentCommitments: number;
+  goalsAllocated: number;
+  periodStart: string;
+  periodEnd: string;
+}> {
+  const curMonth = monthStr || getWibDate().monthStr;
+  const periodStart = `${curMonth}-01`;
+  const periodEnd = `${curMonth}-31`;
 
-  if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
-    query += ` AND date LIKE ?`;
-    params.push(`${monthParam}%`);
+  // 1. Total Liquid Balance
+  const balRes = await db
+    .prepare("SELECT COALESCE(SUM(current_balance), 0) as total FROM accounts WHERE active = 1 AND kind = 'Owned'")
+    .first<{ total: number }>();
+  const totalBalance = round2(Number(balRes?.total || 0));
+
+  // 2. Dana Darurat & Goals Allocated
+  const goalsRes = await db
+    .prepare("SELECT COALESCE(SUM(allocated_amount), 0) as total_goals FROM allocation_goals")
+    .first<{ total_goals: number }>();
+  const goalsAllocated = round2(Number(goalsRes?.total_goals || 0));
+
+  // 3. Protected Savings
+  const protRes = await db
+    .prepare("SELECT COALESCE(SUM(amount), 0) as total_prot FROM protected_allocations WHERE status = 'Active'")
+    .first<{ total_prot: number }>();
+  const protectedSavings = round2(Number(protRes?.total_prot || 0) + goalsAllocated);
+
+  // 4. Pass-through outstanding
+  const ptRes = await db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN transaction_type = 'Income' THEN amount ELSE -amount END), 0) as pt_net
+       FROM transactions
+       WHERE money_context = 'Pass-through' AND is_deleted = 0`
+    )
+    .first<{ pt_net: number }>();
+  const passThroughOutstanding = round2(Math.max(0, Number(ptRes?.pt_net || 0)));
+
+  // 5. Confirmed Commitments (Upcoming active)
+  const commRes = await db
+    .prepare(
+      `SELECT COALESCE(SUM(amount), 0) as total_comm
+       FROM upcoming
+       WHERE status = 'Upcoming' AND due_date <= ?`
+    )
+    .bind(periodEnd)
+    .first<{ total_comm: number }>();
+  const currentCommitments = round2(Number(commRes?.total_comm || 0));
+
+  // 6. Safe to Spend
+  const safeToSpend = round2(totalBalance - protectedSavings - passThroughOutstanding - currentCommitments);
+
+  return {
+    safeToSpend,
+    totalBalance,
+    protectedSavings,
+    passThroughOutstanding,
+    currentCommitments,
+    goalsAllocated,
+    periodStart,
+    periodEnd,
+  };
+}
+
+// =====================================================================
+// INGESTION & PARSER DOMAIN
+// =====================================================================
+
+export interface ParsedCandidate {
+  tx_type: "Income" | "Expense" | "Transfer";
+  amount: number;
+  account: string;
+  to_account?: string | null;
+  category: string;
+  money_context: "Personal" | "Pass-through" | "Historical Research" | "Third-party";
+  person_name?: string | null;
+  date: string;
+  time?: string | null;
+  confidence_score: number;
+  reasons: string;
+  status: "Pending" | "AutoApproved";
+}
+
+export function parseIndonesianAmount(text: string): number | null {
+  // Matches Rp 50.000,00 or Rp. 120.000 or IDR 75,000 or 50.000
+  const match = text.match(/(?:Rp\.?|IDR)?\s*([\d\.,]+)/i);
+  if (!match) return null;
+
+  let raw = match[1].trim();
+  // If ends with ,00 or ,50 (Indonesian cents)
+  if (/,\d{2}$/.test(raw)) {
+    raw = raw.replace(/\./g, "").replace(",", ".");
+  } else if (/\.\d{2}$/.test(raw)) {
+    raw = raw.replace(/,/g, "");
+  } else {
+    // Treat dots and commas as thousand separators
+    raw = raw.replace(/[\.,]/g, "");
   }
 
-  query += ` ORDER BY date DESC, time DESC, id DESC LIMIT ? OFFSET ?`;
-  params.push(limit, offset);
+  const parsed = parseFloat(raw);
+  return isNaN(parsed) || parsed <= 0 ? null : round2(parsed);
+}
 
-  const stmt = db.prepare(query);
-  const res = await stmt.bind(...params).all();
+export function parseGmailNotification(
+  subject: string,
+  bodyText: string,
+  fromAddress: string,
+  occurredAt?: string
+): ParsedCandidate {
+  const wib = getWibDate(occurredAt ? new Date(occurredAt) : new Date());
+  const cleanSubject = (subject || "").toLowerCase();
+  const cleanBody = (bodyText || "").toLowerCase();
+  const cleanFrom = (fromAddress || "").toLowerCase();
 
+  // 1. BCA Adapter
+  if (cleanFrom.includes("bca") || cleanSubject.includes("bca") || cleanBody.includes("m-bca")) {
+    let tx_type: "Income" | "Expense" | "Transfer" = "Expense";
+    let amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+    let account = "BCA Main";
+    let to_account: string | null = null;
+    let category = "Other / Miscellaneous";
+    let confidence = 0.95;
+    let reasons = "BCA Alert: parsed standard transaction notification.";
+
+    if (cleanBody.includes("transfer ke") || cleanBody.includes("debit") || cleanBody.includes("qris")) {
+      tx_type = "Expense";
+      if (cleanBody.includes("qris") || cleanBody.includes("resto") || cleanBody.includes("makan") || cleanBody.includes("cafe")) {
+        category = "Main Meals";
+      } else if (cleanBody.includes("spbu") || cleanBody.includes("pertamina") || cleanBody.includes("shell")) {
+        category = "Fuel";
+      }
+    } else if (cleanBody.includes("transfer dari") || cleanBody.includes("kredit") || cleanBody.includes("masuk")) {
+      tx_type = "Income";
+      category = "Other / Miscellaneous";
+    }
+
+    if (amount <= 0) {
+      confidence = 0.4;
+      reasons = "BCA Alert: could not extract exact amount.";
+    }
+
+    const autoStatus = confidence >= 0.85 ? "AutoApproved" : "Pending";
+
+    return {
+      tx_type,
+      amount,
+      account,
+      to_account,
+      category,
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: confidence,
+      reasons,
+      status: autoStatus,
+    };
+  }
+
+  // 2. Generic / Unknown Adapter
+  const amount = parseIndonesianAmount(bodyText) || 0;
   return {
-    status: "ok",
-    transactions: res.results || [],
+    tx_type: cleanBody.includes("masuk") ? "Income" : "Expense",
+    amount,
+    account: "BCA Main",
+    to_account: null,
+    category: "Other / Miscellaneous",
+    money_context: "Personal",
+    person_name: null,
+    date: wib.dateStr,
+    time: wib.timeStr,
+    confidence_score: 0.4,
+    reasons: `Unknown sender '${fromAddress}'. Requires manual review.`,
+    status: "Pending",
   };
 }
 
-export async function getGoalsSummary(db: D1Database): Promise<Record<string, any>> {
-  const res = await db.prepare(`SELECT * FROM allocation_goals ORDER BY priority ASC, id ASC`).all();
+export function parseTelegramText(text: string, referenceDate?: string): ParsedCandidate {
+  const wib = getWibDate(referenceDate ? new Date(referenceDate) : new Date());
+  const clean = text.trim();
+
+  // Pattern 1: Transfer "transfer 100000 BCA Main ke Jago" or "tf 50k bca ke jago"
+  const tfMatch = clean.match(/(?:transfer|tf)\s+([\d\.,kK]+)\s+(?:dari\s+)?([a-zA-Z0-9\s:]+?)\s+ke\s+([a-zA-Z0-9\s:]+)/i);
+  if (tfMatch) {
+    let amtStr = tfMatch[1].toLowerCase().replace("k", "000");
+    const amount = parseIndonesianAmount(amtStr) || 0;
+    const fromAcc = normalizeAccountName(tfMatch[2].trim());
+    const toAcc = normalizeAccountName(tfMatch[3].trim());
+
+    return {
+      tx_type: "Transfer",
+      amount,
+      account: fromAcc,
+      to_account: toAcc,
+      category: "Other / Miscellaneous",
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: amount > 0 ? 0.95 : 0.4,
+      reasons: "Telegram: Internal transfer command.",
+      status: amount > 0 ? "AutoApproved" : "Pending",
+    };
+  }
+
+  // Pattern 2: Expense "keluar 12000 dari ShopeePay untuk makan" / "bayar 25000 pakai BCA untuk bensin"
+  const expMatch = clean.match(/(?:keluar|bayar|beli)\s+([\d\.,kK]+)\s+(?:dari|pakai|via)\s+([a-zA-Z0-9\s:]+?)\s+(?:untuk|buat)\s+(.+)/i);
+  if (expMatch) {
+    let amtStr = expMatch[1].toLowerCase().replace("k", "000");
+    const amount = parseIndonesianAmount(amtStr) || 0;
+    const account = normalizeAccountName(expMatch[2].trim());
+    const category = inferCategory(expMatch[3].trim());
+
+    return {
+      tx_type: "Expense",
+      amount,
+      account,
+      to_account: null,
+      category,
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: amount > 0 ? 0.95 : 0.4,
+      reasons: "Telegram: Structured expense command.",
+      status: amount > 0 ? "AutoApproved" : "Pending",
+    };
+  }
+
+  // Pattern 3: Income "masuk 500000 ke BCA dari bonus"
+  const incMatch = clean.match(/(?:masuk|terima|dapat)\s+([\d\.,kK]+)\s+(?:ke|di)\s+([a-zA-Z0-9\s:]+?)(?:\s+(?:dari|untuk)\s+(.+))?$/i);
+  if (incMatch) {
+    let amtStr = incMatch[1].toLowerCase().replace("k", "000");
+    const amount = parseIndonesianAmount(amtStr) || 0;
+    const account = normalizeAccountName(incMatch[2].trim());
+
+    return {
+      tx_type: "Income",
+      amount,
+      account,
+      to_account: null,
+      category: "Other / Miscellaneous",
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: amount > 0 ? 0.90 : 0.4,
+      reasons: "Telegram: Structured income command.",
+      status: amount > 0 ? "AutoApproved" : "Pending",
+    };
+  }
+
+  // Ambiguous / Unstructured
+  const rawAmt = parseIndonesianAmount(clean) || 0;
   return {
-    status: "success",
-    goals: res.results || [],
+    tx_type: "Expense",
+    amount: rawAmt,
+    account: "BCA Main",
+    to_account: null,
+    category: "Other / Miscellaneous",
+    money_context: "Personal",
+    person_name: null,
+    date: wib.dateStr,
+    time: wib.timeStr,
+    confidence_score: 0.3,
+    reasons: "Telegram: Ambiguous unstructured text. Requires manual review.",
+    status: "Pending",
   };
 }
 
-export async function getUpcomingList(db: D1Database): Promise<Record<string, any>> {
-  const res = await db.prepare(`SELECT * FROM upcoming ORDER BY due_date ASC, id ASC`).all();
-  return {
-    status: "ok",
-    upcoming: res.results || [],
-  };
+function normalizeAccountName(name: string): string {
+  const n = name.toLowerCase();
+  if (n.includes("shopee")) return "ShopeePay";
+  if (n.includes("gopay")) return "GoPay";
+  if (n.includes("jago")) return "Jago Main";
+  if (n.includes("bca poket") || n.includes("tabungan")) return "BCA Poket: Tabungan";
+  if (n.includes("bca")) return "BCA Main";
+  if (n.includes("cash") || n.includes("tunai")) return "Cash";
+  return name;
 }
 
-export async function getDebtsList(db: D1Database): Promise<Record<string, any>> {
-  const debts = await db.prepare(`SELECT * FROM debts ORDER BY id ASC`).all();
-  const events = await db.prepare(`SELECT * FROM debt_events ORDER BY event_date ASC, id ASC`).all();
-  return {
-    status: "success",
-    debts: debts.results || [],
-    events: events.results || [],
-  };
+function inferCategory(text: string): string {
+  const t = text.toLowerCase();
+  if (t.includes("makan") || t.includes("lunch") || t.includes("dinner") || t.includes("sarapan")) return "Main Meals";
+  if (t.includes("snack") || t.includes("jajan") || t.includes("cemilan")) return "Snacks";
+  if (t.includes("kopi") || t.includes("cafe") || t.includes("minum")) return "Cafe & Drinks";
+  if (t.includes("bensin") || t.includes("pertalite") || t.includes("pertamax")) return "Fuel";
+  if (t.includes("parkir") || t.includes("tol")) return "Parking/Toll";
+  if (t.includes("pulsa") || t.includes("kuota") || t.includes("internet")) return "Phone & Internet";
+  if (t.includes("langganan") || t.includes("subscription")) return "Subscriptions";
+  if (t.includes("obat") || t.includes("dokter") || t.includes("klinik")) return "Health";
+  return "Other / Miscellaneous";
 }
 
-export async function getInsightsSummary(db: D1Database, asOfDate?: string): Promise<Record<string, any>> {
-  const targetDate = asOfDate || getWibDate().dateStr;
-
-  // Source Freshness
-  const lastTx = await db
-    .prepare(
-      `SELECT date, time FROM transactions 
-       WHERE is_deleted = 0 AND date <= ? 
-       ORDER BY date DESC, time DESC, id DESC LIMIT 1`
-    )
-    .bind(targetDate)
-    .first<{ date: string; time: string }>();
-
-  const latestDate = lastTx?.date || targetDate;
-  const latestTime = lastTx?.time || "00:00";
-
-  return {
-    status: "ok",
-    insights: {
-      as_of_date: targetDate,
-      source_freshness: {
-        latest_transaction_date: latestDate,
-        latest_transaction_time: latestTime,
-        source_name: "Input manual",
-        status_label: "Input manual",
-        is_sync_connector_active: false,
-        message: `Catatan transaksi terbaru: ${latestDate} ${latestTime} WIB via input manual.`,
-      },
-    },
-  };
+export function evaluateAutoApproval(candidate: ParsedCandidate, senderAllowed: boolean): "AutoApproved" | "Pending" {
+  if (!senderAllowed) return "Pending";
+  if (candidate.confidence_score < 0.85) return "Pending";
+  if (!candidate.amount || candidate.amount <= 0) return "Pending";
+  if (!candidate.account || !candidate.date) return "Pending";
+  if (candidate.money_context !== "Personal") return "Pending";
+  if (candidate.tx_type === "Transfer" && !candidate.to_account) return "Pending";
+  return "AutoApproved";
 }
