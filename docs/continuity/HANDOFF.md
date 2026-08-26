@@ -213,31 +213,31 @@ Asia/Jakarta / WIB.
 
 ## Immediate next action
 
-Historical Backfill v2 remains intentionally blocked.
+Historical Backfill v2 is paused normally.
 
-Authoritative checkpoint:
+Completed through:
 2025-05
 
-Failed page:
-- month: 2025-05
-- offset: 0
-- circuit-breaker code: BACKFILL_HTTP_FAILURE
+Current authoritative resume state:
+- month: 2025-06
+- offset: 25
+- state: BACKFILL_RUNTIME_PAUSE
+- circuit breaker: not implicated
 
-Deployed corrections:
-- Google Play English cancellation lifecycle parser.
-- Gmail incomplete-event post-delete verification.
-- retry-guard implementation: 7a8377d
-- Worker version: 47d015bc-39dc-48b0-9bf2-fc82490cc382
-- MODE: shadow
-- schema: >= 7
+Lightweight progress observability:
+- implementation: ced919f
+- first trusted message is logged.
+- every fifth trusted message is logged.
+- sender is cleaned.
+- subject is truncated to 72 characters.
+- routine body/message-id logging is disabled.
 
 Next:
-1. Run clearHistoricalBackfillV2Block() exactly once.
-2. Confirm previous block is BACKFILL_HTTP_FAILURE.
-3. Run backfillHistoricalClosedMonthsV2().
-4. Do not reset checkpoint or offset.
-5. BACKFILL_RUNTIME_PAUSE is resumable.
-6. Any new BACKFILL_* error means stop and diagnose.
+1. Synchronize repository Code.gs to the Apps Script project and Save.
+2. Run backfillHistoricalClosedMonthsV2().
+3. Confirm start state is checkpoint=2025-06 and offset=25.
+4. BACKFILL_RUNTIME_PAUSE remains normal and resumable.
+5. Any new BACKFILL_* operational error means stop and diagnose.
 
 
 ## Do not do

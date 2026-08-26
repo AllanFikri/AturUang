@@ -682,3 +682,36 @@ Validation:
 
 Worker version:
 47d015bc-39dc-48b0-9bf2-fc82490cc382
+
+
+## Historical Backfill lightweight progress observability
+
+Operational state before implementation:
+- May 2025 completed successfully.
+- June 2025 first 25-thread page completed.
+- authoritative resume state is 2025-06 offset 25.
+- runner exited normally with BACKFILL_RUNTIME_PAUSE.
+- no circuit-breaker error caused this pause.
+
+Implementation:
+- ced919f feat(gmail): add lightweight backfill progress logs
+- historical fail-fast processing logs the first trusted in-scope message
+  and every fifth trusted message afterward.
+- routine log shows cleaned sender and subject truncated to 72 characters.
+- email body is never emitted in routine progress logs.
+- Gmail message ID is not emitted in routine progress logs.
+- existing detailed error diagnostics are unchanged.
+- live relay behavior is unchanged.
+- checkpoint and offset behavior are unchanged.
+- Worker and D1 logic are unchanged.
+- production SQLite hash remained unchanged.
+
+Validation:
+- Code.gs JavaScript syntax PASS.
+- dedicated observability regression PASS.
+- Historical Backfill v2 regression PASS.
+- Prompt13B Intelligence regression PASS.
+- git diff check PASS.
+
+Apps Script source must be manually synchronized before the next
+historical backfill execution.
