@@ -54,3 +54,5 @@ CREATE TABLE IF NOT EXISTS canonical_event_evidence (
 
 CREATE INDEX IF NOT EXISTS idx_event_evidence_event_id ON canonical_event_evidence(canonical_event_id);
 CREATE INDEX IF NOT EXISTS idx_event_evidence_raw_id ON canonical_event_evidence(raw_event_id);
+
+INSERT OR IGNORE INTO schema_migrations (version, name) VALUES (7, '0007_canonical_events');
