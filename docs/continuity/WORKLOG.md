@@ -598,3 +598,51 @@ Validation:
 Important:
 The defect was found before Historical Backfill v2 was executed, so no Gmail
 checkpoint, D1 data, or local ledger repair was required.
+
+
+## Historical Backfill v2 - Google Play cancellation failure
+
+Historical Backfill v2 operational result:
+- March 2025 completed.
+- April 2025 completed.
+- checkpoint advanced to 2025-05.
+- first May 2025 page stopped fail-fast with BACKFILL_HTTP_FAILURE.
+- Worker returned HTTP 500 for a trusted Google Play lifecycle email.
+- page offset did not advance.
+
+Diagnosis:
+The triggering email was a subscription cancellation notification.
+The Google Play parser did not recognize English canceled/cancelled wording
+before generic numeric amount parsing.
+
+Correction:
+- English cancellation is classified before amount parsing.
+- event_kind = NON_TRANSACTION.
+- financial_class = Ignore.
+- financial_direction = Neutral.
+- amount = 0.
+- candidate = null.
+- evidence_role = LIFECYCLE_STATUS.
+- no ledger mutation.
+
+Implementation:
+- 05dadec fix(gmail): classify google play cancellations
+
+Validation before implementation commit:
+- dedicated Google Play cancellation regression passed.
+- Prompt 13B Intelligence regression passed.
+- Historical Backfill v2 regression passed.
+- TypeScript check passed.
+- production SQLite hash unchanged.
+
+Deployment:
+- Worker aturuang-api deployed successfully.
+- Worker version: 6c04bb23-6572-47b1-9a2d-e91f00e3c788
+- MODE: shadow
+- schema >= 7.
+- production SQLite remained unchanged.
+
+Operational state:
+The Backfill v2 circuit breaker remains intentionally blocked until the
+deployed correction has been verified and explicitly cleared.
+Checkpoint and offset must not be reset.

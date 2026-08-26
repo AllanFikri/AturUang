@@ -48,7 +48,7 @@ explicit project-level decision.
 ## Current Git state
 
 Current implementation HEAD:
-8ccdf92
+05dadec
 
 Recent commits:
 - 841fc63 chore(gmail): prepare controlled february backfill
@@ -69,7 +69,7 @@ Worker URL:
 https://aturuang-api.allanfikrimahardika.workers.dev
 
 Known deployed Worker version:
-9ccb47fd-cd48-4c7d-bb43-143f35e18255
+6c04bb23-6572-47b1-9a2d-e91f00e3c788
 
 MODE:
 shadow
@@ -125,7 +125,7 @@ Completed and validated operationally:
 - February 2025
 
 Current checkpoint:
-2025-03
+2025-05
 
 January successful retry:
 59 successful relay operations.
@@ -213,27 +213,39 @@ Asia/Jakarta / WIB.
 
 ## Immediate next action
 
-Historical Backfill v2 implementation:
-8ccdf92
+Historical Backfill v2 is intentionally blocked after a fail-fast stop.
 
-Current authoritative Gmail checkpoint:
-2025-03
+Completed:
+- 2025-03
+- 2025-04
 
-Closed historical cutoff:
-2026-07
+Authoritative checkpoint:
+2025-05
 
-Next:
-1. Paste the full current Code.gs into the existing Google Apps Script project.
-2. Save.
-3. Run backfillHistoricalClosedMonthsV2().
-4. BACKFILL_RUNTIME_PAUSE is normal; run the same function again to resume.
-5. BACKFILL_COMPLETED with checkpoint 2026-08 means historical ingestion reached
-   the intended cutoff.
-6. Any BACKFILL_* error / BACKFILL_V2_BLOCKED means STOP. Do not rerun.
-7. Diagnose the error first.
-8. Only after diagnosis may clearHistoricalBackfillV2Block() be run.
-9. After full completion, perform exact D1 + SQLite integrity audit.
-10. Analyze whole-history canonical patterns only after that audit passes.
+Failed page:
+- month: 2025-05
+- offset: 0
+- code: BACKFILL_HTTP_FAILURE
+
+Root cause correction:
+- 05dadec fix(gmail): classify google play cancellations
+
+Deployed Worker:
+- version: 6c04bb23-6572-47b1-9a2d-e91f00e3c788
+- mode: shadow
+- schema: >= 7
+
+Next operational sequence:
+1. Do not reset checkpoint or offset.
+2. Run clearHistoricalBackfillV2Block() exactly once.
+3. Confirm the previous block was BACKFILL_HTTP_FAILURE.
+4. Run backfillHistoricalClosedMonthsV2().
+5. May offset 0 will replay safely through Gmail message-id idempotency and
+   incomplete-ingestion recovery.
+6. BACKFILL_RUNTIME_PAUSE is normal and may be resumed.
+7. Any new BACKFILL_* error means stop and diagnose before retry.
+8. After checkpoint reaches 2026-08, run coverage verification and the full
+   D1 + SQLite integrity audit before pattern analysis.
 
 
 ## Do not do
