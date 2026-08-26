@@ -573,3 +573,28 @@ Validation before commit:
 Status:
 Repository implementation prepared.
 Apps Script still requires manual full-Code.gs synchronization before running.
+
+## Historical Backfill v2 offset-regex correction
+
+During manual review of the final Code.gs before execution, an escaping defect
+was caught before any bulk historical run.
+
+Observed:
+The inner historical offset validator contained /^\\d+$/ instead of /^\d+$/.
+
+Impact if executed:
+A persisted numeric offset such as 25 could be rejected as
+BACKFILL_INVALID_OFFSET on a later resume.
+
+Correction:
+- ce092cc fix(gmail): correct historical offset validation
+
+Validation:
+- JavaScript syntax PASS;
+- numeric offset runtime regex test PASS;
+- Backfill v2 static safety test PASS;
+- git diff --check PASS.
+
+Important:
+The defect was found before Historical Backfill v2 was executed, so no Gmail
+checkpoint, D1 data, or local ledger repair was required.
