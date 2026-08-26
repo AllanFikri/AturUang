@@ -137,17 +137,62 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
     let offset = 0;
 
     if (storedOffsetMonth === ymStr) {
-      offset = parseInt(
-        props.getProperty("GMAIL_BACKFILL_OFFSET") || "0",
-        10
+      const rawOffset =
+        props.getProperty("GMAIL_BACKFILL_OFFSET");
+
+      if (
+        rawOffset === null ||
+        !/^\\d+$/.test(rawOffset)
+      ) {
+        console.error(
+          "BACKFILL_INVALID_OFFSET" +
+          " | month=" +
+          ymStr
+        );
+
+        throw new Error(
+          "BACKFILL_INVALID_OFFSET"
+        );
+      }
+
+      offset = parseInt(rawOffset, 10);
+
+      if (
+        !Number.isFinite(offset) ||
+        offset < 0
+      ) {
+        console.error(
+          "BACKFILL_INVALID_OFFSET" +
+          " | month=" +
+          ymStr
+        );
+
+        throw new Error(
+          "BACKFILL_INVALID_OFFSET"
+        );
+      }
+    } else if (storedOffsetMonth) {
+      console.error(
+        "BACKFILL_OFFSET_MONTH_MISMATCH" +
+        " | expected=" +
+        ymStr +
+        " | stored=" +
+        storedOffsetMonth
       );
 
-      if (!Number.isFinite(offset) || offset < 0) {
-        offset = 0;
-      }
+      throw new Error(
+        "BACKFILL_OFFSET_MONTH_MISMATCH"
+      );
     } else {
-      props.setProperty("GMAIL_BACKFILL_OFFSET_MONTH", ymStr);
-      props.setProperty("GMAIL_BACKFILL_OFFSET", "0");
+      props.setProperty(
+        "GMAIL_BACKFILL_OFFSET_MONTH",
+        ymStr
+      );
+
+      props.setProperty(
+        "GMAIL_BACKFILL_OFFSET",
+        "0"
+      );
     }
 
     console.log(
@@ -158,6 +203,21 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
     );
 
     while (true) {
+      if (
+        Date.now() - startedAt >=
+        MAX_RUNTIME_MS
+      ) {
+        console.log(
+          "BACKFILL_RUNTIME_PAUSE" +
+          " | month=" +
+          ymStr +
+          " | offset=" +
+          offset
+        );
+
+        return;
+      }
+
       const page = processGmailQueryPage(
         query,
         workerUrl,
@@ -165,7 +225,8 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
         PAGE_SIZE,
         offset,
         startDate,
-        endDate
+        endDate,
+        true
       );
 
       totalProcessed += page.processedCount;
@@ -174,18 +235,28 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
       // Successful messages from this page are safe to retry because
       // Worker ingestion is idempotent by Gmail message ID.
       if (page.failedCount > 0) {
+        const failureCode =
+          page.failureCode ||
+          "BACKFILL_RELAY_FAILURE";
+
         console.error(
-          "Backfill dihentikan pada " +
+          "BACKFILL_RELAY_STOP" +
+          " | month=" +
           ymStr +
-          " offset " +
+          " | offset=" +
           offset +
-          ": " +
-          page.failedCount +
-          " pesan gagal direlay."
+          " | code=" +
+          failureCode +
+          (
+            page.workerCode
+              ? " | worker_code=" +
+                page.workerCode
+              : ""
+          )
         );
 
         throw new Error(
-          "Gmail historical backfill relay failure; offset dipertahankan untuk retry."
+          failureCode
         );
       }
 
@@ -236,12 +307,11 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
       // Resume safely on the next manual/triggered execution.
       if (Date.now() - startedAt >= MAX_RUNTIME_MS) {
         console.log(
-          "Backfill dipause sebelum batas runtime. " +
-          "Jalankan kembali untuk resume dari " +
+          "BACKFILL_RUNTIME_PAUSE" +
+          " | month=" +
           ymStr +
-          " offset " +
-          offset +
-          "."
+          " | offset=" +
+          offset
         );
         return;
       }
@@ -249,59 +319,420 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
 
     if (Date.now() - startedAt >= MAX_RUNTIME_MS) {
       console.log(
-        "Backfill dipause setelah menyelesaikan bulan. " +
-        "Jalankan kembali untuk melanjutkan dari checkpoint."
+        "BACKFILL_RUNTIME_PAUSE" +
+        " | next_checkpoint=" +
+        formatYearMonth(current)
       );
       return;
     }
   }
 
   console.log(
-    "Backfill selesai. Total pesan sukses pada eksekusi ini: " +
+    "BACKFILL_COMPLETED" +
+    " | through=" +
+    endYM +
+    " | next_checkpoint=" +
+    formatYearMonth(current) +
+    " | successful_messages_this_run=" +
     totalProcessed
   );
 }
 
 /**
- * Controlled historical trial ? March 2025 only.
+ * Historical Backfill v2.
  *
- * Safe to retry while March is partial because the stored
- * thread offset is preserved. Once checkpoint advances beyond
- * March, this function refuses to rerun.
+ * Resume dari checkpoint resmi dan proses closed historical
+ * months sampai 2026-07.
+ *
+ * FAIL-CLOSED:
+ * - concurrent run ditolak;
+ * - persistent BLOCK latch setelah error;
+ * - Worker harus sehat + MODE=shadow;
+ * - schema >= 7;
+ * - checkpoint/offset harus konsisten;
+ * - current/open month ditolak;
+ * - non-200 pertama langsung stop;
+ * - network exception pertama langsung stop;
+ * - malformed HTTP 200 langsung stop;
+ * - runtime pause adalah normal dan resumable.
  */
-function backfillMarch2025Trial() {
-  const props = PropertiesService.getScriptProperties();
+function backfillHistoricalClosedMonthsV2() {
+  const START_YM = "2025-03";
+  const END_YM = "2026-07";
+  const MIN_SCHEMA_VERSION = 7;
 
-  const checkpoint =
-    props.getProperty("GMAIL_BACKFILL_CHECKPOINT") ||
-    "2025-01";
+  const props =
+    PropertiesService.getScriptProperties();
 
-  const offsetMonth =
-    props.getProperty("GMAIL_BACKFILL_OFFSET_MONTH");
+  const lock =
+    LockService.getScriptLock();
 
-  if (checkpoint !== "2025-03") {
+  if (!lock.tryLock(1000)) {
     console.error(
-      "MAR_2025_TRIAL_REFUSED: current checkpoint is " +
-      checkpoint
+      "BACKFILL_ALREADY_RUNNING"
     );
     return;
   }
 
-  if (offsetMonth && offsetMonth !== "2025-03") {
+  try {
+    const blockedCode =
+      props.getProperty(
+        "GMAIL_BACKFILL_V2_BLOCKED_CODE"
+      );
+
+    if (blockedCode) {
+      console.error(
+        "BACKFILL_BLOCKED" +
+        " | code=" +
+        blockedCode +
+        " | clear only after diagnosis"
+      );
+
+      return;
+    }
+
+    const workerUrl =
+      props.getProperty("WORKER_URL");
+
+    const relaySecret =
+      props.getProperty(
+        "GMAIL_RELAY_SECRET"
+      );
+
+    if (!workerUrl || !relaySecret) {
+      backfillV2Throw_(
+        "BACKFILL_CONFIG_MISSING"
+      );
+    }
+
+    const checkpoint =
+      props.getProperty(
+        "GMAIL_BACKFILL_CHECKPOINT"
+      );
+
+    if (
+      !checkpoint ||
+      !isValidYearMonth_(checkpoint)
+    ) {
+      backfillV2Throw_(
+        "BACKFILL_INVALID_CHECKPOINT"
+      );
+    }
+
+    const checkpointYM =
+      parseYearMonth(checkpoint);
+
+    const startYM =
+      parseYearMonth(START_YM);
+
+    const cutoffYM =
+      parseYearMonth(END_YM);
+
+    if (
+      compareYearMonth(
+        checkpointYM,
+        startYM
+      ) < 0
+    ) {
+      backfillV2Throw_(
+        "BACKFILL_INVALID_CHECKPOINT",
+        "checkpoint before validated start"
+      );
+    }
+
+    const completedCheckpoint =
+      formatYearMonth(
+        getNextMonth(cutoffYM)
+      );
+
+    const offsetMonth =
+      props.getProperty(
+        "GMAIL_BACKFILL_OFFSET_MONTH"
+      );
+
+    const rawOffset =
+      props.getProperty(
+        "GMAIL_BACKFILL_OFFSET"
+      );
+
+    if (
+      offsetMonth &&
+      offsetMonth !== checkpoint
+    ) {
+      backfillV2Throw_(
+        "BACKFILL_OFFSET_MONTH_MISMATCH"
+      );
+    }
+
+    if (offsetMonth) {
+      if (
+        rawOffset === null ||
+        !/^\d+$/.test(rawOffset)
+      ) {
+        backfillV2Throw_(
+          "BACKFILL_INVALID_OFFSET"
+        );
+      }
+    } else if (rawOffset !== null) {
+      backfillV2Throw_(
+        "BACKFILL_INVALID_OFFSET",
+        "offset exists without offset month"
+      );
+    }
+
+    if (
+      compareYearMonth(
+        checkpointYM,
+        cutoffYM
+      ) > 0
+    ) {
+      if (
+        checkpoint ===
+          completedCheckpoint &&
+        !offsetMonth &&
+        rawOffset === null
+      ) {
+        console.log(
+          "BACKFILL_COMPLETED" +
+          " | through=" +
+          END_YM +
+          " | checkpoint=" +
+          checkpoint
+        );
+
+        return;
+      }
+
+      backfillV2Throw_(
+        "BACKFILL_INVALID_CHECKPOINT",
+        "checkpoint beyond expected completion"
+      );
+    }
+
+    const scriptTimezone =
+      Session.getScriptTimeZone();
+
+    if (
+      scriptTimezone !==
+      "Asia/Jakarta"
+    ) {
+      backfillV2Throw_(
+        "BACKFILL_TIMEZONE_MISMATCH"
+      );
+    }
+
+    const currentYM =
+      Utilities.formatDate(
+        new Date(),
+        "Asia/Jakarta",
+        "yyyy-MM"
+      );
+
+    if (
+      compareYearMonth(
+        cutoffYM,
+        parseYearMonth(currentYM)
+      ) >= 0
+    ) {
+      backfillV2Throw_(
+        "BACKFILL_CUTOFF_NOT_CLOSED"
+      );
+    }
+
+    const healthUrl =
+      workerUrl.replace(/\/+$/, "") +
+      "/health";
+
+    let healthResponse;
+
+    try {
+      healthResponse =
+        UrlFetchApp.fetch(
+          healthUrl,
+          {
+            method: "get",
+            muteHttpExceptions: true,
+          }
+        );
+    } catch (healthError) {
+      backfillV2Throw_(
+        "BACKFILL_HEALTH_FETCH_EXCEPTION"
+      );
+    }
+
+    const healthCode =
+      healthResponse.getResponseCode();
+
+    if (healthCode !== 200) {
+      backfillV2Throw_(
+        "BACKFILL_HEALTH_HTTP_FAILURE",
+        "HTTP " + healthCode
+      );
+    }
+
+    let health;
+
+    try {
+      health = JSON.parse(
+        healthResponse.getContentText()
+      );
+    } catch (parseError) {
+      backfillV2Throw_(
+        "BACKFILL_INVALID_HEALTH_RESPONSE"
+      );
+    }
+
+    if (
+      !health ||
+      health.status !== "ok"
+    ) {
+      backfillV2Throw_(
+        "BACKFILL_INVALID_HEALTH_RESPONSE"
+      );
+    }
+
+    if (
+      String(
+        health.mode || ""
+      ).toLowerCase() !== "shadow"
+    ) {
+      backfillV2Throw_(
+        "BACKFILL_WORKER_NOT_SHADOW"
+      );
+    }
+
+    const schemaVersion =
+      Number(
+        health.schema_version
+      );
+
+    if (
+      !Number.isFinite(schemaVersion) ||
+      schemaVersion <
+        MIN_SCHEMA_VERSION
+    ) {
+      backfillV2Throw_(
+        "BACKFILL_SCHEMA_TOO_OLD"
+      );
+    }
+
+    console.log(
+      "BACKFILL_V2_START" +
+      " | checkpoint=" +
+      checkpoint +
+      " | cutoff=" +
+      END_YM +
+      " | mode=shadow" +
+      " | schema=" +
+      schemaVersion
+    );
+
+    return backfillGmailTransactions(
+      checkpoint,
+      END_YM
+    );
+  } catch (e) {
+    const rawMessage =
+      String(
+        e && e.message
+          ? e.message
+          : e || ""
+      );
+
+    const codeMatch =
+      rawMessage.match(
+        /BACKFILL_[A-Z0-9_]+/
+      );
+
+    const safeCode =
+      codeMatch
+        ? codeMatch[0]
+        : "BACKFILL_UNEXPECTED_EXCEPTION";
+
+    props.setProperty(
+      "GMAIL_BACKFILL_V2_BLOCKED_CODE",
+      safeCode
+    );
+
+    props.setProperty(
+      "GMAIL_BACKFILL_V2_BLOCKED_AT",
+      new Date().toISOString()
+    );
+
     console.error(
-      "MAR_2025_TRIAL_REFUSED: unexpected offset month " +
-      offsetMonth
+      "BACKFILL_V2_BLOCKED" +
+      " | code=" +
+      safeCode
+    );
+
+    throw new Error(
+      safeCode
+    );
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * HANYA jalankan setelah error sudah didiagnosis.
+ *
+ * Ini hanya menghapus circuit-breaker latch.
+ * Checkpoint dan offset TIDAK direset.
+ */
+function clearHistoricalBackfillV2Block() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const previousCode =
+    props.getProperty(
+      "GMAIL_BACKFILL_V2_BLOCKED_CODE"
+    );
+
+  if (!previousCode) {
+    console.log(
+      "BACKFILL_BLOCK_CLEAR_NOOP"
     );
     return;
   }
 
-  console.log(
-    "CONTROLLED_TRIAL_START: March 2025 only."
+  props.deleteProperty(
+    "GMAIL_BACKFILL_V2_BLOCKED_CODE"
   );
 
-  return backfillGmailTransactions(
-    "2025-03",
-    "2025-03"
+  props.deleteProperty(
+    "GMAIL_BACKFILL_V2_BLOCKED_AT"
+  );
+
+  console.log(
+    "BACKFILL_BLOCK_CLEARED" +
+    " | previous_code=" +
+    previousCode +
+    " | checkpoint and offset preserved"
+  );
+}
+
+
+function backfillV2Throw_(
+  code,
+  detail
+) {
+  console.error(
+    code +
+    (
+      detail
+        ? " | " + detail
+        : ""
+    )
+  );
+
+  throw new Error(code);
+}
+
+
+function isValidYearMonth_(value) {
+  return /^\d{4}-(0[1-9]|1[0-2])$/.test(
+    String(value || "")
   );
 }
 
@@ -381,7 +812,8 @@ function processGmailQueryPage(
   maxThreads,
   startOffset,
   startDate,
-  endDate
+  endDate,
+  failFast
 ) {
   const threads = GmailApp.search(
     query,
@@ -466,53 +898,156 @@ function processGmailQueryPage(
       };
 
       try {
-        const response = UrlFetchApp.fetch(
-          workerUrl + "/api/ingest/gmail",
-          options
-        );
+        const response =
+          UrlFetchApp.fetch(
+            workerUrl +
+              "/api/ingest/gmail",
+            options
+          );
 
-        const code = response.getResponseCode();
+        const code =
+          response.getResponseCode();
 
         if (code === 200) {
+          if (failFast) {
+            let workerResult;
+
+            try {
+              workerResult =
+                JSON.parse(
+                  response.getContentText()
+                );
+            } catch (parseError) {
+              failedCount++;
+
+              console.error(
+                "BACKFILL_INVALID_WORKER_RESPONSE" +
+                " | HTTP 200" +
+                " | Gmail message ID " +
+                messageId
+              );
+
+              return {
+                processedCount:
+                  processedCount,
+                threadCount:
+                  threads.length,
+                failedCount:
+                  failedCount,
+                failureCode:
+                  "BACKFILL_INVALID_WORKER_RESPONSE",
+                workerCode: null,
+                httpStatus: 200,
+                messageId: messageId,
+              };
+            }
+
+            if (
+              !workerResult ||
+              workerResult.status !==
+                "success"
+            ) {
+              failedCount++;
+
+              console.error(
+                "BACKFILL_INVALID_WORKER_RESPONSE" +
+                " | HTTP 200" +
+                " | Gmail message ID " +
+                messageId
+              );
+
+              return {
+                processedCount:
+                  processedCount,
+                threadCount:
+                  threads.length,
+                failedCount:
+                  failedCount,
+                failureCode:
+                  "BACKFILL_INVALID_WORKER_RESPONSE",
+                workerCode: null,
+                httpStatus: 200,
+                messageId: messageId,
+              };
+            }
+          }
+
           processedCount++;
         } else {
-          // Sender trust sudah diperiksa sebelum request.
-          // Karena itu setiap respons non-200 dari Worker harus
-          // menahan checkpoint agar historical evidence tidak terlewat.
           failedCount++;
 
-          let workerCode = "UNKNOWN_WORKER_ERROR";
+          let workerCode =
+            "UNKNOWN_WORKER_ERROR";
 
           try {
-            const workerError = JSON.parse(
-              response.getContentText()
-            );
+            const workerError =
+              JSON.parse(
+                response.getContentText()
+              );
 
             workerCode =
               workerError.code ||
               "NO_ERROR_CODE";
           } catch (parseError) {
-            workerCode = "UNPARSEABLE_ERROR_RESPONSE";
+            workerCode =
+              "UNPARSEABLE_ERROR_RESPONSE";
           }
 
           console.error(
-            "Relay HTTP " +
+            "BACKFILL_HTTP_FAILURE" +
+            " | HTTP " +
             code +
             " | Worker code=" +
             workerCode +
             " | Gmail message ID " +
             messageId
           );
+
+          if (failFast) {
+            return {
+              processedCount:
+                processedCount,
+              threadCount:
+                threads.length,
+              failedCount:
+                failedCount,
+              failureCode:
+                "BACKFILL_HTTP_FAILURE",
+              workerCode:
+                workerCode,
+              httpStatus:
+                code,
+              messageId:
+                messageId,
+            };
+          }
         }
       } catch (e) {
         failedCount++;
 
         console.error(
-          "Exception saat relay message " +
+          "BACKFILL_FETCH_EXCEPTION" +
+          " | Gmail message ID " +
           messageId +
-          ": " +
+          " | " +
           e.toString()
         );
+
+        if (failFast) {
+          return {
+            processedCount:
+              processedCount,
+            threadCount:
+              threads.length,
+            failedCount:
+              failedCount,
+            failureCode:
+              "BACKFILL_FETCH_EXCEPTION",
+            workerCode: null,
+            httpStatus: null,
+            messageId: messageId,
+          };
+        }
       }
     }
   }
@@ -521,6 +1056,10 @@ function processGmailQueryPage(
     processedCount: processedCount,
     threadCount: threads.length,
     failedCount: failedCount,
+    failureCode: null,
+    workerCode: null,
+    httpStatus: null,
+    messageId: null,
   };
 }
 // Date helpers
