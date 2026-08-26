@@ -824,6 +824,11 @@ function processGmailQueryPage(
   let processedCount = 0;
   let failedCount = 0;
 
+  // Lightweight observability for historical backfill only.
+  // Log the first trusted message, then every fifth message.
+  let backfillAttemptCount = 0;
+  const BACKFILL_PROGRESS_EVERY = 5;
+
   for (let i = 0; i < threads.length; i++) {
     const messages = threads[i].getMessages();
 
@@ -846,6 +851,37 @@ function processGmailQueryPage(
       // Enforce message-level strict sender trust.
       if (!isSenderExactTrusted(fromHeader)) {
         continue;
+      }
+
+      if (failFast) {
+        backfillAttemptCount++;
+
+        if (
+          backfillAttemptCount === 1 ||
+          backfillAttemptCount % BACKFILL_PROGRESS_EVERY === 0
+        ) {
+          const safeSender =
+            extractCleanEmail(fromHeader) || "unknown";
+
+          const safeSubject =
+            String(msg.getSubject() || "")
+              .replace(/[\r\n\t|]+/g, " ")
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 72);
+
+          console.log(
+            "BACKFILL_PROGRESS" +
+            " | page_offset=" +
+            (startOffset || 0) +
+            " | item=" +
+            backfillAttemptCount +
+            " | sender=" +
+            safeSender +
+            " | subject=" +
+            (safeSubject || "(no subject)")
+          );
+        }
       }
 
       const messageId = msg.getId();
