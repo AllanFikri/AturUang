@@ -41,116 +41,278 @@ export async function reconstructBalance(
   db: D1Database,
   accountName: string,
   asOfDate?: string
-): Promise<{ status: string; calculated_balance: number; anchor_balance: number; anchor_date: string }> {
+): Promise<{
+  status: string;
+  calculated_balance: number;
+  expected_balance: number | null;
+  cached_balance: number;
+  difference: number | null;
+  anchor_balance: number;
+  anchor_date: string | null;
+  reason: string;
+}> {
   const targetDate = asOfDate || getWibDate().dateStr;
 
-  // 1. Get latest anchor snapshot
-  const snapRes = await db
-    .prepare(
-      `SELECT snapshot_date, snapshot_time, balance, snapshot_kind
-       FROM balance_snapshots
-       WHERE account_name = ? AND snapshot_date <= ? AND is_anchor = 1
-       ORDER BY snapshot_date DESC, snapshot_time DESC LIMIT 1`
-    )
-    .bind(accountName, targetDate)
-    .first<{ snapshot_date: string; snapshot_time: string; balance: number; snapshot_kind: string }>();
+  // 1. Get cached current balance from accounts
+  const accRow = await db
+    .prepare("SELECT current_balance, balance_date FROM accounts WHERE name = ?")
+    .bind(accountName)
+    .first<{ current_balance: number | null; balance_date: string | null }>();
 
-  let anchorDate = "2020-01-01";
-  let anchorTime = "00:00:00";
-  let anchorBal = 0.0;
-
-  if (snapRes) {
-    anchorDate = snapRes.snapshot_date;
-    anchorTime = snapRes.snapshot_time || "00:00:00";
-    anchorBal = Number(snapRes.balance || 0);
+  if (!accRow) {
+    return {
+      status: "unverifiable",
+      calculated_balance: 0.0,
+      expected_balance: null,
+      cached_balance: 0.0,
+      difference: null,
+      anchor_balance: 0.0,
+      anchor_date: null,
+      reason: `Rekening '${accountName}' tidak ditemukan.`,
+    };
   }
 
-  // 2. Sum mutations after anchor
+  const cachedBal = round2(Number(accRow.current_balance || 0));
+  const balDate = accRow.balance_date || null;
+
+  // 2. Search for latest explicit trusted anchor (manual_anchor, initial_anchor)
+  let snapRes = await db
+    .prepare(
+      `SELECT id, balance, snapshot_date, created_at, snapshot_kind
+       FROM balance_snapshots
+       WHERE account_name = ? AND snapshot_date <= ? AND snapshot_kind IN ('manual_anchor', 'initial_anchor')
+       ORDER BY id DESC LIMIT 1`
+    )
+    .bind(accountName, targetDate)
+    .first<{ id: number; balance: number; snapshot_date: string; created_at: string; snapshot_kind: string }>();
+
+  // 3. Fallback to legacy snapshot if no explicit anchor found
+  if (!snapRes) {
+    snapRes = await db
+      .prepare(
+        `SELECT id, balance, snapshot_date, created_at, snapshot_kind
+         FROM balance_snapshots
+         WHERE account_name = ? AND snapshot_date <= ? AND (snapshot_kind = 'legacy' OR snapshot_kind IS NULL)
+         ORDER BY id ASC LIMIT 1`
+      )
+      .bind(accountName, targetDate)
+      .first<{ id: number; balance: number; snapshot_date: string; created_at: string; snapshot_kind: string }>();
+  }
+
+  if (!snapRes) {
+    return {
+      status: "unverifiable",
+      calculated_balance: 0.0,
+      expected_balance: null,
+      cached_balance: cachedBal,
+      difference: null,
+      anchor_balance: 0.0,
+      anchor_date: balDate,
+      reason: "Tidak ada data snapshot saldo (anchor) tepercaya untuk akun ini.",
+    };
+  }
+
+  const anchorBal = round2(Number(snapRes.balance || 0));
+  const anchorDate = snapRes.snapshot_date;
+  const anchorCreated = snapRes.created_at || "";
+
+  // 4. Sum subsequent transaction mutations strictly after the chosen anchor
   const mutRes = await db
     .prepare(
       `SELECT
-         COALESCE(SUM(CASE WHEN transaction_type = 'Income' AND account_to = ? THEN amount ELSE 0 END), 0) -
-         COALESCE(SUM(CASE WHEN transaction_type = 'Expense' AND account_from = ? THEN amount ELSE 0 END), 0) +
-         COALESCE(SUM(CASE WHEN transaction_type = 'Transfer' AND account_to = ? THEN amount
-                           WHEN transaction_type = 'Transfer' AND account_from = ? THEN -amount ELSE 0 END), 0) +
-         COALESCE(SUM(CASE WHEN transaction_type = 'Adjustment' AND account_to = ? THEN amount
-                           WHEN transaction_type = 'Adjustment' AND account_from = ? THEN -amount ELSE 0 END), 0) as net_mutation
+         COALESCE(SUM(CASE WHEN account_to = ? THEN amount ELSE 0 END), 0) as in_mutations,
+         COALESCE(SUM(CASE WHEN account_from = ? THEN amount ELSE 0 END), 0) as out_mutations
        FROM transactions
        WHERE is_deleted = 0
-         AND (date > ? OR (date = ? AND time > ?))
-         AND date <= ?
-         AND (account_from = ? OR account_to = ?)`
+         AND (account_from = ? OR account_to = ?)
+         AND (date > ? OR (date = ? AND created_at > ?))
+         AND date <= ?`
     )
     .bind(
       accountName,
       accountName,
       accountName,
       accountName,
-      accountName,
-      accountName,
       anchorDate,
       anchorDate,
-      anchorTime,
-      targetDate,
-      accountName,
-      accountName
+      anchorCreated,
+      targetDate
     )
-    .first<{ net_mutation: number }>();
+    .first<{ in_mutations: number; out_mutations: number }>();
 
-  const netMutation = Number(mutRes?.net_mutation || 0);
-  const calculatedBalance = round2(anchorBal + netMutation);
+  const inMut = round2(Number(mutRes?.in_mutations || 0));
+  const outMut = round2(Number(mutRes?.out_mutations || 0));
+  const expectedBal = round2(anchorBal + inMut - outMut);
+  const diff = round2(expectedBal - cachedBal);
+
+  const status = Math.abs(diff) < 0.005 ? "ok" : "discrepancy";
+  const reason =
+    Math.abs(diff) < 0.005
+      ? "Saldo terverifikasi sesuai snapshot & mutasi"
+      : `Selisih saldo terdeteksi: tercatat ${cachedBal} vs hitungan mutasi ${expectedBal}`;
 
   return {
-    status: snapRes ? "verified" : "unverifiable",
-    calculated_balance: calculatedBalance,
+    status,
+    calculated_balance: expectedBal,
+    expected_balance: expectedBal,
+    cached_balance: cachedBal,
+    difference: diff,
     anchor_balance: anchorBal,
     anchor_date: anchorDate,
+    reason,
   };
 }
 
-export async function getDashboard(db: D1Database, monthParam?: string): Promise<Record<string, any>> {
+export async function computeDashboardKpis(
+  db: D1Database,
+  monthStr?: string
+): Promise<{
+  safeToSpend: number;
+  totalBalance: number;
+  protectedSavings: number;
+  emergencyAllocated: number;
+  goalsAllocated: number;
+  generalAllocated: number;
+  passThroughOutstanding: number;
+  currentCommitments: number;
+  receivablesOutstanding: number;
+  pendingExpenses: number;
+  monthIncome: number;
+  monthExpense: number;
+  netCashflow: number;
+  selectedMonth: string;
+  asOfDate: string;
+}> {
   const { dateStr: todayStr, monthStr: currentMonth } = getWibDate();
-  const selectedMonth = monthParam && /^\d{4}-\d{2}$/.test(monthParam) ? monthParam : currentMonth;
+  const selectedMonth = monthStr && /^\d{4}-\d{2}$/.test(monthStr) ? monthStr : currentMonth;
 
-  // 1. Total liquid balance from active Owned accounts
+  // 1. Total Liquid Balance from active Owned accounts
   const liquidRes = await db
-    .prepare(
-      `SELECT COALESCE(SUM(current_balance), 0) as total_liquid
-       FROM accounts WHERE active = 1 AND kind = 'Owned'`
-    )
+    .prepare("SELECT COALESCE(SUM(current_balance), 0) as total_liquid FROM accounts WHERE active = 1 AND kind = 'Owned'")
     .first<{ total_liquid: number }>();
-  const totalLiquid = round2(Number(liquidRes?.total_liquid || 0));
+  const totalBalance = round2(Number(liquidRes?.total_liquid || 0));
 
-  // 2. Goal & Emergency Fund Allocations
+  // 2. Allocation Goals (Emergency, Goals, General)
   const allocRes = await db
     .prepare(
-      `SELECT COALESCE(SUM(allocated_amount), 0) as total_allocated,
-              COALESCE(SUM(CASE WHEN name = 'Dana Darurat' THEN allocated_amount ELSE 0 END), 0) as emergency_fund
-       FROM allocation_goals WHERE status = 'Active'`
-    )
-    .first<{ total_allocated: number; emergency_fund: number }>();
-  const totalAllocated = round2(Number(allocRes?.total_allocated || 0));
-  const emergencyFund = round2(Number(allocRes?.emergency_fund || 0));
-
-  // 3. Upcoming Obligations (Confirmed vs Tentative)
-  const upRes = await db
-    .prepare(
       `SELECT
-         COALESCE(SUM(CASE WHEN status = 'Confirmed' THEN amount ELSE 0 END), 0) as confirmed_outflow,
-         COALESCE(SUM(CASE WHEN status = 'Tentative' AND reserve_now = 1 THEN amount ELSE 0 END), 0) as tentative_reserved,
-         COALESCE(SUM(CASE WHEN status = 'Tentative' AND reserve_now = 0 THEN amount ELSE 0 END), 0) as tentative_unreserved
-       FROM upcoming WHERE status IN ('Upcoming', 'Confirmed', 'Tentative')`
+         COALESCE(SUM(CASE WHEN kind = 'Emergency' THEN allocated_amount ELSE 0 END), 0) as emergency,
+         COALESCE(SUM(CASE WHEN kind = 'Goal' THEN allocated_amount ELSE 0 END), 0) as goals,
+         COALESCE(SUM(CASE WHEN kind = 'General' THEN allocated_amount ELSE 0 END), 0) as general,
+         COALESCE(SUM(allocated_amount), 0) as total_alloc
+       FROM allocation_goals
+       WHERE status = 'Active'`
     )
-    .first<{ confirmed_outflow: number; tentative_reserved: number; tentative_unreserved: number }>();
+    .first<{ emergency: number; goals: number; general: number; total_alloc: number }>();
 
-  const confirmedObligations = round2(Number(upRes?.confirmed_outflow || 0));
-  const tentativeReserved = round2(Number(upRes?.tentative_reserved || 0));
-  const tentativeUnreserved = round2(Number(upRes?.tentative_unreserved || 0));
+  const emergencyAllocated = round2(Number(allocRes?.emergency || 0));
+  const goalsAllocated = round2(Number(allocRes?.goals || 0));
+  const generalAllocated = round2(Number(allocRes?.general || 0));
+  const protectedSavings = round2(Number(allocRes?.total_alloc || 0));
 
-  // Safe-to-Spend (Dana Tersedia Saat Ini) Formula Prompt 11
-  const safeToSpend = round2(totalLiquid - totalAllocated - confirmedObligations - tentativeReserved);
+  // 3. Custody (Titipan) Outstanding from Event Ledger
+  const custodyDebts = await db
+    .prepare("SELECT id FROM debts WHERE kind = 'Custody' AND status = 'Active'")
+    .all<{ id: number }>();
 
-  // 4. Monthly Inflow & Outflow for selected month
+  let passThroughOutstanding = 0.0;
+  for (const cd of custodyDebts.results || []) {
+    const evRes = await db
+      .prepare("SELECT COALESCE(SUM(effect * amount), 0.0) as out FROM debt_events WHERE debt_id = ?")
+      .bind(cd.id)
+      .first<{ out: number }>();
+    passThroughOutstanding += Math.max(0.0, Number(evRes?.out || 0));
+  }
+  passThroughOutstanding = round2(passThroughOutstanding);
+
+  // 4. Receivables Outstanding from Event Ledger (Informational only, does NOT increase liquidity)
+  const recDebts = await db
+    .prepare("SELECT id FROM debts WHERE kind = 'Receivable' AND status = 'Active'")
+    .all<{ id: number }>();
+
+  let receivablesOutstanding = 0.0;
+  for (const rd of recDebts.results || []) {
+    const evRes = await db
+      .prepare("SELECT COALESCE(SUM(effect * amount), 0.0) as out FROM debt_events WHERE debt_id = ?")
+      .bind(rd.id)
+      .first<{ out: number }>();
+    receivablesOutstanding += Math.max(0.0, Number(evRes?.out || 0));
+  }
+  receivablesOutstanding = round2(receivablesOutstanding);
+
+  // 5. Effective Commitments (U_eff for Payables + X_eff for Regular Upcomings)
+  // 5a. U_eff for Active Payables
+  const payDebts = await db
+    .prepare("SELECT id FROM debts WHERE kind = 'Payable' AND status = 'Active'")
+    .all<{ id: number }>();
+
+  let totalUeff = 0.0;
+  for (const pd of payDebts.results || []) {
+    const evRes = await db
+      .prepare("SELECT COALESCE(SUM(effect * amount), 0.0) as out FROM debt_events WHERE debt_id = ?")
+      .bind(pd.id)
+      .first<{ out: number }>();
+    const debtOut = Math.max(0.0, Number(evRes?.out || 0));
+
+    // Active protected allocation coverage for upcomings linked to this Payable
+    const covRes = await db
+      .prepare(
+        `SELECT COALESCE(SUM(pa.amount), 0.0) as cov
+         FROM protected_allocations pa
+         JOIN upcoming u ON pa.covers_upcoming_id = u.id
+         WHERE u.debt_id = ? AND pa.status = 'Active' AND u.status = 'Upcoming'`
+      )
+      .bind(pd.id)
+      .first<{ cov: number }>();
+    const cov = Number(covRes?.cov || 0);
+    totalUeff += Math.max(0.0, debtOut - cov);
+  }
+
+  // 5b. X_eff for Regular Upcomings (debt_id IS NULL OR debt_id = 0)
+  const upcomings = await db
+    .prepare(
+      `SELECT id, amount, status, COALESCE(reserve_now, 0) as reserve_now
+       FROM upcoming
+       WHERE (debt_id IS NULL OR debt_id = 0)
+         AND status IN ('Upcoming', 'Confirmed', 'Tentative')`
+    )
+    .all<{ id: number; amount: number; status: string; reserve_now: number }>();
+
+  let totalXeff = 0.0;
+  for (const u of upcomings.results || []) {
+    if (u.status === "Tentative" && Number(u.reserve_now || 0) === 0) {
+      continue; // Tentative without reserve_now does not deduct
+    }
+    const covRes = await db
+      .prepare("SELECT COALESCE(SUM(amount), 0.0) as cov FROM protected_allocations WHERE covers_upcoming_id = ? AND status = 'Active'")
+      .bind(u.id)
+      .first<{ cov: number }>();
+    const cov = Number(covRes?.cov || 0);
+    const amt = Number(u.amount || 0);
+    totalXeff += Math.max(0.0, amt - cov);
+  }
+
+  const currentCommitments = round2(totalUeff + totalXeff);
+
+  // 6. Pending Expenses from Provisional Neutral transactions
+  const pendRes = await db
+    .prepare(
+      `SELECT COALESCE(SUM(amount), 0.0) as pend
+       FROM transactions
+       WHERE is_deleted = 0
+         AND status = 'Provisional Neutral'
+         AND (transaction_type = 'Expense' OR (transaction_type = '' AND amount > 0))`
+    )
+    .first<{ pend: number }>();
+  const pendingExpenses = round2(Number(pendRes?.pend || 0));
+
+  // 7. Safe to Spend Formula Prompt 11:
+  // Liquid Assets - Active Allocations - Custody Outstanding - Effective Commitments - Pending Expenses
+  const safeToSpend = round2(
+    totalBalance - protectedSavings - passThroughOutstanding - currentCommitments - pendingExpenses
+  );
+
+  // 8. Monthly Income and Expense
   const monthlyRes = await db
     .prepare(
       `SELECT
@@ -166,31 +328,36 @@ export async function getDashboard(db: D1Database, monthParam?: string): Promise
   const monthExpense = round2(Number(monthlyRes?.expense || 0));
   const netCashflow = round2(monthIncome - monthExpense);
 
-  // Months available
+  return {
+    safeToSpend,
+    totalBalance,
+    protectedSavings,
+    emergencyAllocated,
+    goalsAllocated,
+    generalAllocated,
+    passThroughOutstanding,
+    currentCommitments,
+    receivablesOutstanding,
+    pendingExpenses,
+    monthIncome,
+    monthExpense,
+    netCashflow,
+    selectedMonth,
+    asOfDate: todayStr,
+  };
+}
+
+export async function getDashboard(db: D1Database, monthParam?: string): Promise<Record<string, any>> {
+  const kpis = await computeDashboardKpis(db, monthParam);
+
   const monthsRows = await db
-    .prepare(
-      `SELECT DISTINCT substr(date, 1, 7) as m FROM transactions
-       WHERE is_deleted = 0 ORDER BY m DESC`
-    )
+    .prepare("SELECT DISTINCT substr(date, 1, 7) as m FROM transactions WHERE is_deleted = 0 ORDER BY m DESC")
     .all<{ m: string }>();
   const months = (monthsRows.results || []).map((r) => r.m);
 
   return {
-    kpis: {
-      safeToSpend: safeToSpend,
-      totalBalance: totalLiquid,
-      allocatedGoals: totalAllocated,
-      emergencyFund: emergencyFund,
-      confirmedObligations: confirmedObligations,
-      tentativeReserved: tentativeReserved,
-      tentativeUnreserved: tentativeUnreserved,
-      monthIncome: monthIncome,
-      monthExpense: monthExpense,
-      netCashflow: netCashflow,
-      selectedMonth: selectedMonth,
-      asOfDate: todayStr,
-    },
-    months: months,
+    kpis,
+    months,
   };
 }
 
@@ -235,7 +402,7 @@ export async function getTransactionsList(
 }
 
 export async function getGoalsSummary(db: D1Database): Promise<Record<string, any>> {
-  const res = await db.prepare(`SELECT * FROM allocation_goals ORDER BY priority ASC, id ASC`).all();
+  const res = await db.prepare("SELECT * FROM allocation_goals ORDER BY priority ASC, id ASC").all();
   return {
     status: "success",
     goals: res.results || [],
@@ -243,7 +410,7 @@ export async function getGoalsSummary(db: D1Database): Promise<Record<string, an
 }
 
 export async function getUpcomingList(db: D1Database): Promise<Record<string, any>> {
-  const res = await db.prepare(`SELECT * FROM upcoming ORDER BY due_date ASC, id ASC`).all();
+  const res = await db.prepare("SELECT * FROM upcoming ORDER BY due_date ASC, id ASC").all();
   return {
     status: "ok",
     upcoming: res.results || [],
@@ -251,8 +418,8 @@ export async function getUpcomingList(db: D1Database): Promise<Record<string, an
 }
 
 export async function getDebtsList(db: D1Database): Promise<Record<string, any>> {
-  const debts = await db.prepare(`SELECT * FROM debts ORDER BY id ASC`).all();
-  const events = await db.prepare(`SELECT * FROM debt_events ORDER BY event_date ASC, id ASC`).all();
+  const debts = await db.prepare("SELECT * FROM debts ORDER BY id ASC").all();
+  const events = await db.prepare("SELECT * FROM debt_events ORDER BY event_date ASC, id ASC").all();
   return {
     status: "success",
     debts: debts.results || [],
@@ -263,7 +430,6 @@ export async function getDebtsList(db: D1Database): Promise<Record<string, any>>
 export async function getInsightsSummary(db: D1Database, asOfDate?: string): Promise<Record<string, any>> {
   const targetDate = asOfDate || getWibDate().dateStr;
 
-  // Source Freshness
   const lastTx = await db
     .prepare(
       `SELECT date, time FROM transactions
@@ -397,7 +563,7 @@ export function parseGmailNotification(
     date: wib.dateStr,
     time: wib.timeStr,
     confidence_score: 0.4,
-    reasons: `Unknown sender '${fromAddress}'. Requires manual review.`,
+    reasons: "Unknown sender. Requires manual review.",
     status: "Pending",
   };
 }

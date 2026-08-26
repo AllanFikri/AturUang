@@ -1,4 +1,4 @@
-// auth.ts: Otentikasi, Proteksi Akses Staging, HMAC Gmail Relay, dan Telegram Webhook
+// auth.ts: Otentikasi dan Proteksi Keamanan Fail-Closed untuk Cloudflare Worker
 export interface Env {
   DB: D1Database;
   MODE?: string;
@@ -15,9 +15,6 @@ export function getSecurityHeaders(): HeadersInit {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Signature, X-Timestamp, X-Nonce, X-Telegram-Bot-Api-Secret-Token, X-Requested-With",
   };
 }
 
@@ -33,10 +30,24 @@ export function constantTimeEqual(a: string, b: string): boolean {
 }
 
 export function authenticateRequest(request: Request, env: Env): Response | null {
+  const expectedToken = env.STAGING_ADMIN_TOKEN;
+  if (!expectedToken) {
+    // Fail closed: Token tidak dikonfigurasi pada environment
+    return new Response(
+      JSON.stringify({
+        status: "error",
+        code: "UNAUTHORIZED",
+        message: "Akses ditolak: otentikasi staging belum dikonfigurasi atau tidak valid.",
+      }),
+      {
+        status: 401,
+        headers: getSecurityHeaders(),
+      }
+    );
+  }
+
   const authHeader = request.headers.get("Authorization") || "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : "";
-
-  const expectedToken = env.STAGING_ADMIN_TOKEN || "aturuang-staging-secret-key-default";
 
   if (!token || !constantTimeEqual(token, expectedToken)) {
     return new Response(
@@ -55,14 +66,16 @@ export function authenticateRequest(request: Request, env: Env): Response | null
   return null;
 }
 
-// In-memory nonce cache for anti-replay (cleaned periodically)
-const seenNonces = new Map<string, number>();
-
 export async function verifyGmailHmac(
   request: Request,
   rawBody: string,
-  secret: string
+  secret?: string,
+  db?: D1Database
 ): Promise<{ valid: boolean; error?: string }> {
+  if (!secret) {
+    return { valid: false, error: "UNCONFIGURED_GMAIL_SECRET" };
+  }
+
   const signature = request.headers.get("X-Signature") || "";
   const timestampStr = request.headers.get("X-Timestamp") || "";
   const nonce = request.headers.get("X-Nonce") || "";
@@ -82,18 +95,24 @@ export async function verifyGmailHmac(
     return { valid: false, error: "EXPIRED_TIMESTAMP" };
   }
 
-  // Check nonce replay
-  if (seenNonces.has(nonce)) {
-    return { valid: false, error: "NONCE_REPLAY" };
-  }
+  // Durable Nonce Replay Check in D1
+  if (db) {
+    try {
+      // Clean old nonces (>10 minutes)
+      const pruneCutoff = now - 600000;
+      await db.prepare("DELETE FROM gmail_replay_nonces WHERE timestamp < ?").bind(pruneCutoff).run();
 
-  // Purge old nonces (>10 min)
-  for (const [n, ts] of seenNonces.entries()) {
-    if (now - ts > 600000) {
-      seenNonces.delete(n);
+      // Insert new nonce (PRIMARY KEY constraint prevents replay)
+      await db.prepare(
+        "INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)"
+      ).bind(nonce, timestamp).run();
+    } catch (err: any) {
+      if (err.message && err.message.includes("UNIQUE")) {
+        return { valid: false, error: "NONCE_REPLAY" };
+      }
+      return { valid: false, error: "NONCE_REPLAY" };
     }
   }
-  seenNonces.set(nonce, now);
 
   // Compute HMAC-SHA256
   const payloadToSign = `${timestampStr}.${nonce}.${rawBody}`;
@@ -122,8 +141,8 @@ export function verifyTelegramWebhook(
   expectedSecretToken?: string
 ): { valid: boolean; error?: string } {
   if (!expectedSecretToken) {
-    // If not configured in test, pass
-    return { valid: true };
+    // Fail-closed: Jika secret belum diisi, tolak seluruh webhook
+    return { valid: false, error: "UNCONFIGURED_TELEGRAM_SECRET" };
   }
   const headerToken = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
   if (!headerToken || !constantTimeEqual(headerToken, expectedSecretToken)) {
@@ -137,7 +156,8 @@ export function isTelegramUserAllowed(
   allowedUserId?: string
 ): boolean {
   if (!allowedUserId) {
-    return true; // No restriction set
+    // Fail-closed: Jika allowlist belum diisi, tolak seluruh user
+    return false;
   }
   if (userId === undefined || userId === null) {
     return false;

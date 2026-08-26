@@ -28,7 +28,7 @@ export default {
     const path = url.pathname;
     const method = request.method.toUpperCase();
 
-    // CORS Preflight
+    // CORS Preflight: Default deny non-allowed methods
     if (method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -65,19 +65,18 @@ export default {
     }
 
     // =================================================================
-    // 2. GMAIL INGESTION RELAY (HMAC-SHA256 Protected)
+    // 2. GMAIL INGESTION RELAY (HMAC-SHA256 & Durable Replay Protected)
     // =================================================================
     if (path === "/api/ingest/gmail" && method === "POST") {
       const rawBody = await request.text();
-      const secret = env.GMAIL_RELAY_SECRET || "aturuang_gmail_relay_secret_default";
 
-      const hmacCheck = await verifyGmailHmac(request, rawBody, secret);
+      const hmacCheck = await verifyGmailHmac(request, rawBody, env.GMAIL_RELAY_SECRET, env.DB);
       if (!hmacCheck.valid) {
         return new Response(
           JSON.stringify({
             status: "error",
             code: hmacCheck.error || "HMAC_VERIFICATION_FAILED",
-            message: "Otentikasi Gmail relay gagal.",
+            message: "Otentikasi Gmail relay ditolak.",
           }),
           { status: 401, headers: getSecurityHeaders() }
         );
@@ -89,12 +88,18 @@ export default {
 
         if (!message_id) {
           return new Response(
-            JSON.stringify({ status: "error", message: "message_id wajib disertakan." }),
+            JSON.stringify({ status: "error", code: "BAD_REQUEST", message: "message_id wajib disertakan." }),
             { status: 400, headers: getSecurityHeaders() }
           );
         }
 
         const now = getWibDate().dateStr;
+
+        // Compute actual deterministic SHA-256 hash of payload
+        const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rawBody));
+        const payloadHash = Array.from(new Uint8Array(hashBuf))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
 
         // Idempotency check on raw_events
         const existing = await env.DB.prepare(
@@ -113,11 +118,21 @@ export default {
           );
         }
 
+        // Extract sanitized sender domain (e.g. bca.co.id) instead of raw personal email
+        const senderDomain = String(from || "").includes("@")
+          ? String(from).split("@")[1].replace(/[>]/g, "").trim().toLowerCase()
+          : "unknown";
+
+        const minimalPayload = JSON.stringify({
+          sender_domain: senderDomain,
+          subject_sanitized: String(subject || "").substring(0, 100),
+        });
+
         // Insert raw event
         const rawRes = await env.DB.prepare(
           `INSERT INTO raw_events (source, external_id, occurred_at, payload_hash, parser_version, state, minimal_raw_payload)
            VALUES ('gmail', ?, ?, ?, '1.0.0', 'Parsed', ?)`
-        ).bind(message_id, internal_date || now, "sha256_hash", JSON.stringify({ from, subject })).run();
+        ).bind(message_id, internal_date || now, payloadHash, minimalPayload).run();
 
         const rawEventId = rawRes.meta.last_row_id;
 
@@ -169,7 +184,7 @@ export default {
         );
       } catch (err: any) {
         return new Response(
-          JSON.stringify({ status: "error", code: "INTERNAL_SERVER_ERROR", message: `Gagal memproses email: ${err.message}` }),
+          JSON.stringify({ status: "error", code: "INTERNAL_SERVER_ERROR", message: "Terjadi kesalahan internal pada layanan backend cloud." }),
           { status: 500, headers: getSecurityHeaders() }
         );
       }
@@ -182,7 +197,7 @@ export default {
       const secCheck = verifyTelegramWebhook(request, env.TELEGRAM_SECRET_TOKEN);
       if (!secCheck.valid) {
         return new Response(
-          JSON.stringify({ status: "error", message: "Secret token Telegram tidak valid." }),
+          JSON.stringify({ status: "error", code: "UNAUTHORIZED", message: "Secret token Telegram tidak valid." }),
           { status: 401, headers: getSecurityHeaders() }
         );
       }
@@ -247,11 +262,17 @@ export default {
             );
           }
 
+          // Compute deterministic SHA-256
+          const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+          const textHash = Array.from(new Uint8Array(hashBuf))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join("");
+
           // Handle structured text
           const rawRes = await env.DB.prepare(
             `INSERT INTO raw_events (source, external_id, occurred_at, payload_hash, parser_version, state, minimal_raw_payload)
-             VALUES ('telegram', ?, CURRENT_TIMESTAMP, 'tg_hash', '1.0.0', 'Parsed', ?)`
-          ).bind(msgId, JSON.stringify({ text })).run();
+             VALUES ('telegram', ?, CURRENT_TIMESTAMP, ?, '1.0.0', 'Parsed', ?)`
+          ).bind(msgId, textHash, JSON.stringify({ length: text.length })).run();
 
           const rawEventId = rawRes.meta.last_row_id;
           const cand = parseTelegramText(text);
@@ -292,14 +313,14 @@ export default {
         );
       } catch (err: any) {
         return new Response(
-          JSON.stringify({ status: "error", code: "INTERNAL_SERVER_ERROR", message: err.message }),
+          JSON.stringify({ status: "error", code: "INTERNAL_SERVER_ERROR", message: "Terjadi kesalahan internal pada layanan backend cloud." }),
           { status: 500, headers: getSecurityHeaders() }
         );
       }
     }
 
     // =================================================================
-    // 4. AUTHENTICATION FOR STAGING API
+    // 4. AUTHENTICATION FOR STAGING API (Fail-Closed)
     // =================================================================
     const authError = authenticateRequest(request, env);
     if (authError) {

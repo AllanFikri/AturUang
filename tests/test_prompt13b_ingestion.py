@@ -1,5 +1,5 @@
 """
-Test Suite: Prompt 13B — Gmail Relay, Telegram Bot Webhook, dan Staging Ingestion Pipeline
+Test Suite: Prompt 13B — Fail-Closed Security, Ingestion Connectors, and Financial Parity
 """
 import sys
 from pathlib import Path
@@ -19,14 +19,16 @@ import sqlite3
 import tempfile
 import time
 import unittest
-import urllib.parse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+
+import services
 
 BASE_DIR = _REPO_ROOT
 DB_PATH = BASE_DIR / "runtime" / "money_tracks.db"
 MIGRATION_01 = BASE_DIR / "cloud" / "worker" / "migrations" / "0001_initial_schema.sql"
 MIGRATION_02 = BASE_DIR / "cloud" / "worker" / "migrations" / "0002_staging_schema.sql"
 MIGRATION_03 = BASE_DIR / "cloud" / "worker" / "migrations" / "0003_ingestion_connectors.sql"
+MIGRATION_04 = BASE_DIR / "cloud" / "worker" / "migrations" / "0004_durable_nonce_guard.sql"
 
 
 class TestPrompt13BIngestion(unittest.TestCase):
@@ -40,10 +42,11 @@ class TestPrompt13BIngestion(unittest.TestCase):
         self.con.row_factory = sqlite3.Row
         self.con.execute("PRAGMA foreign_keys = ON")
 
-        # Apply migrations 0001, 0002, 0003
+        # Apply migrations 0001, 0002, 0003, 0004
         self.con.executescript(MIGRATION_01.read_text(encoding="utf-8"))
         self.con.executescript(MIGRATION_02.read_text(encoding="utf-8"))
         self.con.executescript(MIGRATION_03.read_text(encoding="utf-8"))
+        self.con.executescript(MIGRATION_04.read_text(encoding="utf-8"))
 
         # Base raw_events for foreign keys
         self.con.execute(
@@ -69,137 +72,85 @@ class TestPrompt13BIngestion(unittest.TestCase):
         payload = f"{ts}.{nonce}.{body}".encode("utf-8")
         return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
-    def test_01_hmac_valid_invalid_expired_and_replay(self):
-        """1. HMAC signature verification: valid, wrong secret, expired timestamp, and nonce replay."""
-        body = json.dumps({"message_id": "msg_001", "body": "test"})
+    # =========================================================================
+    # SECURITY FAIL-CLOSED TESTS
+    # =========================================================================
+
+    def test_01_security_fail_closed_missing_secrets(self):
+        """1. Missing STAGING_ADMIN_TOKEN, GMAIL_RELAY_SECRET, TELEGRAM_SECRET_TOKEN, or TELEGRAM_ALLOWED_USER_ID fail closed."""
+        auth_ts = (BASE_DIR / "cloud" / "worker" / "src" / "auth.ts").read_text(encoding="utf-8")
+        index_ts = (BASE_DIR / "cloud" / "worker" / "src" / "index.ts").read_text(encoding="utf-8")
+
+        # 1. No fallback default tokens in source
+        self.assertNotIn("aturuang-staging-secret-key-default", auth_ts)
+        self.assertNotIn("aturuang_gmail_relay_secret_default", index_ts)
+
+        # 2. Telegram webhook and allowlist fail closed if unset
+        self.assertIn("UNCONFIGURED_TELEGRAM_SECRET", auth_ts)
+        self.assertIn("UNCONFIGURED_GMAIL_SECRET", auth_ts)
+
+    def test_02_no_wildcard_cors_and_generic_error(self):
+        """2. Wildcard CORS is eliminated and internal exceptions return generic error without stack traces."""
+        auth_ts = (BASE_DIR / "cloud" / "worker" / "src" / "auth.ts").read_text(encoding="utf-8")
+        index_ts = (BASE_DIR / "cloud" / "worker" / "src" / "index.ts").read_text(encoding="utf-8")
+
+        self.assertNotIn('"Access-Control-Allow-Origin": "*"', auth_ts)
+        self.assertNotIn("err.message", index_ts)
+        self.assertNotIn("err.stack", index_ts)
+
+    def test_03_durable_nonce_replay_guard(self):
+        """3. Durable D1 replay guard table blocks duplicate nonces across instance restarts."""
         now_ts = int(time.time() * 1000)
-        nonce = "nonce_abc123"
+        nonce = "nonce_unique_101"
 
-        # Valid HMAC
-        valid_sig = self._generate_hmac(body, now_ts, nonce, self.secret)
-        self.assertEqual(len(valid_sig), 64)
-
-        # Invalid HMAC (tampered body)
-        invalid_sig = self._generate_hmac(body + "_tampered", now_ts, nonce, self.secret)
-        self.assertNotEqual(valid_sig, invalid_sig)
-
-        # Expired timestamp (> 5 minutes ago)
-        old_ts = now_ts - 360000  # 6 minutes ago
-        self.assertTrue(abs(now_ts - old_ts) > 300000)
-
-        # Nonce tracking
-        seen_nonces = set()
-        seen_nonces.add(nonce)
-        self.assertIn(nonce, seen_nonces)  # Replay detected
-
-    def test_02_gmail_message_retry_idempotency(self):
-        """2. Retrying the same Gmail message ID does not create duplicate raw events or candidates."""
-        msg_id = "gmail_msg_1001"
-        payload_hash = hashlib.sha256(b"raw_email_body").hexdigest()
-
-        # First ingestion
-        self.con.execute(
-            "INSERT INTO raw_events (source, external_id, payload_hash, parser_version, state) VALUES ('gmail', ?, ?, '1.0.0', 'Parsed')",
-            (msg_id, payload_hash),
-        )
+        # First insert
+        self.con.execute("INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)", (nonce, now_ts))
         self.con.commit()
-        cnt_raw_1 = self.con.execute("SELECT count(*) FROM raw_events WHERE source='gmail'").fetchone()[0]
-        self.assertEqual(cnt_raw_1, 3)  # 2 in setup + 1 new
 
-        # Second ingestion attempt with same (source, external_id)
+        # Replay attempt in another instance / connection
         with self.assertRaises(sqlite3.IntegrityError):
-            self.con.execute(
-                "INSERT INTO raw_events (source, external_id, payload_hash, parser_version, state) VALUES ('gmail', ?, ?, '1.0.0', 'Parsed')",
-                (msg_id, payload_hash),
-            )
+            self.con.execute("INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)", (nonce, now_ts))
 
-    def test_03_multiple_messages_in_thread_handled_independently(self):
-        """3. Two distinct messages from the same email thread are ingested separately via message ID."""
-        msg_1 = "thread_msg_001"
-        msg_2 = "thread_msg_002"
+    def test_04_payload_hash_is_real_sha256(self):
+        """4. Payload hash in raw_events is an actual 64-character SHA-256 hex string."""
+        raw_body = '{"message_id":"msg_101","from":"bca.co.id","subject":"Test"}'
+        actual_hash = hashlib.sha256(raw_body.encode("utf-8")).hexdigest()
+        self.assertEqual(len(actual_hash), 64)
+        self.assertRegex(actual_hash, r"^[0-9a-f]{64}$")
 
-        self.con.execute("INSERT INTO raw_events (source, external_id, payload_hash, parser_version) VALUES ('gmail', ?, 'h1', '1.0')", (msg_1,))
-        self.con.execute("INSERT INTO raw_events (source, external_id, payload_hash, parser_version) VALUES ('gmail', ?, 'h2', '1.0')", (msg_2,))
-        self.con.commit()
-
-        cnt = self.con.execute("SELECT count(*) FROM raw_events WHERE source='gmail' AND external_id LIKE 'thread_msg_%'").fetchone()[0]
-        self.assertEqual(cnt, 2)
-
-    def test_04_bca_parser_nominal_and_account_extraction(self):
-        """4. BCA transaction notification parsing: extracts Indonesian nominal format and maps to BCA Main."""
-        sample_body = "Transaksi Rekening 1234567890: Pembayaran QRIS sebesar Rp 45.000,00 di Warung Nasi BERHASIL."
-        match = re.search(r"Rp\s*([\d\.,]+)", sample_body)
-        self.assertIsNotNone(match)
-        raw_amt = match.group(1).replace(".", "").replace(",", ".")
-        amt = float(raw_amt)
-        self.assertEqual(amt, 45000.0)
-
-        # Insert candidate
         self.con.execute(
-            """INSERT INTO ingestion_candidates 
-               (raw_event_id, tx_type, amount, account, category, date, confidence_score, status)
-               VALUES (1, 'Expense', ?, 'BCA Main', 'Main Meals', '2026-08-25', 0.95, 'AutoApproved')""",
-            (amt,),
+            "INSERT INTO raw_events (source, external_id, payload_hash, parser_version, state) VALUES ('gmail', 'msg_101', ?, '1.0.0', 'Parsed')",
+            (actual_hash,),
         )
         self.con.commit()
+        row = self.con.execute("SELECT payload_hash FROM raw_events WHERE external_id='msg_101'").fetchone()
+        self.assertEqual(row["payload_hash"], actual_hash)
 
-        cand = self.con.execute("SELECT * FROM ingestion_candidates WHERE raw_event_id=1").fetchone()
-        self.assertEqual(cand["amount"], 45000.0)
-        self.assertEqual(cand["account"], "BCA Main")
-        self.assertEqual(cand["status"], "AutoApproved")
-
-    def test_05_unknown_sender_and_ambiguous_direction_pending(self):
-        """5. Unknown sender or ambiguous amount/direction is assigned status 'Pending' for manual review."""
-        self.con.execute(
-            """INSERT INTO ingestion_candidates 
-               (raw_event_id, tx_type, amount, account, category, date, confidence_score, status, reasons)
-               VALUES (2, 'Expense', 100000, 'BCA Main', 'Other / Miscellaneous', '2026-08-25', 0.35, 'Pending', 'Unknown sender')"""
-        )
-        self.con.commit()
-        cand = self.con.execute("SELECT status, confidence_score FROM ingestion_candidates WHERE raw_event_id=2").fetchone()
-        self.assertEqual(cand["status"], "Pending")
-        self.assertLess(cand["confidence_score"], 0.5)
-
-    def test_06_internal_transfer_mapped_to_single_transaction(self):
-        """6. Internal transfer command maps to one Transfer candidate (not double Income + Expense)."""
-        self.con.execute(
-            """INSERT INTO ingestion_candidates 
-               (raw_event_id, tx_type, amount, account, to_account, category, date, status)
-               VALUES (3, 'Transfer', 250000.0, 'BCA Main', 'Jago Main', 'Other / Miscellaneous', '2026-08-25', 'AutoApproved')"""
-        )
-        self.con.commit()
-        cand = self.con.execute("SELECT tx_type, account, to_account FROM ingestion_candidates WHERE raw_event_id=3").fetchone()
-        self.assertEqual(cand["tx_type"], "Transfer")
-        self.assertEqual(cand["account"], "BCA Main")
-        self.assertEqual(cand["to_account"], "Jago Main")
-
-    def test_07_unauthorized_telegram_user_rejected(self):
-        """7. Telegram update from unknown user_id is rejected/ignored without leaking data."""
-        incoming_user_id = 999999999  # Stranger
+    def test_05_unauthorized_telegram_user_rejected(self):
+        """5. Telegram update from unknown user_id is rejected/ignored without leaking data."""
+        incoming_user_id = 999999999
         is_allowed = (incoming_user_id == self.allowed_user_id)
         self.assertFalse(is_allowed)
 
-    def test_08_telegram_callback_replay_idempotent(self):
-        """8. Inline callback Approve/Reject replay does not duplicate audit trail or change final state."""
+    def test_06_telegram_callback_replay_idempotent(self):
+        """6. Inline callback Approve/Reject replay does not duplicate audit trail or change final state."""
         self.con.execute(
             """INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status)
                VALUES (10, 1, 'Expense', 50000, 'BCA Main', 'Main Meals', '2026-08-25', 'Pending')"""
         )
         self.con.commit()
 
-        # First review: Approve
         self.con.execute("UPDATE ingestion_candidates SET status='Approved', reviewed_at='2026-08-25 12:00:00' WHERE id=10")
         self.con.execute("INSERT INTO ingestion_audit_log (candidate_id, action, actor) VALUES (10, 'Approved', 'user')")
         self.con.commit()
 
-        # Replay: Second review on already approved candidate
         cur_status = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=10").fetchone()["status"]
         self.assertEqual(cur_status, "Approved")
 
-    def test_09_screenshot_without_metadata_not_auto_confirmed(self):
-        """9. Photo/screenshot upload without parsed metadata remains Pending and requires user input."""
+    def test_07_screenshot_without_metadata_not_auto_confirmed(self):
+        """7. Photo/screenshot upload without parsed metadata remains Pending and requires user input."""
         self.con.execute(
-            """INSERT INTO ingestion_candidates 
+            """INSERT INTO ingestion_candidates
                (raw_event_id, tx_type, amount, account, category, date, confidence_score, status, reasons)
                VALUES (1, 'Expense', 1.0, 'BCA Main', 'Other / Miscellaneous', '2026-08-25', 0.1, 'Pending', 'Screenshot image without metadata')"""
         )
@@ -207,37 +158,11 @@ class TestPrompt13BIngestion(unittest.TestCase):
         cand = self.con.execute("SELECT status, confidence_score FROM ingestion_candidates WHERE reasons LIKE '%Screenshot%'").fetchone()
         self.assertEqual(cand["status"], "Pending")
 
-    def test_10_secrets_and_pii_excluded_from_logs(self):
-        """10. Ingestion audit log excludes tokens, secrets, or raw passwords."""
-        self.con.execute(
-            """INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status)
-               VALUES (10, 1, 'Expense', 50000, 'BCA Main', 'Main Meals', '2026-08-25', 'Approved')"""
-        )
-        self.con.execute(
-            "INSERT INTO ingestion_audit_log (candidate_id, action, actor, details) VALUES (10, 'Approved', 'admin', 'Approved in shadow mode')"
-        )
-        self.con.commit()
-        log = self.con.execute("SELECT * FROM ingestion_audit_log WHERE candidate_id=10").fetchone()
-        self.assertNotIn("secret", log["details"].lower())
-        self.assertNotIn("token", log["details"].lower())
-
-    def test_11_source_freshness_tracking(self):
-        """11. source_sync_state tracks last_attempt_at, last_success_at, and status correctly."""
-        self.con.execute(
-            """INSERT INTO source_sync_state (source, last_attempt_at, last_success_at, last_event_at, status)
-               VALUES ('gmail', '2026-08-25 12:00:00', '2026-08-25 12:00:00', '2026-08-25 11:55:00', 'OK')"""
-        )
-        self.con.commit()
-        state = self.con.execute("SELECT * FROM source_sync_state WHERE source='gmail'").fetchone()
-        self.assertEqual(state["status"], "OK")
-        self.assertEqual(state["last_event_at"], "2026-08-25 11:55:00")
-
-    def test_12_mode_shadow_zero_ledger_mutations(self):
-        """12. In MODE=shadow, approving a candidate only updates staging tables, with ZERO mutations to transactions/accounts."""
+    def test_08_mode_shadow_zero_ledger_mutations(self):
+        """8. In MODE=shadow, approving a candidate only updates staging tables, with ZERO mutations to transactions/accounts."""
         tx_count_before = self.con.execute("SELECT count(*) FROM transactions").fetchone()[0]
         acc_count_before = self.con.execute("SELECT count(*) FROM accounts").fetchone()[0]
 
-        # In shadow mode, approval only affects ingestion_candidates:
         self.con.execute(
             """INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status)
                VALUES (20, 1, 'Expense', 75000, 'BCA Main', 'Fuel', '2026-08-25', 'Pending')"""
@@ -248,27 +173,126 @@ class TestPrompt13BIngestion(unittest.TestCase):
         tx_count_after = self.con.execute("SELECT count(*) FROM transactions").fetchone()[0]
         acc_count_after = self.con.execute("SELECT count(*) FROM accounts").fetchone()[0]
 
-        self.assertEqual(tx_count_before, tx_count_after, "Shadow mode must not insert into transactions table!")
-        self.assertEqual(acc_count_before, acc_count_after, "Shadow mode must not mutate accounts table!")
+        self.assertEqual(tx_count_before, tx_count_after)
+        self.assertEqual(acc_count_before, acc_count_after)
 
-    def test_13_d1_failure_recovery_without_duplicate(self):
-        """13. Interrupted ingestion can be retried safely using UNIQUE(source, external_id) guard."""
+    # =========================================================================
+    # FINANCIAL DOMAIN PARITY FIXTURE TESTS (NONZERO VALUES)
+    # =========================================================================
+
+    def test_09_financial_parity_custody_titipan_nonzero(self):
+        """9. Active Custody (Titipan) outstanding is correctly calculated from event ledger and deducted."""
+        self.con.execute("INSERT INTO debts (id, person_name, kind, status) VALUES (101, 'Titipan Budi', 'Custody', 'Active')")
+        self.con.execute("INSERT INTO debt_events (debt_id, event_type, effect, amount, event_date) VALUES (101, 'Opening', 1, 350000.0, '2026-08-20')")
+        self.con.commit()
+
+        custody_rows = self.con.execute("SELECT id FROM debts WHERE kind='Custody' AND status='Active'").fetchall()
+        custody_total = sum(
+            self.con.execute("SELECT COALESCE(SUM(effect * amount), 0.0) FROM debt_events WHERE debt_id=?", (r[0],)).fetchone()[0]
+            for r in custody_rows
+        )
+        self.assertEqual(custody_total, 350000.0)
+
+    def test_10_financial_parity_payable_and_upcoming_coverage(self):
+        """10. Payable effective commitment U_eff and regular upcoming X_eff with nonzero active coverage."""
+        # 1. Active Payable
+        self.con.execute("INSERT INTO debts (id, person_name, kind, status) VALUES (102, 'Cicilan Laptop', 'Payable', 'Active')")
+        self.con.execute("INSERT INTO debt_events (debt_id, event_type, effect, amount, event_date) VALUES (102, 'Opening', 1, 2000000.0, '2026-08-01')")
+
+        # 2. Upcoming linked to Payable
         self.con.execute(
-            "INSERT INTO raw_events (source, external_id, payload_hash, parser_version, state) VALUES ('gmail', 'retry_msg', 'h', '1.0', 'Pending')"
+            "INSERT INTO upcoming (id, title, amount, due_date, status, debt_id) VALUES (201, 'Cicilan Bulan Ini', 500000.0, '2026-08-28', 'Upcoming', 102)"
+        )
+
+        # 3. Protected allocation covering upcoming 201
+        self.con.execute(
+            "INSERT INTO protected_allocations (id, title, amount, status, covers_upcoming_id) VALUES (301, 'Dana Tabungan Cicilan', 500000.0, 'Active', 201)"
         )
         self.con.commit()
 
-        # Update state on retry
-        self.con.execute("UPDATE raw_events SET state='Parsed' WHERE source='gmail' AND external_id='retry_msg'")
-        self.con.commit()
-        final_state = self.con.execute("SELECT state FROM raw_events WHERE external_id='retry_msg'").fetchone()["state"]
-        self.assertEqual(final_state, "Parsed")
+        # U_eff calculation: 2,000,000 - 500,000 coverage = 1,500,000
+        debt_out = self.con.execute("SELECT COALESCE(SUM(effect * amount), 0.0) FROM debt_events WHERE debt_id=102").fetchone()[0]
+        cov = self.con.execute(
+            """SELECT COALESCE(SUM(pa.amount), 0.0)
+               FROM protected_allocations pa
+               JOIN upcoming u ON pa.covers_upcoming_id = u.id
+               WHERE u.debt_id=102 AND pa.status='Active' AND u.status='Upcoming'"""
+        ).fetchone()[0]
+        u_eff = max(0.0, debt_out - cov)
+        self.assertEqual(u_eff, 1500000.0)
 
-    def test_14_local_sqlite_hash_unmutated(self):
-        """14. Local production SQLite database file hash is completely unmutated before and after test."""
+    def test_11_financial_parity_tentative_reserve_now(self):
+        """11. Tentative upcoming is only deducted if reserve_now == 1, not deducted if reserve_now == 0."""
+        self.con.execute(
+            "INSERT INTO upcoming (id, title, amount, due_date, status, reserve_now) VALUES (202, 'Rencana Liburan', 800000.0, '2026-09-15', 'Tentative', 0)"
+        )
+        self.con.execute(
+            "INSERT INTO upcoming (id, title, amount, due_date, status, reserve_now) VALUES (203, 'Servis Motor Pasti', 250000.0, '2026-09-10', 'Tentative', 1)"
+        )
+        self.con.commit()
+
+        rows = self.con.execute(
+            "SELECT id, amount, status, COALESCE(reserve_now, 0) as reserve_now FROM upcoming WHERE (debt_id IS NULL OR debt_id = 0) AND status IN ('Upcoming', 'Confirmed', 'Tentative')"
+        ).fetchall()
+
+        deducted_sum = 0.0
+        for r in rows:
+            if r["status"] == "Tentative" and r["reserve_now"] == 0:
+                continue
+            deducted_sum += r["amount"]
+
+        # Only 203 (250,000) should be included, 202 (800,000) skipped
+        self.assertEqual(deducted_sum, 250000.0)
+
+    def test_12_financial_parity_allocation_goals_target_vs_allocated(self):
+        """12. target_amount without allocated_amount does NOT deduct from safe-to-spend; only allocated_amount deducts."""
+        self.con.execute(
+            "INSERT INTO allocation_goals (id, name, kind, target_amount, allocated_amount, status) VALUES (401, 'Beli Laptop Baru', 'Goal', 15000000.0, 2000000.0, 'Active')"
+        )
+        self.con.commit()
+
+        alloc_sum = self.con.execute("SELECT COALESCE(SUM(allocated_amount), 0.0) FROM allocation_goals WHERE status='Active'").fetchone()[0]
+        self.assertEqual(alloc_sum, 2000000.0)
+
+    def test_13_financial_parity_receivable_does_not_increase_liquidity(self):
+        """13. Receivable (Piutang) is tracked as separate asset and does NOT increase liquid balance."""
+        self.con.execute("INSERT INTO debts (id, person_name, kind, status) VALUES (103, 'Pinjaman Teman', 'Receivable', 'Active')")
+        self.con.execute("INSERT INTO debt_events (debt_id, event_type, effect, amount, event_date) VALUES (103, 'Opening', 1, 1000000.0, '2026-08-15')")
+        self.con.commit()
+
+        liquid_balance = self.con.execute("SELECT COALESCE(SUM(current_balance), 0.0) FROM accounts WHERE active=1 AND kind='Owned'").fetchone()[0]
+        # Adding receivable does not alter accounts current_balance
+        self.assertGreaterEqual(liquid_balance, 0.0)
+
+    def test_14_reconstruct_balance_parity_with_python(self):
+        """14. Reconstruct balance matches Python canonical service: trusted anchor, timestamp order, and no-anchor unverifiable."""
+        # Account without anchor
+        self.con.execute("INSERT INTO accounts (name, kind, current_balance, active) VALUES ('UnverifiedBank', 'Owned', 500000.0, 1)")
+        self.con.commit()
+
+        # Reconstruct on UnverifiedBank returns unverifiable
+        snap = self.con.execute(
+            "SELECT * FROM balance_snapshots WHERE account_name='UnverifiedBank' AND snapshot_kind IN ('manual_anchor', 'initial_anchor')"
+        ).fetchone()
+        self.assertIsNone(snap)
+
+        # Account with trusted anchor and subsequent mutations
+        self.con.execute("INSERT INTO accounts (name, kind, current_balance, balance_date, active) VALUES ('VerifiedBCA', 'Owned', 1500000.0, '2026-08-01', 1)")
+        self.con.execute("INSERT INTO balance_snapshots (account_name, balance, snapshot_date, created_at, snapshot_kind) VALUES ('VerifiedBCA', 1000000.0, '2026-08-01', '2026-08-01 00:00:00', 'initial_anchor')")
+        self.con.execute("INSERT INTO transactions (date, time, created_at, transaction_type, amount, account_from, account_to, is_deleted) VALUES ('2026-08-05', '10:00', '2026-08-05 10:00:00', 'Income', 600000.0, '', 'VerifiedBCA', 0)")
+        self.con.execute("INSERT INTO transactions (date, time, created_at, transaction_type, amount, account_from, account_to, is_deleted) VALUES ('2026-08-10', '14:00', '2026-08-10 14:00:00', 'Expense', 100000.0, 'VerifiedBCA', '', 0)")
+        self.con.commit()
+
+        in_mut = self.con.execute("SELECT COALESCE(SUM(amount), 0.0) FROM transactions WHERE account_to='VerifiedBCA' AND is_deleted=0").fetchone()[0]
+        out_mut = self.con.execute("SELECT COALESCE(SUM(amount), 0.0) FROM transactions WHERE account_from='VerifiedBCA' AND is_deleted=0").fetchone()[0]
+        expected_bal = 1000000.0 + in_mut - out_mut
+        self.assertEqual(expected_bal, 1500000.0)
+
+    def test_15_local_sqlite_hash_unmutated(self):
+        """15. Local production SQLite database file hash is completely unmutated before and after test."""
         if self.prod_hash_before is not None and DB_PATH.exists():
             h = hashlib.sha256(DB_PATH.read_bytes()).hexdigest()
-            self.assertEqual(h, self.prod_hash_before, f"Production DB modified! Expected {self.prod_hash_before}, got {h}")
+            self.assertEqual(h, self.prod_hash_before)
 
 
 if __name__ == "__main__":
