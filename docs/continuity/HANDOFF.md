@@ -47,8 +47,8 @@ explicit project-level decision.
 
 ## Current Git state
 
-HEAD before continuity documentation commit:
-841fc63
+Current implementation HEAD before this handoff update:
+a066a40
 
 Recent commits:
 - 841fc63 chore(gmail): prepare controlled february backfill
@@ -213,15 +213,17 @@ Asia/Jakarta / WIB.
 
 ## Immediate next action
 
-1. Commit durable continuity documentation.
-2. Prepare a March-2025-only controlled backfill runner.
-3. Paste repository Code.gs into the existing Google Apps Script project.
-4. Run March once.
-5. Stop.
-6. Perform exact D1 + SQLite audit.
-7. Only proceed to April if the March audit passes.
+The March-only runner from commit a066a40 was superseded before execution.
 
-Do not batch February-through-latest blindly.
+Do NOT execute backfillMarch2025Trial().
+
+Current authoritative Gmail checkpoint:
+2025-03
+
+Next engineering action:
+Implement and validate Historical Backfill v2 with a fail-fast circuit breaker
+for closed months through 2026-07.
+
 
 ## Do not do
 

@@ -477,3 +477,58 @@ Prepare and validate March 2025 historical Gmail backfill.
 
 Do not start broad multi-month backfill or Prompt 14 cutover until the
 controlled historical validation sequence is intentionally completed.
+
+## Continuity foundation and March preparation
+
+Continuity documentation was established and pushed:
+
+- commit 1f78c33 docs(project): add durable continuity log
+- WORKLOG.md created
+- HANDOFF.md created
+- DECISIONS.md created
+- WORKING_RULES.md created
+
+This makes repository documentation, rather than chat memory alone,
+the continuity mechanism for future GPT/ChatGPT sessions.
+
+After the clean February 2025 audit, the controlled Apps Script helper
+was advanced from February to March only.
+
+March runner preparation:
+- commit a066a40 chore(gmail): prepare controlled march backfill
+- required checkpoint: 2025-03
+- allowed historical window: 2025-03 through 2025-03 only
+- retry remains offset-preserving
+- runner refuses execution after checkpoint advances beyond March
+- no Worker, D1, or SQLite mutation was performed during preparation
+
+Next operational action:
+Paste repository Code.gs into the existing Apps Script project and run
+backfillMarch2025Trial() exactly once, then perform an exact post-March audit.
+
+## Historical backfill strategy revised before March execution
+
+January and February 2025 were used as controlled canary months.
+
+They exposed and allowed correction of important failure classes including:
+- incomplete-ingestion retry safety;
+- canonical evidence completion semantics;
+- UTF-8 HMAC signing;
+- page/checkpoint preservation after relay failure.
+
+After February passed its exact integrity audit, the strategy was revised.
+
+The March-only helper prepared in commit a066a40 was superseded before
+execution.
+
+Decision:
+Do not continue creating one manual runner per month.
+
+Next architecture:
+One resumable Historical Backfill v2 runner will resume from the authoritative
+stored checkpoint, process closed historical months through 2026-07, stop
+fail-fast on infrastructure/relay integrity errors, respect Apps Script
+runtime limits, and preserve retry position.
+
+Cloudflare capacity is not the reason for the previous month-by-month process.
+The purpose was canary validation of ingestion correctness.
