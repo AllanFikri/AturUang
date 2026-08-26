@@ -285,9 +285,15 @@ class TestGmailIntelligenceV1(unittest.TestCase):
         self.assertIn("WHERE id = ?", repair_verification)
 
         self.assertIn(
-            "CANONICAL_EVENT_PERSISTENCE_FAILED",
+            "GMAIL_CANONICAL_FAILURE | stage=${canonicalStage}",
             index_text,
-            "Canonical persistence failures must propagate to HTTP 500.",
+            "Canonical persistence failures must expose a safe diagnostic stage.",
+        )
+
+        self.assertIn(
+            "code: `CANONICAL_${safeStage}`",
+            index_text,
+            "Canonical persistence failures must return a stage-specific error code.",
         )
 
         self.assertIn(

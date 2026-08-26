@@ -262,23 +262,27 @@ export default {
         // Fail closed: raw/candidate ingestion is NOT considered successful
         // until canonical evidence has also been persisted.
         let canonDbId: number | null = null;
+        let canonicalStage = "lookup_init";
 
         try {
           let existingCanon: { id: number } | null = null;
 
           if (canonEv.transaction_reference) {
+            canonicalStage = "lookup_transaction_reference";
             existingCanon = await env.DB.prepare(
               "SELECT id FROM canonical_financial_events WHERE transaction_reference = ? LIMIT 1"
             ).bind(canonEv.transaction_reference).first<{ id: number }>();
           }
 
           if (!existingCanon && canonEv.external_order_id) {
+            canonicalStage = "lookup_external_order_id";
             existingCanon = await env.DB.prepare(
               "SELECT id FROM canonical_financial_events WHERE external_order_id = ? LIMIT 1"
             ).bind(canonEv.external_order_id).first<{ id: number }>();
           }
 
           if (!existingCanon) {
+            canonicalStage = "lookup_event_id";
             existingCanon = await env.DB.prepare(
               "SELECT id FROM canonical_financial_events WHERE event_id = ? LIMIT 1"
             ).bind(canonEv.event_id).first<{ id: number }>();
@@ -286,6 +290,7 @@ export default {
 
           if (existingCanon) {
             canonDbId = existingCanon.id;
+            canonicalStage = "insert_existing_evidence";
 
             const evidenceRes = await env.DB.prepare(
               `INSERT INTO canonical_event_evidence
@@ -302,6 +307,7 @@ export default {
               throw new Error("CANONICAL_EVIDENCE_INSERT_FAILED");
             }
           } else {
+            canonicalStage = "insert_new_canonical_batch";
             const canonicalInsert = env.DB.prepare(
               `INSERT INTO canonical_financial_events
                (event_id, occurred_at_wib, status, event_kind, financial_class, financial_direction,
@@ -366,10 +372,22 @@ export default {
             }
           }
         } catch (canonicalErr: any) {
-          // Outer Gmail handler returns HTTP 500.
-          // Apps Script therefore preserves its historical checkpoint.
-          // Retry will self-heal the incomplete raw row above.
-          throw new Error("CANONICAL_EVENT_PERSISTENCE_FAILED");
+          const safeStage = canonicalStage
+            .toUpperCase()
+            .replace(/[^A-Z0-9_]/g, "_");
+
+          console.error(
+            `GMAIL_CANONICAL_FAILURE | stage=${canonicalStage}`
+          );
+
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code: `CANONICAL_${safeStage}`,
+              message: "Canonical Gmail persistence failed.",
+            }),
+            { status: 500, headers: getSecurityHeaders() }
+          );
         }
 
         // Update source freshness

@@ -1,39 +1,37 @@
 ﻿from pathlib import Path
 
-code = Path(
-    "cloud/worker/src/index.ts"
-).read_text(encoding="utf-8")
+code = Path("cloud/worker/src/index.ts").read_text(encoding="utf-8")
 
-tx_ref = '''if (canonEv.transaction_reference) {
-            existingCanon = await env.DB.prepare(
-              "SELECT id FROM canonical_financial_events WHERE transaction_reference = ? LIMIT 1"
-'''
+markers = [
+    '"SELECT id FROM canonical_financial_events WHERE transaction_reference = ? LIMIT 1"',
+    '"SELECT id FROM canonical_financial_events WHERE external_order_id = ? LIMIT 1"',
+    '"SELECT id FROM canonical_financial_events WHERE event_id = ? LIMIT 1"',
+]
 
-external = '''if (!existingCanon && canonEv.external_order_id) {
-            existingCanon = await env.DB.prepare(
-              "SELECT id FROM canonical_financial_events WHERE external_order_id = ? LIMIT 1"
-'''
+for marker in markers:
+    assert marker in code, f"missing lookup: {marker}"
 
-event_id = '''if (!existingCanon) {
-            existingCanon = await env.DB.prepare(
-              "SELECT id FROM canonical_financial_events WHERE event_id = ? LIMIT 1"
-'''
+positions = [code.index(marker) for marker in markers]
 
-assert tx_ref in code, "transaction_reference lookup missing"
-assert external in code, "external_order_id fallback missing"
-assert event_id in code, "event_id fallback missing"
-
-tx_pos = code.index(tx_ref)
-ext_pos = code.index(external)
-event_pos = code.index(event_id)
-
-assert tx_pos < ext_pos < event_pos, (
-    "Canonical lookup order must be "
+assert positions == sorted(positions), (
+    "Canonical lookup order must remain "
     "transaction_reference -> external_order_id -> event_id"
 )
 
-assert "} else if (canonEv.external_order_id)" not in code, (
-    "Old mutually-exclusive external_order_id lookup still present"
-)
+assert "if (!existingCanon && canonEv.external_order_id)" in code
+assert "if (!existingCanon)" in code
 
-print("CANONICAL_CORRELATION_FALLBACK: PASS")
+assert "} else if (canonEv.external_order_id)" not in code
+
+stages = [
+    'canonicalStage = "lookup_transaction_reference"',
+    'canonicalStage = "lookup_external_order_id"',
+    'canonicalStage = "lookup_event_id"',
+    'canonicalStage = "insert_existing_evidence"',
+    'canonicalStage = "insert_new_canonical_batch"',
+]
+
+for stage in stages:
+    assert stage in code, f"missing observability stage: {stage}"
+
+print("CANONICAL_CORRELATION_STRUCTURE: PASS")
