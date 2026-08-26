@@ -270,10 +270,18 @@ export default {
             existingCanon = await env.DB.prepare(
               "SELECT id FROM canonical_financial_events WHERE transaction_reference = ? LIMIT 1"
             ).bind(canonEv.transaction_reference).first<{ id: number }>();
-          } else if (canonEv.external_order_id) {
+          }
+
+          if (!existingCanon && canonEv.external_order_id) {
             existingCanon = await env.DB.prepare(
               "SELECT id FROM canonical_financial_events WHERE external_order_id = ? LIMIT 1"
             ).bind(canonEv.external_order_id).first<{ id: number }>();
+          }
+
+          if (!existingCanon) {
+            existingCanon = await env.DB.prepare(
+              "SELECT id FROM canonical_financial_events WHERE event_id = ? LIMIT 1"
+            ).bind(canonEv.event_id).first<{ id: number }>();
           }
 
           if (existingCanon) {
