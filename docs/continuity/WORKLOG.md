@@ -532,3 +532,44 @@ runtime limits, and preserve retry position.
 
 Cloudflare capacity is not the reason for the previous month-by-month process.
 The purpose was canary validation of ingestion correctness.
+
+## Historical Backfill v2 circuit breaker implemented
+
+Implementation commit:
+- 8ccdf92 feat(gmail): add fail-fast historical backfill v2
+
+Historical range:
+- authoritative start checkpoint: 2025-03
+- closed cutoff: 2026-07
+
+Safety behavior:
+- concurrent bulk execution is rejected by ScriptLock;
+- any operational/integrity error creates a persistent circuit-breaker latch;
+- a blocked runner refuses future runs until the block is explicitly cleared
+  after diagnosis;
+- clearing the block does not reset checkpoint or offset;
+- Worker health must return HTTP 200;
+- Worker health JSON must be valid;
+- Worker MODE must remain shadow;
+- schema must be >= 7;
+- checkpoint and offset must be consistent;
+- invalid offset is not silently reset;
+- current/open month is refused;
+- first non-200 relay stops immediately;
+- first network exception stops immediately;
+- malformed/non-success HTTP 200 Worker response stops immediately;
+- page offset advances only after whole-page success;
+- runtime pause is coded as BACKFILL_RUNTIME_PAUSE and is safe to resume;
+- successful earlier messages on a failed page remain retry-safe through Worker
+  idempotency and canonical evidence completion semantics.
+
+Validation before commit:
+- Code.gs JavaScript syntax PASS;
+- Backfill v2 static safety test PASS;
+- Prompt 13B Intelligence regression PASS when available;
+- git diff --check PASS;
+- local production SQLite hash unchanged.
+
+Status:
+Repository implementation prepared.
+Apps Script still requires manual full-Code.gs synchronization before running.

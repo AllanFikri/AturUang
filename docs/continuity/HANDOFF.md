@@ -47,8 +47,8 @@ explicit project-level decision.
 
 ## Current Git state
 
-Current implementation HEAD before this handoff update:
-a066a40
+Current implementation HEAD:
+8ccdf92
 
 Recent commits:
 - 841fc63 chore(gmail): prepare controlled february backfill
@@ -213,16 +213,27 @@ Asia/Jakarta / WIB.
 
 ## Immediate next action
 
-The March-only runner from commit a066a40 was superseded before execution.
-
-Do NOT execute backfillMarch2025Trial().
+Historical Backfill v2 implementation:
+8ccdf92
 
 Current authoritative Gmail checkpoint:
 2025-03
 
-Next engineering action:
-Implement and validate Historical Backfill v2 with a fail-fast circuit breaker
-for closed months through 2026-07.
+Closed historical cutoff:
+2026-07
+
+Next:
+1. Paste the full current Code.gs into the existing Google Apps Script project.
+2. Save.
+3. Run backfillHistoricalClosedMonthsV2().
+4. BACKFILL_RUNTIME_PAUSE is normal; run the same function again to resume.
+5. BACKFILL_COMPLETED with checkpoint 2026-08 means historical ingestion reached
+   the intended cutoff.
+6. Any BACKFILL_* error / BACKFILL_V2_BLOCKED means STOP. Do not rerun.
+7. Diagnose the error first.
+8. Only after diagnosis may clearHistoricalBackfillV2Block() be run.
+9. After full completion, perform exact D1 + SQLite integrity audit.
+10. Analyze whole-history canonical patterns only after that audit passes.
 
 
 ## Do not do
