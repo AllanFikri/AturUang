@@ -1,16 +1,35 @@
-# Panduan Setup Gmail Relay (Google Apps Script)
+# AturUang — Panduan Setup Gmail Relay & Historical Backfill
 
-Integrasi ini bertugas menangkap notifikasi transaksi dari Gmail secara 24/7 dan mengirimkannya ke endpoint Worker AturUang `POST /api/ingest/gmail` dengan tanda tangan HMAC-SHA256.
+## 1. Persiapan Proyek Apps Script
+1. Buka [Google Apps Script](https://script.google.com/) menggunakan akun Google Anda.
+2. Buat proyek baru dengan nama **AturUang Gmail Connector**.
+3. Buka file `Code.gs`, hapus kode default, dan salin seluruh isi dari `integrations/gmail-apps-script/Code.gs`.
 
-## Langkah Konfigurasi
-1. Buka [Google Apps Script](https://script.google.com/) dan buat project baru berjudul `AturUang-Gmail-Relay`.
-2. Salin isi berkas `Code.gs` dan `appsscript.json` ke editor project.
-3. Buka **Project Settings** > **Script Properties**, tambahkan dua property:
-   - `WORKER_URL`: URL Cloudflare Worker Anda (misal `https://aturuang-api.example.workers.dev`).
-   - `GMAIL_RELAY_SECRET`: Kunci rahasia HMAC yang sama dengan rahasia yang disimpan di Wrangler Secrets Worker (`GMAIL_RELAY_SECRET`).
-4. Buka menu **Triggers** (ikon jam di panel kiri) > **Add Trigger**:
+## 2. Konfigurasi Script Properties
+Di panel kiri editor Apps Script:
+1. Klik **Project Settings** (ikon roda gigi ⚙️).
+2. Gulir ke bawah ke bagian **Script Properties**, klik **Add script property**:
+   - `WORKER_URL`: `https://aturuang-api.allanfikrimahardika.workers.dev`
+   - `GMAIL_RELAY_SECRET`: Masukkan secret HMAC yang Anda konfigurasi di Cloudflare Worker secret.
+3. Klik **Save script properties**.
+
+## 3. Menjalankan Historical Backfill (2025-01-01 s.d. Sekarang)
+1. Pilih fungsi `backfillGmailTransactions` di dropdown fungsi editor.
+2. Klik tombol **Run** (Jalankan).
+3. Berikan otorisasi akses baca Gmail saat pertama kali diminta oleh Google.
+4. Apps Script akan memproses email secara bulanan (bounded windows) mulai Januari 2025 dengan strict exact senders:
+   - Checkpoint bulanan otomatis disimpan di `GMAIL_BACKFILL_CHECKPOINT`.
+   - Jika terjadi timeout execution (batas 6 menit Apps Script), jalankan kembali `backfillGmailTransactions` untuk melanjutkan dari checkpoint terakhir secara idempoten.
+5. Untuk memeriksa status checkpoint, jalankan fungsi `getBackfillStatus()`.
+6. Untuk mereset checkpoint dari awal (2025-01), jalankan fungsi `resetBackfillCheckpoint()`.
+
+## 4. Mengaktifkan Live Relay Berkala (Opsional)
+1. Buka menu **Triggers** (ikon jam ⏰) di panel kiri.
+2. Klik **Add Trigger**:
    - Function to run: `relayGmailTransactions`
    - Event source: `Time-driven`
-   - Type of based timer: `Minutes timer`
-   - Select minute interval: `Every 5 minutes` or `Every 10 minutes`.
-5. Simpan dan izinkan izin akses Google OAuth (hanya membaca Gmail `gmail.readonly` dan panggilan jaringan `script.external_request`).
+   - Type: `Minutes timer` (setiap 10 atau 15 menit).
+3. Simpan trigger.
+
+> **Catatan Keamanan:**
+> Worker AturUang berada dalam `MODE=shadow` dan hanya memproses bukti transaksi ke staging queue tanpa mengubah financial ledger produksi.

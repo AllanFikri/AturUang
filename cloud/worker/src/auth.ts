@@ -66,6 +66,43 @@ export function authenticateRequest(request: Request, env: Env): Response | null
   return null;
 }
 
+// =========================================================================
+// GMAIL SENDER TRUST REGISTRY (STRICT & EVIDENCE-BACKED)
+// =========================================================================
+export const TRUSTED_PRIMARY_GMAIL_SENDERS = new Set<string>([
+  "bca@bca.co.id",
+  "noreply@jago.com",
+  "no-reply@flip.id",
+  "googleplay-noreply@google.com",
+  "noreply@byu.id",
+  "no-reply@mailer-esb.com",
+]);
+
+export const TRUSTED_SECONDARY_GMAIL_SENDERS = new Set<string>([
+  "info@shopee.co.id",
+  "info@mail.shopee.co.id",
+  "noreply@cx.byu.id",
+]);
+
+export function extractCleanEmailAddress(fromHeader: string): string {
+  if (!fromHeader) return "";
+  const match = fromHeader.match(/<([^>]+)>/);
+  const raw = match ? match[1] : fromHeader;
+  return raw.trim().toLowerCase();
+}
+
+export function isGmailSenderTrusted(fromHeader: string): { trusted: boolean; email: string; isPrimary: boolean } {
+  const email = extractCleanEmailAddress(fromHeader);
+  if (!email) return { trusted: false, email: "", isPrimary: false };
+  const isPrimary = TRUSTED_PRIMARY_GMAIL_SENDERS.has(email);
+  const isSecondary = TRUSTED_SECONDARY_GMAIL_SENDERS.has(email);
+  return {
+    trusted: isPrimary || isSecondary,
+    email,
+    isPrimary,
+  };
+}
+
 export async function verifyGmailHmac(
   request: Request,
   rawBody: string,
@@ -73,7 +110,8 @@ export async function verifyGmailHmac(
   db?: D1Database
 ): Promise<{ valid: boolean; error?: string }> {
   // 1. Validasi secret
-  if (!secret) {
+  const cleanSecret = (secret || "").trim();
+  if (!cleanSecret) {
     return { valid: false, error: "UNCONFIGURED_GMAIL_SECRET" };
   }
 
@@ -102,7 +140,7 @@ export async function verifyGmailHmac(
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
-    enc.encode(secret),
+    enc.encode(cleanSecret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]

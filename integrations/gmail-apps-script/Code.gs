@@ -1,12 +1,42 @@
 /**
- * AturUang — Gmail Relay Connector (Google Apps Script)
+ * AturUang — Gmail Relay & Historical Backfill Connector (Google Apps Script)
  * 
- * Membaca notifikasi transaksi bank/e-wallet baru dari Gmail secara terfilter,
- * menandatangani payload dengan HMAC-SHA256, dan mengirimkannya ke Worker AturUang.
+ * Membaca notifikasi transaksi bank/e-wallet dari Gmail dengan strict exact-sender filtering,
+ * menandatangani payload dengan HMAC-SHA256, dan mengirimkannya ke Worker AturUang (Mode: Shadow).
  * 
  * TIDAK MENGGUNAKAN GOOGLE SHEETS.
  */
 
+// Exact evidence-backed senders
+const TRUSTED_SENDER_QUERY = 'from:(bca@bca.co.id OR noreply@jago.com OR no-reply@flip.id OR googleplay-noreply@google.com OR noreply@byu.id OR no-reply@mailer-esb.com OR info@shopee.co.id OR info@mail.shopee.co.id OR noreply@cx.byu.id)';
+
+const TRUSTED_SENDERS_SET = [
+  "bca@bca.co.id",
+  "noreply@jago.com",
+  "no-reply@flip.id",
+  "googleplay-noreply@google.com",
+  "noreply@byu.id",
+  "no-reply@mailer-esb.com",
+  "info@shopee.co.id",
+  "info@mail.shopee.co.id",
+  "noreply@cx.byu.id"
+];
+
+function extractCleanEmail(fromHeader) {
+  if (!fromHeader) return "";
+  const match = fromHeader.match(/<([^>]+)>/);
+  const raw = match ? match[1] : fromHeader;
+  return raw.trim().toLowerCase();
+}
+
+function isSenderExactTrusted(fromHeader) {
+  const clean = extractCleanEmail(fromHeader);
+  return TRUSTED_SENDERS_SET.indexOf(clean) !== -1;
+}
+
+/**
+ * 1. Live Periodic Relay (Jalankan via Time-driven trigger tiap 5-15 menit)
+ */
 function relayGmailTransactions() {
   const props = PropertiesService.getScriptProperties();
   const workerUrl = props.getProperty("WORKER_URL");
@@ -17,22 +47,95 @@ function relayGmailTransactions() {
     return;
   }
 
-  // Filter query: Hanya membaca email dari pengirim terpercaya dalam 2 hari terakhir
-  const query = 'newer_than:2d (from:bca.co.id OR from:bankjago.com OR from:shopeepay.co.id OR from:gopay.co.id OR subject:"Notifikasi Transaksi" OR subject:"m-BCA")';
-  const threads = GmailApp.search(query, 0, 20);
+  const query = 'newer_than:2d ' + TRUSTED_SENDER_QUERY;
+  processGmailQuery(query, workerUrl, relaySecret, 30);
+}
+
+/**
+ * 2. Historical Backfill (2025-01-01 s.d. Sekarang)
+ * Bounded monthly windows, resumable checkpoint di Script Properties.
+ */
+function backfillGmailTransactions(startYearMonth, endYearMonth) {
+  const props = PropertiesService.getScriptProperties();
+  const workerUrl = props.getProperty("WORKER_URL");
+  const relaySecret = props.getProperty("GMAIL_RELAY_SECRET");
+
+  if (!workerUrl || !relaySecret) {
+    console.error("Konfigurasi WORKER_URL atau GMAIL_RELAY_SECRET belum diisi di Script Properties.");
+    return;
+  }
+
+  const startYM = startYearMonth || props.getProperty("GMAIL_BACKFILL_CHECKPOINT") || "2025-01";
+  const now = new Date();
+  const currentYM = now.getFullYear() + "-" + ("0" + (now.getMonth() + 1)).slice(-2);
+  const endYM = endYearMonth || currentYM;
+
+  console.log("Memulai Backfill Gmail dari " + startYM + " s.d. " + endYM);
+
+  let current = parseYearMonth(startYM);
+  const target = parseYearMonth(endYM);
+
+  let totalProcessed = 0;
+
+  while (compareYearMonth(current, target) <= 0) {
+    const ymStr = formatYearMonth(current);
+    const nextYM = getNextMonth(current);
+    const afterDate = ymStr + "-01";
+    const beforeDate = formatYearMonth(nextYM) + "-01";
+
+    const query = 'after:' + afterDate + ' before:' + beforeDate + ' ' + TRUSTED_SENDER_QUERY;
+    console.log("Memproses jendela: " + query);
+
+    const count = processGmailQuery(query, workerUrl, relaySecret, 100);
+    totalProcessed += count;
+
+    // Simpan checkpoint bulan berikutnya
+    props.setProperty("GMAIL_BACKFILL_CHECKPOINT", formatYearMonth(nextYM));
+    console.log("Jendela " + ymStr + " selesai (" + count + " pesan). Checkpoint: " + formatYearMonth(nextYM));
+
+    current = nextYM;
+  }
+
+  console.log("Backfill selesai. Total pesan terproses: " + totalProcessed);
+}
+
+function getBackfillStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const cp = props.getProperty("GMAIL_BACKFILL_CHECKPOINT") || "Belum dimulai (default 2025-01)";
+  console.log("Status Checkpoint Backfill Saat Ini: " + cp);
+  return cp;
+}
+
+function resetBackfillCheckpoint() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty("GMAIL_BACKFILL_CHECKPOINT");
+  console.log("Checkpoint backfill telah direset ke 2025-01.");
+}
+
+/**
+ * Core processor loop (Message-level inspection)
+ */
+function processGmailQuery(query, workerUrl, relaySecret, maxThreads) {
+  const threads = GmailApp.search(query, 0, maxThreads);
+  let processedCount = 0;
 
   for (let i = 0; i < threads.length; i++) {
     const messages = threads[i].getMessages();
     for (let j = 0; j < messages.length; j++) {
       const msg = messages[j];
-      const messageId = msg.getId();
+      const fromHeader = msg.getFrom();
 
-      // Payload minimal teredaksi
+      // Enforce message-level strict sender trust
+      if (!isSenderExactTrusted(fromHeader)) {
+        continue;
+      }
+
+      const messageId = msg.getId();
       const payload = {
         message_id: messageId,
-        from: msg.getFrom(),
+        from: fromHeader,
         subject: msg.getSubject(),
-        body: msg.getPlainBody().substring(0, 2000), // Max 2000 chars
+        body: msg.getPlainBody().substring(0, 2000), // Minimal excerpt
         internal_date: msg.getDate().toISOString(),
       };
 
@@ -40,7 +143,7 @@ function relayGmailTransactions() {
       const timestamp = Date.now().toString();
       const nonce = Utilities.getUuid();
 
-      // Sign with HMAC-SHA256: timestamp.nonce.rawBody
+      // Sign with HMAC-SHA256
       const toSign = timestamp + "." + nonce + "." + rawBody;
       const signatureBytes = Utilities.computeHmacSha256Signature(toSign, relaySecret);
       const signature = signatureBytes.map(function(byte) {
@@ -63,13 +166,37 @@ function relayGmailTransactions() {
         const response = UrlFetchApp.fetch(workerUrl + "/api/ingest/gmail", options);
         const code = response.getResponseCode();
         if (code === 200) {
-          console.log("Pesan berhasil direlay: " + messageId);
-        } else {
-          console.warn("Gagal relay pesan " + messageId + ": HTTP " + code + " " + response.getContentText());
+          processedCount++;
+        } else if (code === 403) {
+          console.warn("Ditolak (403 Untrusted Sender): " + fromHeader);
         }
       } catch (e) {
-        console.error("Exception saat relay pesan " + messageId + ": " + e.toString());
+        console.error("Exception saat relay message " + messageId + ": " + e.toString());
       }
     }
   }
+
+  return processedCount;
+}
+
+// Date helpers
+function parseYearMonth(ymStr) {
+  const parts = ymStr.split("-");
+  return { year: parseInt(parts[0], 10), month: parseInt(parts[1], 10) };
+}
+
+function formatYearMonth(ym) {
+  return ym.year + "-" + ("0" + ym.month).slice(-2);
+}
+
+function getNextMonth(ym) {
+  if (ym.month === 12) {
+    return { year: ym.year + 1, month: 1 };
+  }
+  return { year: ym.year, month: ym.month + 1 };
+}
+
+function compareYearMonth(a, b) {
+  if (a.year !== b.year) return a.year - b.year;
+  return a.month - b.month;
 }

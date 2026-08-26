@@ -1,5 +1,5 @@
-// domain.ts: Modul domain kalkulasi finansial AturUang untuk D1 dan Parser Ingestion
-import { Env } from "./auth";
+// domain.ts: Modul domain kalkulasi finansial AturUang untuk D1 dan Transaction Intelligence Engine
+import { isGmailSenderTrusted } from "./auth.ts";
 
 export function round2(num: number): number {
   return Math.round((num + Number.EPSILON) * 100) / 100;
@@ -98,313 +98,226 @@ export async function reconstructBalance(
   cached_balance: number;
   difference: number | null;
   anchor_balance: number;
-  anchor_date: string | null;
-  reason: string;
+  anchor_date: string;
+  total_inflows: number;
+  total_outflows: number;
+  tx_count: number;
 }> {
+  const acc = await db
+    .prepare("SELECT name, current_balance, balance_date FROM accounts WHERE name = ?")
+    .bind(accountName)
+    .first<{ name: string; current_balance: number; balance_date: string }>();
+
+  if (!acc) {
+    throw new Error(`Akun '${accountName}' tidak ditemukan.`);
+  }
+
+  const cachedBalance = round2(acc.current_balance || 0.0);
   const targetDate = asOfDate || getWibDate().dateStr;
 
-  // 1. Get cached current balance from accounts
-  const accRow = await db
-    .prepare("SELECT current_balance, balance_date FROM accounts WHERE name = ?")
-    .bind(accountName)
-    .first<{ current_balance: number | null; balance_date: string | null }>();
-
-  if (!accRow) {
-    return {
-      status: "unverifiable",
-      calculated_balance: 0.0,
-      expected_balance: null,
-      cached_balance: 0.0,
-      difference: null,
-      anchor_balance: 0.0,
-      anchor_date: null,
-      reason: `Rekening '${accountName}' tidak ditemukan.`,
-    };
-  }
-
-  const cachedBal = round2(Number(accRow.current_balance || 0));
-  const balDate = accRow.balance_date || null;
-
-  // 2. Search for latest explicit trusted anchor (manual_anchor, initial_anchor)
-  let snapRes = await db
+  let snap = await db
     .prepare(
-      `SELECT id, balance, snapshot_date, created_at, snapshot_kind
-       FROM balance_snapshots
-       WHERE account_name = ? AND snapshot_date <= ? AND snapshot_kind IN ('manual_anchor', 'initial_anchor')
-       ORDER BY id DESC LIMIT 1`
+      `SELECT balance, date FROM balance_snapshots
+       WHERE account = ? AND date <= ?
+       ORDER BY date DESC, id DESC LIMIT 1`
     )
     .bind(accountName, targetDate)
-    .first<{ id: number; balance: number; snapshot_date: string; created_at: string; snapshot_kind: string }>();
+    .first<{ balance: number; date: string }>();
 
-  // 3. Fallback to legacy snapshot if no explicit anchor found
-  if (!snapRes) {
-    snapRes = await db
-      .prepare(
-        `SELECT id, balance, snapshot_date, created_at, snapshot_kind
-         FROM balance_snapshots
-         WHERE account_name = ? AND snapshot_date <= ? AND (snapshot_kind = 'legacy' OR snapshot_kind IS NULL)
-         ORDER BY id ASC LIMIT 1`
-      )
-      .bind(accountName, targetDate)
-      .first<{ id: number; balance: number; snapshot_date: string; created_at: string; snapshot_kind: string }>();
+  let anchorBalance = 0.0;
+  let anchorDate = "1970-01-01";
+
+  if (snap) {
+    anchorBalance = round2(snap.balance || 0.0);
+    anchorDate = snap.date;
   }
 
-  if (!snapRes) {
-    return {
-      status: "unverifiable",
-      calculated_balance: 0.0,
-      expected_balance: null,
-      cached_balance: cachedBal,
-      difference: null,
-      anchor_balance: 0.0,
-      anchor_date: balDate,
-      reason: "Tidak ada data snapshot saldo (anchor) tepercaya untuk akun ini.",
-    };
-  }
-
-  const anchorBal = round2(Number(snapRes.balance || 0));
-  const anchorDate = snapRes.snapshot_date;
-  const anchorCreated = snapRes.created_at || "";
-
-  // 4. Sum subsequent transaction mutations strictly after the chosen anchor
-  const mutRes = await db
+  const txRows = await db
     .prepare(
-      `SELECT
-         COALESCE(SUM(CASE WHEN account_to = ? THEN amount ELSE 0 END), 0) as in_mutations,
-         COALESCE(SUM(CASE WHEN account_from = ? THEN amount ELSE 0 END), 0) as out_mutations
-       FROM transactions
-       WHERE is_deleted = 0
-         AND (account_from = ? OR account_to = ?)
-         AND (date > ? OR (date = ? AND created_at > ?))
-         AND date <= ?`
+      `SELECT type, amount, account, to_account, date FROM transactions
+       WHERE (account = ? OR to_account = ?)
+         AND date > ? AND date <= ?
+       ORDER BY date ASC, id ASC`
     )
-    .bind(
-      accountName,
-      accountName,
-      accountName,
-      accountName,
-      anchorDate,
-      anchorDate,
-      anchorCreated,
-      targetDate
-    )
-    .first<{ in_mutations: number; out_mutations: number }>();
+    .bind(accountName, accountName, anchorDate, targetDate)
+    .all<{ type: string; amount: number; account: string; to_account?: string | null; date: string }>();
 
-  const inMut = round2(Number(mutRes?.in_mutations || 0));
-  const outMut = round2(Number(mutRes?.out_mutations || 0));
-  const expectedBal = round2(anchorBal + inMut - outMut);
-  const diff = round2(expectedBal - cachedBal);
+  let totalInflows = 0.0;
+  let totalOutflows = 0.0;
+  let running = anchorBalance;
 
-  const status = Math.abs(diff) < 0.005 ? "ok" : "discrepancy";
-  const reason =
-    Math.abs(diff) < 0.005
-      ? "Saldo terverifikasi sesuai snapshot & mutasi"
-      : `Selisih saldo terdeteksi: tercatat ${cachedBal} vs hitungan mutasi ${expectedBal}`;
+  for (const tx of txRows.results || []) {
+    const amt = round2(tx.amount || 0.0);
+    if (tx.type === "Income") {
+      if (tx.account === accountName) {
+        totalInflows = round2(totalInflows + amt);
+        running = round2(running + amt);
+      }
+    } else if (tx.type === "Expense") {
+      if (tx.account === accountName) {
+        totalOutflows = round2(totalOutflows + amt);
+        running = round2(running - amt);
+      }
+    } else if (tx.type === "Transfer") {
+      if (tx.to_account === accountName) {
+        totalInflows = round2(totalInflows + amt);
+        running = round2(running + amt);
+      } else if (tx.account === accountName) {
+        totalOutflows = round2(totalOutflows + amt);
+        running = round2(running - amt);
+      }
+    }
+  }
+
+  const calculatedBalance = round2(running);
+  const diff = asOfDate ? null : round2(cachedBalance - calculatedBalance);
+  const status = diff !== null && Math.abs(diff) > 0.005 ? "DISCREPANCY" : "MATCHED";
 
   return {
     status,
-    calculated_balance: expectedBal,
-    expected_balance: expectedBal,
-    cached_balance: cachedBal,
+    calculated_balance: calculatedBalance,
+    expected_balance: asOfDate ? null : cachedBalance,
+    cached_balance: cachedBalance,
     difference: diff,
-    anchor_balance: anchorBal,
+    anchor_balance: anchorBalance,
     anchor_date: anchorDate,
-    reason,
-  };
-}
-
-export async function computeDashboardKpis(
-  db: D1Database,
-  monthStr?: string
-): Promise<{
-  safeToSpend: number;
-  totalBalance: number;
-  protectedSavings: number;
-  emergencyAllocated: number;
-  goalsAllocated: number;
-  generalAllocated: number;
-  passThroughOutstanding: number;
-  currentCommitments: number;
-  receivablesOutstanding: number;
-  pendingExpenses: number;
-  monthIncome: number;
-  monthExpense: number;
-  netCashflow: number;
-  selectedMonth: string;
-  asOfDate: string;
-}> {
-  const { dateStr: todayStr, monthStr: currentMonth } = getWibDate();
-  const selectedMonth = monthStr && /^\d{4}-\d{2}$/.test(monthStr) ? monthStr : currentMonth;
-
-  // 1. Total Liquid Balance from active Owned accounts
-  const liquidRes = await db
-    .prepare("SELECT COALESCE(SUM(current_balance), 0) as total_liquid FROM accounts WHERE active = 1 AND kind = 'Owned'")
-    .first<{ total_liquid: number }>();
-  const totalBalance = round2(Number(liquidRes?.total_liquid || 0));
-
-  // 2. Allocation Goals (Emergency, Goals, General)
-  const allocRes = await db
-    .prepare(
-      `SELECT
-         COALESCE(SUM(CASE WHEN kind = 'Emergency' THEN allocated_amount ELSE 0 END), 0) as emergency,
-         COALESCE(SUM(CASE WHEN kind = 'Goal' THEN allocated_amount ELSE 0 END), 0) as goals,
-         COALESCE(SUM(CASE WHEN kind = 'General' THEN allocated_amount ELSE 0 END), 0) as general,
-         COALESCE(SUM(allocated_amount), 0) as total_alloc
-       FROM allocation_goals
-       WHERE status = 'Active'`
-    )
-    .first<{ emergency: number; goals: number; general: number; total_alloc: number }>();
-
-  const emergencyAllocated = round2(Number(allocRes?.emergency || 0));
-  const goalsAllocated = round2(Number(allocRes?.goals || 0));
-  const generalAllocated = round2(Number(allocRes?.general || 0));
-  const protectedSavings = round2(Number(allocRes?.total_alloc || 0));
-
-  // 3. Custody (Titipan) Outstanding from Event Ledger
-  const custodyDebts = await db
-    .prepare("SELECT id FROM debts WHERE kind = 'Custody' AND status = 'Active'")
-    .all<{ id: number }>();
-
-  let passThroughOutstanding = 0.0;
-  for (const cd of custodyDebts.results || []) {
-    const evRes = await db
-      .prepare("SELECT COALESCE(SUM(effect * amount), 0.0) as out FROM debt_events WHERE debt_id = ?")
-      .bind(cd.id)
-      .first<{ out: number }>();
-    passThroughOutstanding += Math.max(0.0, Number(evRes?.out || 0));
-  }
-  passThroughOutstanding = round2(passThroughOutstanding);
-
-  // 4. Receivables Outstanding from Event Ledger (Informational only, does NOT increase liquidity)
-  const recDebts = await db
-    .prepare("SELECT id FROM debts WHERE kind = 'Receivable' AND status = 'Active'")
-    .all<{ id: number }>();
-
-  let receivablesOutstanding = 0.0;
-  for (const rd of recDebts.results || []) {
-    const evRes = await db
-      .prepare("SELECT COALESCE(SUM(effect * amount), 0.0) as out FROM debt_events WHERE debt_id = ?")
-      .bind(rd.id)
-      .first<{ out: number }>();
-    receivablesOutstanding += Math.max(0.0, Number(evRes?.out || 0));
-  }
-  receivablesOutstanding = round2(receivablesOutstanding);
-
-  // 5. Effective Commitments (U_eff for Payables + X_eff for Regular Upcomings)
-  // 5a. U_eff for Active Payables
-  const payDebts = await db
-    .prepare("SELECT id FROM debts WHERE kind = 'Payable' AND status = 'Active'")
-    .all<{ id: number }>();
-
-  let totalUeff = 0.0;
-  for (const pd of payDebts.results || []) {
-    const evRes = await db
-      .prepare("SELECT COALESCE(SUM(effect * amount), 0.0) as out FROM debt_events WHERE debt_id = ?")
-      .bind(pd.id)
-      .first<{ out: number }>();
-    const debtOut = Math.max(0.0, Number(evRes?.out || 0));
-
-    // Active protected allocation coverage for upcomings linked to this Payable
-    const covRes = await db
-      .prepare(
-        `SELECT COALESCE(SUM(pa.amount), 0.0) as cov
-         FROM protected_allocations pa
-         JOIN upcoming u ON pa.covers_upcoming_id = u.id
-         WHERE u.debt_id = ? AND pa.status = 'Active' AND u.status = 'Upcoming'`
-      )
-      .bind(pd.id)
-      .first<{ cov: number }>();
-    const cov = Number(covRes?.cov || 0);
-    totalUeff += Math.max(0.0, debtOut - cov);
-  }
-
-  // 5b. X_eff for Regular Upcomings (debt_id IS NULL OR debt_id = 0)
-  const upcomings = await db
-    .prepare(
-      `SELECT id, amount, status, COALESCE(reserve_now, 0) as reserve_now
-       FROM upcoming
-       WHERE (debt_id IS NULL OR debt_id = 0)
-         AND status IN ('Upcoming', 'Confirmed', 'Tentative')`
-    )
-    .all<{ id: number; amount: number; status: string; reserve_now: number }>();
-
-  const covMap = (await getUpcomingActiveCoverage(db)) as Map<number, number>;
-  let totalXeff = 0.0;
-  for (const u of upcomings.results || []) {
-    if (u.status === "Tentative" && Number(u.reserve_now || 0) === 0) {
-      continue; // Tentative without reserve_now does not deduct
-    }
-    const cov = covMap.get(u.id) || 0.0;
-    const amt = Number(u.amount || 0);
-    totalXeff += Math.max(0.0, amt - cov);
-  }
-
-  const currentCommitments = round2(totalUeff + totalXeff);
-
-  // 6. Pending Expenses from Provisional Neutral transactions
-  const pendRes = await db
-    .prepare(
-      `SELECT COALESCE(SUM(amount), 0.0) as pend
-       FROM transactions
-       WHERE is_deleted = 0
-         AND status = 'Provisional Neutral'
-         AND (transaction_type = 'Expense' OR (transaction_type = '' AND amount > 0))`
-    )
-    .first<{ pend: number }>();
-  const pendingExpenses = round2(Number(pendRes?.pend || 0));
-
-  // 7. Safe to Spend Formula Prompt 11:
-  // Liquid Assets - Active Allocations - Custody Outstanding - Effective Commitments - Pending Expenses
-  const safeToSpend = round2(
-    totalBalance - protectedSavings - passThroughOutstanding - currentCommitments - pendingExpenses
-  );
-
-  // 8. Monthly Income and Expense
-  const monthlyRes = await db
-    .prepare(
-      `SELECT
-         COALESCE(SUM(CASE WHEN transaction_type = 'Income' AND money_context = 'Personal' THEN amount ELSE 0 END), 0) as income,
-         COALESCE(SUM(CASE WHEN transaction_type = 'Expense' AND money_context = 'Personal' THEN amount ELSE 0 END), 0) as expense
-       FROM transactions
-       WHERE is_deleted = 0 AND date LIKE ?`
-    )
-    .bind(`${selectedMonth}%`)
-    .first<{ income: number; expense: number }>();
-
-  const monthIncome = round2(Number(monthlyRes?.income || 0));
-  const monthExpense = round2(Number(monthlyRes?.expense || 0));
-  const netCashflow = round2(monthIncome - monthExpense);
-
-  return {
-    safeToSpend,
-    totalBalance,
-    protectedSavings,
-    emergencyAllocated,
-    goalsAllocated,
-    generalAllocated,
-    passThroughOutstanding,
-    currentCommitments,
-    receivablesOutstanding,
-    pendingExpenses,
-    monthIncome,
-    monthExpense,
-    netCashflow,
-    selectedMonth,
-    asOfDate: todayStr,
+    total_inflows: totalInflows,
+    total_outflows: totalOutflows,
+    tx_count: (txRows.results || []).length,
   };
 }
 
 export async function getDashboard(db: D1Database, monthParam?: string): Promise<Record<string, any>> {
-  const kpis = await computeDashboardKpis(db, monthParam);
+  const { monthStr: currentMonth, dateStr: todayStr } = getWibDate();
+  const selectedMonth = monthParam || currentMonth;
 
-  const monthsRows = await db
-    .prepare("SELECT DISTINCT substr(date, 1, 7) as m FROM transactions WHERE is_deleted = 0 ORDER BY m DESC")
-    .all<{ m: string }>();
-  const months = (monthsRows.results || []).map((r) => r.m);
+  // 1. Total liquid balance dari akun bertipe Owned & active
+  const accRows = await db
+    .prepare("SELECT name, current_balance, protected_amount, active FROM accounts WHERE kind = 'Owned' AND active = 1")
+    .all<{ name: string; current_balance: number; protected_amount: number; active: number }>();
+
+  let totalBalance = 0.0;
+  for (const a of accRows.results || []) {
+    totalBalance = round2(totalBalance + Number(a.current_balance || 0));
+  }
+
+  // 2. Protected Savings dari allocation_goals + protected_allocations
+  let emergencyAllocated = 0.0;
+  let goalsAllocated = 0.0;
+  let generalAllocated = 0.0;
+
+  try {
+    const goals = await db
+      .prepare("SELECT kind, allocated_amount FROM allocation_goals WHERE status = 'Active'")
+      .all<{ kind: string; allocated_amount: number }>();
+
+    for (const g of goals.results || []) {
+      const amt = Number(g.allocated_amount || 0);
+      if (g.kind === "Emergency") emergencyAllocated = round2(emergencyAllocated + amt);
+      else if (g.kind === "Goal") goalsAllocated = round2(goalsAllocated + amt);
+      else generalAllocated = round2(generalAllocated + amt);
+    }
+  } catch {}
+
+  try {
+    const pa = await db
+      .prepare("SELECT kind, amount FROM protected_allocations WHERE status = 'Active'")
+      .all<{ kind: string; amount: number }>();
+
+    for (const p of pa.results || []) {
+      const amt = Number(p.amount || 0);
+      if (p.kind === "Emergency") emergencyAllocated = round2(emergencyAllocated + amt);
+      else if (p.kind === "Goal") goalsAllocated = round2(goalsAllocated + amt);
+      else generalAllocated = round2(generalAllocated + amt);
+    }
+  } catch {}
+
+  const protectedSavings = round2(emergencyAllocated + goalsAllocated + generalAllocated);
+
+  // 3. Commitments (Upcoming aktif dalam 7 hari & bulan berjalan)
+  const covMap = (await getUpcomingActiveCoverage(db)) as Map<number, number>;
+  const upRows = await db
+    .prepare(
+      `SELECT id, amount, due_date, is_tentative, is_passive
+       FROM upcoming
+       WHERE status = 'Active' AND due_date LIKE ?`
+    )
+    .bind(`${selectedMonth}%`)
+    .all<{ id: number; amount: number; due_date: string; is_tentative?: number; is_passive?: number }>();
+
+  let currentCommitments = 0.0;
+  for (const u of upRows.results || []) {
+    if (u.is_passive === 1) continue;
+    const gross = Number(u.amount || 0);
+    const covered = covMap.get(u.id) || 0.0;
+    const net = Math.max(0.0, round2(gross - covered));
+    currentCommitments = round2(currentCommitments + net);
+  }
+
+  // 4. Receivables Outstanding (Piutang)
+  const recRows = await db
+    .prepare("SELECT current_balance FROM accounts WHERE kind = 'Receivable' AND active = 1")
+    .all<{ current_balance: number }>();
+
+  let receivablesOutstanding = 0.0;
+  for (const r of recRows.results || []) {
+    receivablesOutstanding = round2(receivablesOutstanding + Number(r.current_balance || 0));
+  }
+
+  // 5. Pass-Through Outstanding (Konteks titipan / dana pihak ketiga)
+  let passThroughOutstanding = 0.0;
+  try {
+    const ptRow = await db
+      .prepare(
+        `SELECT
+           COALESCE(SUM(CASE WHEN type = 'Income' THEN amount ELSE 0 END), 0) -
+           COALESCE(SUM(CASE WHEN type = 'Expense' THEN amount ELSE 0 END), 0) as net
+         FROM transactions
+         WHERE money_context = 'Pass-through'`
+      )
+      .first<{ net: number }>();
+    passThroughOutstanding = round2(Math.max(0.0, ptRow?.net || 0.0));
+  } catch {}
+
+  // 6. Safe to Spend
+  const safeToSpend = round2(
+    totalBalance - protectedSavings - currentCommitments - passThroughOutstanding
+  );
+
+  // 7. Bulan berjalan Income & Expense
+  const txSummary = await db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN type = 'Income' THEN amount ELSE 0 END), 0) as inc,
+         COALESCE(SUM(CASE WHEN type = 'Expense' THEN amount ELSE 0 END), 0) as exp
+       FROM transactions
+       WHERE date LIKE ? AND (money_context IS NULL OR money_context = 'Personal')`
+    )
+    .bind(`${selectedMonth}%`)
+    .first<{ inc: number; exp: number }>();
+
+  const monthIncome = round2(txSummary?.inc || 0.0);
+  const monthExpense = round2(txSummary?.exp || 0.0);
+  const netCashflow = round2(monthIncome - monthExpense);
 
   return {
-    kpis,
-    months,
+    kpis: {
+      safeToSpend,
+      totalBalance,
+      protectedSavings,
+      emergencyAllocated,
+      goalsAllocated,
+      generalAllocated,
+      passThroughOutstanding,
+      currentCommitments,
+      receivablesOutstanding,
+      pendingExpenses: 0.0,
+      monthIncome,
+      monthExpense,
+      netCashflow,
+      selectedMonth,
+      asOfDate: todayStr,
+    },
   };
 }
 
@@ -419,95 +332,136 @@ export async function getAccountsList(db: D1Database): Promise<Record<string, an
   return {
     status: "ok",
     accounts: accountsRes.results || [],
+    count: (accountsRes.results || []).length,
   };
 }
 
 export async function getTransactionsList(
   db: D1Database,
-  limit = 50,
+  limit = 20,
   offset = 0,
-  monthParam?: string
+  month?: string
 ): Promise<Record<string, any>> {
-  let query = `SELECT * FROM transactions WHERE is_deleted = 0`;
+  let query = "SELECT * FROM transactions";
   const params: any[] = [];
 
-  if (monthParam && /^\d{4}-\d{2}$/.test(monthParam)) {
-    query += ` AND date LIKE ?`;
-    params.push(`${monthParam}%`);
+  if (month) {
+    query += " WHERE date LIKE ?";
+    params.push(`${month}%`);
   }
 
-  query += ` ORDER BY date DESC, time DESC, id DESC LIMIT ? OFFSET ?`;
+  query += " ORDER BY date DESC, id DESC LIMIT ? OFFSET ?";
   params.push(limit, offset);
 
   const stmt = db.prepare(query);
-  const res = await stmt.bind(...params).all();
+  const rows = await stmt.bind(...params).all();
 
   return {
     status: "ok",
-    transactions: res.results || [],
+    transactions: rows.results || [],
+    limit,
+    offset,
   };
 }
 
 export async function getGoalsSummary(db: D1Database): Promise<Record<string, any>> {
-  const res = await db.prepare("SELECT * FROM allocation_goals ORDER BY priority ASC, id ASC").all();
+  let goals: any[] = [];
+  try {
+    const rows = await db.prepare("SELECT * FROM allocation_goals ORDER BY priority ASC, id ASC").all();
+    goals = rows.results || [];
+  } catch {}
+
   return {
     status: "success",
-    goals: res.results || [],
+    goals,
   };
 }
 
 export async function getUpcomingList(db: D1Database): Promise<Record<string, any>> {
-  const res = await db.prepare("SELECT * FROM upcoming ORDER BY due_date ASC, id ASC").all();
+  const rows = await db
+    .prepare("SELECT * FROM upcoming WHERE status = 'Active' ORDER BY due_date ASC, id ASC")
+    .all();
+
   return {
     status: "ok",
-    upcoming: res.results || [],
+    upcoming: rows.results || [],
   };
 }
 
 export async function getDebtsList(db: D1Database): Promise<Record<string, any>> {
-  const debts = await db.prepare("SELECT * FROM debts ORDER BY id ASC").all();
-  const events = await db.prepare("SELECT * FROM debt_events ORDER BY event_date ASC, id ASC").all();
+  const debts = await db.prepare("SELECT * FROM debts ORDER BY due_date ASC, id ASC").all();
+  let events: any[] = [];
+  try {
+    const evRows = await db.prepare("SELECT * FROM debt_events ORDER BY event_date ASC, id ASC").all();
+    events = evRows.results || [];
+  } catch {}
+
   return {
     status: "success",
     debts: debts.results || [],
-    events: events.results || [],
+    events,
   };
 }
 
-export async function getInsightsSummary(db: D1Database, asOfDate?: string): Promise<Record<string, any>> {
-  const targetDate = asOfDate || getWibDate().dateStr;
+export async function getInsightsSummary(db: D1Database): Promise<Record<string, any>> {
+  const { monthStr, dateStr } = getWibDate();
+  let syncState: any = null;
+  try {
+    syncState = await db.prepare("SELECT * FROM source_sync_state WHERE source = 'gmail'").first();
+  } catch {}
 
-  const lastTx = await db
-    .prepare(
-      `SELECT date, time FROM transactions
-       WHERE is_deleted = 0 AND date <= ?
-       ORDER BY date DESC, time DESC, id DESC LIMIT 1`
-    )
-    .bind(targetDate)
-    .first<{ date: string; time: string }>();
-
-  const latestDate = lastTx?.date || targetDate;
-  const latestTime = lastTx?.time || "00:00";
+  const lastEventDate = syncState?.last_event_at || dateStr;
 
   return {
     status: "ok",
     insights: {
-      as_of_date: targetDate,
-      source_freshness: {
-        latest_transaction_date: latestDate,
-        latest_transaction_time: latestTime,
-        source_name: "Input manual",
-        status_label: "Input manual",
-        is_sync_connector_active: false,
-        message: `Catatan transaksi terbaru: ${latestDate} ${latestTime} WIB via input manual.`,
+      freshness: {
+        last_event_at: lastEventDate,
+        status_label: syncState ? "Tersinkronisasi" : "Input manual",
+        is_sync_connector_active: !!syncState,
+        message: syncState
+          ? `Konektor Gmail aktif. Terakhir: ${lastEventDate} WIB.`
+          : `Catatan transaksi terbaru: ${dateStr} WIB via input manual.`,
       },
     },
   };
 }
 
 // =====================================================================
-// INGESTION & PARSER DOMAIN
+// TRANSACTION INTELLIGENCE ENGINE V1
 // =====================================================================
+
+export type CanonicalEventKind =
+  | "MERCHANT_PAYMENT"
+  | "EXTERNAL_TRANSFER"
+  | "INCOMING_TRANSFER"
+  | "OWN_TRANSFER"
+  | "TOPUP"
+  | "CASH_WITHDRAWAL"
+  | "ALLOCATION_MOVEMENT"
+  | "INVESTMENT_MOVEMENT"
+  | "REFUND"
+  | "SUBSCRIPTION_CHARGE"
+  | "DIGITAL_PURCHASE"
+  | "INVOICE_EVIDENCE"
+  | "FAILED_ATTEMPT"
+  | "NON_TRANSACTION";
+
+export type FinancialClass =
+  | "Expense"
+  | "Income"
+  | "Internal Transfer"
+  | "Top-up"
+  | "Cash Withdrawal"
+  | "Investment Movement"
+  | "Receivable"
+  | "Payable"
+  | "Refund"
+  | "Pending Review"
+  | "Ignore";
+
+export type DestinationOwnerType = "SELF" | "OTHER_PERSON" | "MERCHANT" | "INSTITUTION" | "UNKNOWN";
+export type EvidenceRole = "PRIMARY_PAYMENT" | "SECONDARY_RECEIPT" | "INVOICE" | "LIFECYCLE_STATUS" | "INTERMEDIARY";
 
 export interface ParsedCandidate {
   tx_type: "Income" | "Expense" | "Transfer";
@@ -521,14 +475,57 @@ export interface ParsedCandidate {
   time?: string | null;
   confidence_score: number;
   reasons: string;
-  status: "Pending" | "AutoApproved";
+  status: "Pending" | "AutoApproved" | "Ignored";
+}
+
+export interface CanonicalFinancialEvent {
+  event_id: string;
+  occurred_at_wib: string;
+  status: "Pending" | "Approved" | "Rejected" | "AutoApproved" | "Ignored" | "Applied";
+  event_kind: CanonicalEventKind;
+  financial_class: FinancialClass;
+  financial_direction: "Debit" | "Credit" | "Neutral";
+  amount: number;
+  currency: string;
+  fee_amount: number;
+  source_account_alias: string | null;
+  destination_account_alias: string | null;
+  destination_owner_type: DestinationOwnerType;
+  merchant_normalized: string | null;
+  merchant_pan: string | null;
+  merchant_location: string | null;
+  counterparty_normalized: string | null;
+  description_normalized: string | null;
+  transaction_reference: string | null;
+  external_order_id: string | null;
+  confidence: number;
+  recommended_action: string;
+  review_reason: string | null;
+  evidence_role: EvidenceRole;
+  candidate?: ParsedCandidate | null;
 }
 
 export function parseIndonesianAmount(text: string): number | null {
-  const match = text.match(/(?:Rp\.?|IDR)?\s*([\d\.,]+)/i);
-  if (!match) return null;
+  if (!text) return null;
 
-  let raw = match[1].trim();
+  // 1. Try explicit total/nominal/sebesar keyword first
+  const kwMatch = text.match(/(?:total pembayaran|total|nominal|sebesar|jumlah|amount|bayar)\s*[:]?\s*(?:rp\.?|idr)?\s*([\d\.,]+)/i);
+  let raw = kwMatch ? kwMatch[1].trim() : null;
+
+  // 2. Try explicit currency prefix Rp / IDR
+  if (!raw) {
+    const curMatch = text.match(/(?:Rp\.?|IDR)\s*([\d\.,]+)/i);
+    if (curMatch) raw = curMatch[1].trim();
+  }
+
+  // 3. Fallback to isolated numeric sequence
+  if (!raw) {
+    const fallbackMatch = text.match(/\b([\d\.,]+)\b/);
+    if (fallbackMatch) raw = fallbackMatch[1].trim();
+  }
+
+  if (!raw) return null;
+
   if (/,\d{2}$/.test(raw)) {
     raw = raw.replace(/\./g, "").replace(",", ".");
   } else if (/\.\d{2}$/.test(raw)) {
@@ -541,77 +538,976 @@ export function parseIndonesianAmount(text: string): number | null {
   return isNaN(parsed) || parsed <= 0 ? null : round2(parsed);
 }
 
+export function inferMerchantCategory(merchantName: string, textContext = ""): string {
+  const m = (merchantName || "").toLowerCase();
+  const c = (textContext || "").toLowerCase();
+  const full = `${m} ${c}`;
+
+  if (full.includes("warung mbak yani") || full.includes("kantin arsitektur") || full.includes("resto") || full.includes("makan") || full.includes("padang")) {
+    return "Main Meals";
+  }
+  if (full.includes("uta ngopi") || full.includes("kopi studio24") || full.includes("kopi") || full.includes("cafe") || full.includes("coffee") || full.includes("chatime")) {
+    return "Cafe & Drinks";
+  }
+  if (full.includes("spbu") || full.includes("pertamina") || full.includes("shell") || full.includes("bensin") || full.includes("pertalite") || full.includes("pertamax")) {
+    return "Fuel";
+  }
+  if (full.includes("xl") || full.includes("by.u") || full.includes("telkomsel") || full.includes("indosat") || full.includes("tri") || full.includes("pulsa") || full.includes("kuota")) {
+    return "Phone & Internet";
+  }
+  if (full.includes("fotocopy sarjana") || full.includes("fotokopi") || full.includes("print") || full.includes("percetakan") || full.includes("buku") || full.includes("gramedia")) {
+    return "Education & Career";
+  }
+  if (full.includes("parkir") || full.includes("parking") || full.includes("tol") || full.includes("etoll")) {
+    return "Parking/Toll";
+  }
+  if (full.includes("google play") || full.includes("subscription") || full.includes("spotify") || full.includes("netflix") || full.includes("youtube")) {
+    return "Subscriptions";
+  }
+  return "Other / Miscellaneous";
+}
+
+export function normalizeAccountName(name: string): string {
+  const n = name.toLowerCase().trim();
+  if (n.includes("shopeepay") || n.includes("shopee")) return "ShopeePay";
+  if (n.includes("gopay")) return "GoPay";
+  if (n.includes("jago")) return "Jago Main";
+  if (n.includes("bca poket") || n.includes("poket")) {
+    const sub = name.split(":")[1]?.trim() || "Tabungan";
+    return `BCA Poket: ${sub}`;
+  }
+  if (n.includes("bca")) return "BCA Main";
+  if (n.includes("cash") || n.includes("tunai")) return "Cash";
+  if (n.includes("rdn") || n.includes("stockbit")) return "RDN Stockbit";
+  return name;
+}
+
+// =========================================================================
+// GMAIL TRANSACTION INTELLIGENCE V1 PARSER
+// =========================================================================
+export function parseGmailIntelligence(
+  subject: string,
+  bodyText: string,
+  fromAddress: string,
+  occurredAt?: string
+): CanonicalFinancialEvent {
+  const wib = getWibDate(occurredAt ? new Date(occurredAt) : new Date());
+  const cleanFrom = (fromAddress || "").toLowerCase();
+  const cleanSubj = (subject || "").toLowerCase();
+  const cleanBody = (bodyText || "").toLowerCase();
+  const occurredAtWib = `${wib.dateStr} ${wib.timeStr} WIB`;
+
+  // -----------------------------------------------------------------------
+  // 1. BCA (bca@bca.co.id)
+  // -----------------------------------------------------------------------
+  if (cleanFrom.includes("bca.co.id")) {
+    // A. Failed transaction / Gagal
+    if (cleanBody.includes("status transaksi: gagal") || cleanBody.includes("transaksi gagal") || cleanBody.includes("transaksi ditolak") || cleanSubj.includes("gagal")) {
+      const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+      return {
+        event_id: `bca_fail_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "Ignored",
+        event_kind: "FAILED_ATTEMPT",
+        financial_class: "Ignore",
+        financial_direction: "Neutral",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: "BCA Main",
+        destination_account_alias: null,
+        destination_owner_type: "UNKNOWN",
+        merchant_normalized: null,
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: null,
+        description_normalized: "BCA Alert: Transaksi Gagal/Ditolak",
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Ignore failed transaction",
+        review_reason: "Failed attempt; zero ledger mutation.",
+        evidence_role: "LIFECYCLE_STATUS",
+        candidate: null,
+      };
+    }
+
+    // B. BCA Cardless Tarik Tunai
+    if (cleanBody.includes("tarik tunai tanpa kartu") || cleanBody.includes("cardless withdrawal") || cleanSubj.includes("tarik tunai")) {
+      const amount = parseIndonesianAmount(bodyText) || 0;
+      const refMatch = bodyText.match(/(?:no\.?\s*referensi|ref(?:erence)?)\s*[:]?\s*([a-zA-Z0-9]+)/i);
+      const refId = refMatch ? refMatch[1] : null;
+
+      const cand: ParsedCandidate = {
+        tx_type: "Transfer",
+        amount,
+        account: "BCA Main",
+        to_account: "Cash",
+        category: "Cash Withdrawal",
+        money_context: "Personal",
+        person_name: null,
+        date: wib.dateStr,
+        time: wib.timeStr,
+        confidence_score: 0.95,
+        reasons: "BCA Cardless: Penarikan tunai tanpa kartu -> BCA ke Cash.",
+        status: "AutoApproved",
+      };
+
+      return {
+        event_id: refId ? `bca_cash_${refId}` : `bca_cash_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "AutoApproved",
+        event_kind: "CASH_WITHDRAWAL",
+        financial_class: "Cash Withdrawal",
+        financial_direction: "Neutral",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: "BCA Main",
+        destination_account_alias: "Cash",
+        destination_owner_type: "SELF",
+        merchant_normalized: null,
+        merchant_pan: null,
+        merchant_location: "ATM BCA",
+        counterparty_normalized: "Self (Cash)",
+        description_normalized: "BCA Cardless Tarik Tunai",
+        transaction_reference: refId,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Record Internal Transfer BCA -> Cash",
+        review_reason: null,
+        evidence_role: "PRIMARY_PAYMENT",
+        candidate: cand,
+      };
+    }
+
+    // C. BCA Poket (Pembuatan / Tambah Dana / Pindahkan Poket)
+    if (cleanBody.includes("poket") || cleanSubj.includes("poket")) {
+      const amount = parseIndonesianAmount(bodyText) || 0;
+      const pocketMatch = bodyText.match(/(?:nama poket|poket)\s*[:]?\s*([a-zA-Z0-9\s]+)/i);
+      const pocketName = pocketMatch ? pocketMatch[1].trim() : "Tabungan";
+      const toPocket = `BCA Poket: ${pocketName}`;
+
+      const cand: ParsedCandidate = {
+        tx_type: "Transfer",
+        amount,
+        account: "BCA Main",
+        to_account: toPocket,
+        category: "Allocation Movement",
+        money_context: "Personal",
+        person_name: null,
+        date: wib.dateStr,
+        time: wib.timeStr,
+        confidence_score: 0.95,
+        reasons: `BCA Poket: Pergerakan alokasi dana ke ${toPocket}. Bukan pengeluaran ledger.`,
+        status: "AutoApproved",
+      };
+
+      return {
+        event_id: `bca_poket_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "AutoApproved",
+        event_kind: "ALLOCATION_MOVEMENT",
+        financial_class: "Internal Transfer",
+        financial_direction: "Neutral",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: "BCA Main",
+        destination_account_alias: toPocket,
+        destination_owner_type: "SELF",
+        merchant_normalized: null,
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: toPocket,
+        description_normalized: `BCA Poket Alokasi (${pocketName})`,
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Record Allocation Movement (Internal)",
+        review_reason: null,
+        evidence_role: "PRIMARY_PAYMENT",
+        candidate: cand,
+      };
+    }
+
+    // D. BCA QRIS
+    if (cleanBody.includes("qris") || cleanSubj.includes("qris")) {
+      const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+      const merchantMatch = bodyText.match(/(?:merchant|nama merchant|pembayaran kepada|kepada)\s*[:]?\s*([a-zA-Z0-9\s\.,\-_]+?)(?:\r|\n|pan|lokasi|tanggal|$)/i);
+      const merchantName = merchantMatch ? merchantMatch[1].trim() : "QRIS Merchant";
+      const panMatch = bodyText.match(/(?:pan|nmid)\s*[:]?\s*([a-zA-Z0-9]+)/i);
+      const pan = panMatch ? panMatch[1].trim() : null;
+      const locMatch = bodyText.match(/(?:lokasi|kota)\s*[:]?\s*([a-zA-Z0-9\s]+)/i);
+      const location = locMatch ? locMatch[1].trim() : null;
+      const refMatch = bodyText.match(/(?:no\.?\s*referensi|ref(?:erence)?)\s*[:]?\s*([a-zA-Z0-9]+)/i);
+      const refId = refMatch ? refMatch[1] : null;
+
+      const category = inferMerchantCategory(merchantName, bodyText);
+
+      const cand: ParsedCandidate = {
+        tx_type: "Expense",
+        amount,
+        account: "BCA Main",
+        to_account: null,
+        category,
+        money_context: "Personal",
+        person_name: null,
+        date: wib.dateStr,
+        time: wib.timeStr,
+        confidence_score: 0.95,
+        reasons: `BCA QRIS: Pembayaran berhasil ke ${merchantName}.`,
+        status: "AutoApproved",
+      };
+
+      return {
+        event_id: refId ? `bca_qris_${refId}` : `bca_qris_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "AutoApproved",
+        event_kind: "MERCHANT_PAYMENT",
+        financial_class: "Expense",
+        financial_direction: "Debit",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: "BCA Main",
+        destination_account_alias: null,
+        destination_owner_type: "MERCHANT",
+        merchant_normalized: merchantName,
+        merchant_pan: pan,
+        merchant_location: location,
+        counterparty_normalized: merchantName,
+        description_normalized: `Pembayaran QRIS ${merchantName}`,
+        transaction_reference: refId,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Record QRIS Expense",
+        review_reason: null,
+        evidence_role: "PRIMARY_PAYMENT",
+        candidate: cand,
+      };
+    }
+
+    // E. BCA Top-up ShopeePay (Virtual Account 122...)
+    if (cleanBody.includes("shopeepay") || cleanBody.includes("airpay") || cleanBody.includes("12208") || cleanBody.includes("122")) {
+      const amount = parseIndonesianAmount(bodyText) || 0;
+      const cand: ParsedCandidate = {
+        tx_type: "Transfer",
+        amount,
+        account: "BCA Main",
+        to_account: "ShopeePay",
+        category: "Top-up",
+        money_context: "Personal",
+        person_name: null,
+        date: wib.dateStr,
+        time: wib.timeStr,
+        confidence_score: 0.95,
+        reasons: "BCA Topup: Transfer ke ShopeePay VA -> Internal Transfer SELF.",
+        status: "AutoApproved",
+      };
+
+      return {
+        event_id: `bca_topup_shopee_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "AutoApproved",
+        event_kind: "TOPUP",
+        financial_class: "Top-up",
+        financial_direction: "Neutral",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: "BCA Main",
+        destination_account_alias: "ShopeePay",
+        destination_owner_type: "SELF",
+        merchant_normalized: "ShopeePay",
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "ShopeePay (Self)",
+        description_normalized: "Top-up ShopeePay via BCA Virtual Account",
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Record Internal Transfer (Topup)",
+        review_reason: null,
+        evidence_role: "PRIMARY_PAYMENT",
+        candidate: cand,
+      };
+    }
+
+    // F. BCA Transfer to Jago (SELF)
+    if (cleanBody.includes("jago") || cleanBody.includes("bank jago") || cleanBody.includes("artos")) {
+      const amount = parseIndonesianAmount(bodyText) || 0;
+      const cand: ParsedCandidate = {
+        tx_type: "Transfer",
+        amount,
+        account: "BCA Main",
+        to_account: "Jago Main",
+        category: "Other / Miscellaneous",
+        money_context: "Personal",
+        person_name: null,
+        date: wib.dateStr,
+        time: wib.timeStr,
+        confidence_score: 0.95,
+        reasons: "BCA ke Jago: Transfer antar rekening sendiri (SELF).",
+        status: "AutoApproved",
+      };
+
+      return {
+        event_id: `bca_jago_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "AutoApproved",
+        event_kind: "OWN_TRANSFER",
+        financial_class: "Internal Transfer",
+        financial_direction: "Neutral",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: "BCA Main",
+        destination_account_alias: "Jago Main",
+        destination_owner_type: "SELF",
+        merchant_normalized: null,
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "Jago Main (Self)",
+        description_normalized: "Transfer BCA ke Jago",
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Record Internal Transfer",
+        review_reason: null,
+        evidence_role: "PRIMARY_PAYMENT",
+        candidate: cand,
+      };
+    }
+
+    // G. Generic BCA Outgoing / Incoming
+    const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+    const isIncoming = cleanBody.includes("transfer dari") || cleanBody.includes("kredit") || cleanBody.includes("masuk");
+
+    const cand: ParsedCandidate = {
+      tx_type: isIncoming ? "Income" : "Expense",
+      amount,
+      account: "BCA Main",
+      to_account: null,
+      category: "Other / Miscellaneous",
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: 0.60,
+      reasons: isIncoming
+        ? "BCA: Dana masuk dari pihak lain. Memerlukan review konteks."
+        : "BCA: Transfer keluar ke perorangan/pihak ketiga. Memerlukan review kategori.",
+      status: "Pending",
+    };
+
+    return {
+      event_id: `bca_tx_${Date.now()}`,
+      occurred_at_wib: occurredAtWib,
+      status: "Pending",
+      event_kind: isIncoming ? "INCOMING_TRANSFER" : "EXTERNAL_TRANSFER",
+      financial_class: "Pending Review",
+      financial_direction: isIncoming ? "Credit" : "Debit",
+      amount,
+      currency: "IDR",
+      fee_amount: 0,
+      source_account_alias: isIncoming ? null : "BCA Main",
+      destination_account_alias: isIncoming ? "BCA Main" : null,
+      destination_owner_type: "OTHER_PERSON",
+      merchant_normalized: null,
+      merchant_pan: null,
+      merchant_location: null,
+      counterparty_normalized: "Third Party",
+      description_normalized: isIncoming ? "Transfer Masuk BCA" : "Transfer Keluar BCA",
+      transaction_reference: null,
+      external_order_id: null,
+      confidence: 0.60,
+      recommended_action: "Review recipient/sender before ledger classification",
+      review_reason: "Person-to-person transfer requires manual semantics confirmation.",
+      evidence_role: "PRIMARY_PAYMENT",
+      candidate: cand,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // 2. JAGO (noreply@jago.com)
+  // -----------------------------------------------------------------------
+  if (cleanFrom.includes("jago.com")) {
+    const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+
+    // A. RDN / Stockbit Investment
+    if (cleanBody.includes("rdn") || cleanBody.includes("stockbit") || cleanSubj.includes("stockbit") || cleanSubj.includes("rdn")) {
+      const isFromRdn = cleanBody.includes("dari rdn") || cleanBody.includes("tarik dari stockbit");
+      const cand: ParsedCandidate = {
+        tx_type: "Transfer",
+        amount,
+        account: isFromRdn ? "RDN Stockbit" : "Jago Main",
+        to_account: isFromRdn ? "Jago Main" : "RDN Stockbit",
+        category: "Investment Movement",
+        money_context: "Personal",
+        person_name: null,
+        date: wib.dateStr,
+        time: wib.timeStr,
+        confidence_score: 0.95,
+        reasons: "Jago: Pergerakan dana investasi RDN / Stockbit.",
+        status: "AutoApproved",
+      };
+
+      return {
+        event_id: `jago_rdn_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "AutoApproved",
+        event_kind: "INVESTMENT_MOVEMENT",
+        financial_class: "Investment Movement",
+        financial_direction: "Neutral",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: isFromRdn ? "RDN Stockbit" : "Jago Main",
+        destination_account_alias: isFromRdn ? "Jago Main" : "RDN Stockbit",
+        destination_owner_type: "SELF",
+        merchant_normalized: "Stockbit / RDN",
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "RDN Stockbit",
+        description_normalized: "Mutasi Investasi Jago <-> RDN Stockbit",
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Record Investment Movement",
+        review_reason: null,
+        evidence_role: "PRIMARY_PAYMENT",
+        candidate: cand,
+      };
+    }
+
+    // B. ShopeePay ke Jago (SELF)
+    if (cleanBody.includes("shopeepay") || cleanBody.includes("airpay")) {
+      const cand: ParsedCandidate = {
+        tx_type: "Transfer",
+        amount,
+        account: "ShopeePay",
+        to_account: "Jago Main",
+        category: "Other / Miscellaneous",
+        money_context: "Personal",
+        person_name: null,
+        date: wib.dateStr,
+        time: wib.timeStr,
+        confidence_score: 0.95,
+        reasons: "Jago: Tarik saldo ShopeePay ke Jago (Internal Transfer SELF).",
+        status: "AutoApproved",
+      };
+
+      return {
+        event_id: `jago_shopee_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "AutoApproved",
+        event_kind: "OWN_TRANSFER",
+        financial_class: "Internal Transfer",
+        financial_direction: "Neutral",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: "ShopeePay",
+        destination_account_alias: "Jago Main",
+        destination_owner_type: "SELF",
+        merchant_normalized: null,
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "ShopeePay (Self)",
+        description_normalized: "Transfer ShopeePay ke Jago",
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Record Internal Transfer",
+        review_reason: null,
+        evidence_role: "PRIMARY_PAYMENT",
+        candidate: cand,
+      };
+    }
+
+    // C. Jago Merchant Payment
+    if (cleanBody.includes("pembayaran merchant") || cleanBody.includes("pembayaran berhasil") || cleanBody.includes("merchant")) {
+      const mMatch = bodyText.match(/(?:merchant|di|kepada)\s*[:]?\s*([a-zA-Z0-9\s\.,\-_]+)/i);
+      const merchant = mMatch ? mMatch[1].trim() : "Merchant Jago";
+      const category = inferMerchantCategory(merchant, bodyText);
+
+      const cand: ParsedCandidate = {
+        tx_type: "Expense",
+        amount,
+        account: "Jago Main",
+        to_account: null,
+        category,
+        money_context: "Personal",
+        person_name: null,
+        date: wib.dateStr,
+        time: wib.timeStr,
+        confidence_score: 0.95,
+        reasons: `Jago: Pembayaran merchant ${merchant}.`,
+        status: "AutoApproved",
+      };
+
+      return {
+        event_id: `jago_merchant_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "AutoApproved",
+        event_kind: "MERCHANT_PAYMENT",
+        financial_class: "Expense",
+        financial_direction: "Debit",
+        amount,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: "Jago Main",
+        destination_account_alias: null,
+        destination_owner_type: "MERCHANT",
+        merchant_normalized: merchant,
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: merchant,
+        description_normalized: `Pembayaran Jago ke ${merchant}`,
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Record Expense",
+        review_reason: null,
+        evidence_role: "PRIMARY_PAYMENT",
+        candidate: cand,
+      };
+    }
+
+    // D. Generic Jago
+    const isIncoming = cleanBody.includes("uang masuk") || cleanBody.includes("transfer dari");
+    const cand: ParsedCandidate = {
+      tx_type: isIncoming ? "Income" : "Expense",
+      amount,
+      account: "Jago Main",
+      to_account: null,
+      category: "Other / Miscellaneous",
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: 0.60,
+      reasons: "Jago: Transfer pihak ketiga. Memerlukan review manual.",
+      status: "Pending",
+    };
+
+    return {
+      event_id: `jago_tx_${Date.now()}`,
+      occurred_at_wib: occurredAtWib,
+      status: "Pending",
+      event_kind: isIncoming ? "INCOMING_TRANSFER" : "EXTERNAL_TRANSFER",
+      financial_class: "Pending Review",
+      financial_direction: isIncoming ? "Credit" : "Debit",
+      amount,
+      currency: "IDR",
+      fee_amount: 0,
+      source_account_alias: isIncoming ? null : "Jago Main",
+      destination_account_alias: isIncoming ? "Jago Main" : null,
+      destination_owner_type: "OTHER_PERSON",
+      merchant_normalized: null,
+      merchant_pan: null,
+      merchant_location: null,
+      counterparty_normalized: "Third Party",
+      description_normalized: isIncoming ? "Transfer Masuk Jago" : "Transfer Keluar Jago",
+      transaction_reference: null,
+      external_order_id: null,
+      confidence: 0.60,
+      recommended_action: "Review transfer",
+      review_reason: "Third party transfer semantics unconfirmed.",
+      evidence_role: "PRIMARY_PAYMENT",
+      candidate: cand,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // 3. FLIP (no-reply@flip.id)
+  // -----------------------------------------------------------------------
+  if (cleanFrom.includes("flip.id")) {
+    const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+    const refMatch = bodyText.match(/(?:id transaksi|transaksi id|ref(?:erence)?)\s*[:]?\s*([a-zA-Z0-9]+)/i);
+    const refId = refMatch ? refMatch[1] : null;
+    const destMatch = bodyText.match(/(?:ke|rekening tujuan)\s*[:]?\s*([a-zA-Z0-9\s]+)/i);
+    const destName = destMatch ? destMatch[1].trim() : "Penerima Flip";
+
+    const cand: ParsedCandidate = {
+      tx_type: "Expense",
+      amount,
+      account: "BCA Main",
+      to_account: null,
+      category: "Other / Miscellaneous",
+      money_context: "Personal",
+      person_name: destName,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: 0.75,
+      reasons: `Flip: Transfer via intermediary Flip ke ${destName}.`,
+      status: "Pending",
+    };
+
+    return {
+      event_id: refId ? `flip_${refId}` : `flip_${Date.now()}`,
+      occurred_at_wib: occurredAtWib,
+      status: "Pending",
+      event_kind: "EXTERNAL_TRANSFER",
+      financial_class: "Pending Review",
+      financial_direction: "Debit",
+      amount,
+      currency: "IDR",
+      fee_amount: 0,
+      source_account_alias: "BCA Main",
+      destination_account_alias: null,
+      destination_owner_type: "OTHER_PERSON",
+      merchant_normalized: null,
+      merchant_pan: null,
+      merchant_location: null,
+      counterparty_normalized: destName,
+      description_normalized: `Transfer Flip ke ${destName}`,
+      transaction_reference: refId,
+      external_order_id: refId,
+      confidence: 0.75,
+      recommended_action: "Correlate with bank debit and review recipient",
+      review_reason: "Flip transfer workflow requires recipient semantic confirmation.",
+      evidence_role: "INTERMEDIARY",
+      candidate: cand,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // 4. GOOGLE PLAY (googleplay-noreply@google.com)
+  // -----------------------------------------------------------------------
+  if (cleanFrom.includes("googleplay-noreply@google.com")) {
+    const amount = parseIndonesianAmount(bodyText) || 0;
+    const orderMatch = bodyText.match(/(?:nomor pesanan|order number)\s*[:]?\s*(GPA\.[\d\-]+)/i);
+    const orderId = orderMatch ? orderMatch[1] : null;
+
+    if (cleanBody.includes("dibatalkan") || cleanBody.includes("declined") || cleanBody.includes("ditolak") || amount === 0) {
+      return {
+        event_id: orderId ? `gplay_${orderId}` : `gplay_cancel_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "Ignored",
+        event_kind: "NON_TRANSACTION",
+        financial_class: "Ignore",
+        financial_direction: "Neutral",
+        amount: 0,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: null,
+        destination_account_alias: null,
+        destination_owner_type: "MERCHANT",
+        merchant_normalized: "Google Play",
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "Google Play",
+        description_normalized: "Google Play Trial/Cancellation",
+        transaction_reference: null,
+        external_order_id: orderId,
+        confidence: 0.95,
+        recommended_action: "Ignore non-charge",
+        review_reason: "Trial or cancellation; zero financial charge.",
+        evidence_role: "LIFECYCLE_STATUS",
+        candidate: null,
+      };
+    }
+
+    const cand: ParsedCandidate = {
+      tx_type: "Expense",
+      amount,
+      account: "BCA Main",
+      to_account: null,
+      category: "Subscriptions",
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: 0.95,
+      reasons: `Google Play: Pembelian aplikasi / langganan digital (${orderId || "Order"}).`,
+      status: "AutoApproved",
+    };
+
+    return {
+      event_id: orderId ? `gplay_${orderId}` : `gplay_${Date.now()}`,
+      occurred_at_wib: occurredAtWib,
+      status: "AutoApproved",
+      event_kind: "DIGITAL_PURCHASE",
+      financial_class: "Expense",
+      financial_direction: "Debit",
+      amount,
+      currency: "IDR",
+      fee_amount: 0,
+      source_account_alias: "BCA Main",
+      destination_account_alias: null,
+      destination_owner_type: "MERCHANT",
+      merchant_normalized: "Google Play",
+      merchant_pan: null,
+      merchant_location: "Digital",
+      counterparty_normalized: "Google Play",
+      description_normalized: "Google Play Digital Purchase",
+      transaction_reference: orderId,
+      external_order_id: orderId,
+      confidence: 0.95,
+      recommended_action: "Record Digital Expense",
+      review_reason: null,
+      evidence_role: "PRIMARY_PAYMENT",
+      candidate: cand,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // 5. by.U (noreply@byu.id / noreply@cx.byu.id)
+  // -----------------------------------------------------------------------
+  if (cleanFrom.includes("byu.id")) {
+    if (cleanFrom.includes("cx.byu.id") || cleanBody.includes("kuota kamu habis") || cleanBody.includes("kuota aktif")) {
+      return {
+        event_id: `byu_cx_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "Ignored",
+        event_kind: "NON_TRANSACTION",
+        financial_class: "Ignore",
+        financial_direction: "Neutral",
+        amount: 0,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: null,
+        destination_account_alias: null,
+        destination_owner_type: "UNKNOWN",
+        merchant_normalized: "by.U",
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "by.U",
+        description_normalized: "by.U Quota/Lifecycle Notification",
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Ignore lifecycle notice",
+        review_reason: "Lifecycle quota event; zero payment charge.",
+        evidence_role: "LIFECYCLE_STATUS",
+        candidate: null,
+      };
+    }
+
+    const amount = parseIndonesianAmount(bodyText) || 0;
+    const orderMatch = bodyText.match(/(?:no\.?\s*pesanan|order id)\s*[:]?\s*([a-zA-Z0-9]+)/i);
+    const orderId = orderMatch ? orderMatch[1] : null;
+
+    const cand: ParsedCandidate = {
+      tx_type: "Expense",
+      amount,
+      account: "BCA Main",
+      to_account: null,
+      category: "Phone & Internet",
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: 0.95,
+      reasons: `by.U: Pembayaran paket data / pulsa berhasil (${orderId || "Receipt"}).`,
+      status: "AutoApproved",
+    };
+
+    return {
+      event_id: orderId ? `byu_${orderId}` : `byu_${Date.now()}`,
+      occurred_at_wib: occurredAtWib,
+      status: "AutoApproved",
+      event_kind: "DIGITAL_PURCHASE",
+      financial_class: "Expense",
+      financial_direction: "Debit",
+      amount,
+      currency: "IDR",
+      fee_amount: 0,
+      source_account_alias: "BCA Main",
+      destination_account_alias: null,
+      destination_owner_type: "MERCHANT",
+      merchant_normalized: "by.U (Telkomsel)",
+      merchant_pan: null,
+      merchant_location: "Digital",
+      counterparty_normalized: "by.U",
+      description_normalized: "Pembelian Paket by.U",
+      transaction_reference: orderId,
+      external_order_id: orderId,
+      confidence: 0.95,
+      recommended_action: "Record Telecom Expense",
+      review_reason: null,
+      evidence_role: "PRIMARY_PAYMENT",
+      candidate: cand,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // 6. ESB E-Receipt (no-reply@mailer-esb.com)
+  // -----------------------------------------------------------------------
+  if (cleanFrom.includes("mailer-esb.com")) {
+    const amount = parseIndonesianAmount(bodyText) || 0;
+    const orderMatch = bodyText.match(/(?:order id|receipt no|no struk)\s*[:]?\s*([a-zA-Z0-9\-_]+)/i);
+    const orderId = orderMatch ? orderMatch[1] : null;
+    const mMatch = bodyText.match(/(?:merchant|resto|outlet|store)\s*[:]?\s*([a-zA-Z0-9\s\.,\-_]+)/i);
+    const merchant = mMatch ? mMatch[1].trim() : "ESB Restaurant";
+
+    return {
+      event_id: orderId ? `esb_${orderId}` : `esb_${Date.now()}`,
+      occurred_at_wib: occurredAtWib,
+      status: "Approved",
+      event_kind: "INVOICE_EVIDENCE",
+      financial_class: "Expense",
+      financial_direction: "Debit",
+      amount,
+      currency: "IDR",
+      fee_amount: 0,
+      source_account_alias: null,
+      destination_account_alias: null,
+      destination_owner_type: "MERCHANT",
+      merchant_normalized: merchant,
+      merchant_pan: null,
+      merchant_location: null,
+      counterparty_normalized: merchant,
+      description_normalized: `Struk Digital ESB: ${merchant}`,
+      transaction_reference: orderId,
+      external_order_id: orderId,
+      confidence: 0.90,
+      recommended_action: "Correlate with bank debit evidence",
+      review_reason: null,
+      evidence_role: "SECONDARY_RECEIPT",
+      candidate: null, // Secondary evidence: enriches bank debit
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // 7. SHOPEE (info@shopee.co.id / info@mail.shopee.co.id)
+  // -----------------------------------------------------------------------
+  if (cleanFrom.includes("shopee.co.id")) {
+    // Shipping / delivery status -> NON_TRANSACTION
+    if (cleanSubj.includes("dikirim") || cleanSubj.includes("dalam perjalanan") || cleanSubj.includes("pesanan diterima") || cleanBody.includes("sudahkah menerima")) {
+      return {
+        event_id: `shopee_ship_${Date.now()}`,
+        occurred_at_wib: occurredAtWib,
+        status: "Ignored",
+        event_kind: "NON_TRANSACTION",
+        financial_class: "Ignore",
+        financial_direction: "Neutral",
+        amount: 0,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: null,
+        destination_account_alias: null,
+        destination_owner_type: "MERCHANT",
+        merchant_normalized: "Shopee",
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "Shopee",
+        description_normalized: "Shopee Shipping/Delivery Status",
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action: "Ignore non-invoice update",
+        review_reason: "Shipping lifecycle update; zero financial transaction.",
+        evidence_role: "LIFECYCLE_STATUS",
+        candidate: null,
+      };
+    }
+
+    // Invoice evidence
+    const amount = parseIndonesianAmount(bodyText) || 0;
+    const orderMatch = bodyText.match(/(?:no\.?\s*pesanan|order id|no invoice)\s*[:]?\s*([a-zA-Z0-9]+)/i);
+    const orderId = orderMatch ? orderMatch[1] : null;
+
+    return {
+      event_id: orderId ? `shopee_inv_${orderId}` : `shopee_inv_${Date.now()}`,
+      occurred_at_wib: occurredAtWib,
+      status: "Approved",
+      event_kind: "INVOICE_EVIDENCE",
+      financial_class: "Expense",
+      financial_direction: "Debit",
+      amount,
+      currency: "IDR",
+      fee_amount: 0,
+      source_account_alias: null,
+      destination_account_alias: null,
+      destination_owner_type: "MERCHANT",
+      merchant_normalized: "Shopee",
+      merchant_pan: null,
+      merchant_location: null,
+      counterparty_normalized: "Shopee",
+      description_normalized: `Faktur Shopee (${orderId || "Invoice"})`,
+      transaction_reference: orderId,
+      external_order_id: orderId,
+      confidence: 0.90,
+      recommended_action: "Correlate with bank/wallet payment",
+      review_reason: null,
+      evidence_role: "INVOICE",
+      candidate: null, // Secondary evidence: enriches payment
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Default / Unknown Fallback
+  // -----------------------------------------------------------------------
+  const amount = parseIndonesianAmount(bodyText) || 0;
+  return {
+    event_id: `unk_${Date.now()}`,
+    occurred_at_wib: occurredAtWib,
+    status: "Pending",
+    event_kind: "NON_TRANSACTION",
+    financial_class: "Pending Review",
+    financial_direction: "Neutral",
+    amount,
+    currency: "IDR",
+    fee_amount: 0,
+    source_account_alias: "BCA Main",
+    destination_account_alias: null,
+    destination_owner_type: "UNKNOWN",
+    merchant_normalized: null,
+    merchant_pan: null,
+    merchant_location: null,
+    counterparty_normalized: "Unknown Sender",
+    description_normalized: "Unknown Email Transaction",
+    transaction_reference: null,
+    external_order_id: null,
+    confidence: 0.20,
+    recommended_action: "Review manually",
+    review_reason: "Untrusted or unrecognized sender format.",
+    evidence_role: "PRIMARY_PAYMENT",
+    candidate: {
+      tx_type: "Expense",
+      amount,
+      account: "BCA Main",
+      to_account: null,
+      category: "Other / Miscellaneous",
+      money_context: "Personal",
+      person_name: null,
+      date: wib.dateStr,
+      time: wib.timeStr,
+      confidence_score: 0.20,
+      reasons: "Unknown sender format. Requires manual review.",
+      status: "Pending",
+    },
+  };
+}
+
+// Backward-compatible adapter for existing caller endpoints
 export function parseGmailNotification(
   subject: string,
   bodyText: string,
   fromAddress: string,
   occurredAt?: string
 ): ParsedCandidate {
-  const wib = getWibDate(occurredAt ? new Date(occurredAt) : new Date());
-  const cleanSubject = (subject || "").toLowerCase();
-  const cleanBody = (bodyText || "").toLowerCase();
-  const cleanFrom = (fromAddress || "").toLowerCase();
-
-  // 1. BCA Adapter
-  if (cleanFrom.includes("bca") || cleanSubject.includes("bca") || cleanBody.includes("m-bca")) {
-    let tx_type: "Income" | "Expense" | "Transfer" = "Expense";
-    let amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
-    let account = "BCA Main";
-    let to_account: string | null = null;
-    let category = "Other / Miscellaneous";
-    let confidence = 0.95;
-    let reasons = "BCA Alert: parsed standard transaction notification.";
-
-    if (cleanBody.includes("transfer ke") || cleanBody.includes("debit") || cleanBody.includes("qris")) {
-      tx_type = "Expense";
-      if (cleanBody.includes("qris") || cleanBody.includes("resto") || cleanBody.includes("makan") || cleanBody.includes("cafe")) {
-        category = "Main Meals";
-      } else if (cleanBody.includes("spbu") || cleanBody.includes("pertamina") || cleanBody.includes("shell")) {
-        category = "Fuel";
-      }
-    } else if (cleanBody.includes("transfer dari") || cleanBody.includes("kredit") || cleanBody.includes("masuk")) {
-      tx_type = "Income";
-      category = "Other / Miscellaneous";
-    }
-
-    if (amount <= 0) {
-      confidence = 0.4;
-      reasons = "BCA Alert: could not extract exact amount.";
-    }
-
-    const autoStatus = confidence >= 0.85 ? "AutoApproved" : "Pending";
-
-    return {
-      tx_type,
-      amount,
-      account,
-      to_account,
-      category,
-      money_context: "Personal",
-      person_name: null,
-      date: wib.dateStr,
-      time: wib.timeStr,
-      confidence_score: confidence,
-      reasons,
-      status: autoStatus,
-    };
+  const ev = parseGmailIntelligence(subject, bodyText, fromAddress, occurredAt);
+  if (ev.candidate) {
+    return ev.candidate;
   }
-
-  // 2. Generic / Unknown Adapter
-  const amount = parseIndonesianAmount(bodyText) || 0;
+  const wib = getWibDate(occurredAt ? new Date(occurredAt) : new Date());
   return {
-    tx_type: cleanBody.includes("masuk") ? "Income" : "Expense",
-    amount,
-    account: "BCA Main",
-    to_account: null,
-    category: "Other / Miscellaneous",
+    tx_type: "Expense",
+    amount: ev.amount,
+    account: ev.source_account_alias || "BCA Main",
+    to_account: ev.destination_account_alias,
+    category: ev.financial_class === "Expense" ? "Other / Miscellaneous" : ev.financial_class,
     money_context: "Personal",
-    person_name: null,
+    person_name: ev.counterparty_normalized,
     date: wib.dateStr,
     time: wib.timeStr,
-    confidence_score: 0.4,
-    reasons: "Unknown sender. Requires manual review.",
-    status: "Pending",
+    confidence_score: ev.confidence,
+    reasons: ev.review_reason || ev.recommended_action,
+    status: ev.status === "AutoApproved" ? "AutoApproved" : ev.status === "Ignored" ? "Ignored" : "Pending",
   };
 }
 
@@ -649,7 +1545,8 @@ export function parseTelegramText(text: string, referenceDate?: string): ParsedC
     let amtStr = expMatch[1].toLowerCase().replace("k", "000");
     const amount = parseIndonesianAmount(amtStr) || 0;
     const account = normalizeAccountName(expMatch[2].trim());
-    const category = inferCategory(expMatch[3].trim());
+    const purpose = expMatch[3].trim();
+    const category = inferMerchantCategory("", purpose);
 
     return {
       tx_type: "Expense",
@@ -667,21 +1564,23 @@ export function parseTelegramText(text: string, referenceDate?: string): ParsedC
     };
   }
 
-  // Pattern 3: Income "masuk 500000 ke BCA dari bonus"
-  const incMatch = clean.match(/(?:masuk|terima|dapat)\s+([\d\.,kK]+)\s+(?:ke|di)\s+([a-zA-Z0-9\s:]+?)(?:\s+(?:dari|untuk)\s+(.+))?$/i);
+  // Pattern 3: Income "masuk 500000 ke BCA dari Allan untuk gaji"
+  const incMatch = clean.match(/(?:masuk|dapat|terima)\s+([\d\.,kK]+)\s+(?:ke|di)\s+([a-zA-Z0-9\s:]+?)(?:\s+dari\s+([a-zA-Z0-9\s]+?))?(?:\s+(?:untuk|buat)\s+(.+))?$/i);
   if (incMatch) {
     let amtStr = incMatch[1].toLowerCase().replace("k", "000");
     const amount = parseIndonesianAmount(amtStr) || 0;
     const account = normalizeAccountName(incMatch[2].trim());
+    const person = incMatch[3] ? incMatch[3].trim() : null;
+    const purpose = incMatch[4] ? incMatch[4].trim() : "";
 
     return {
       tx_type: "Income",
       amount,
       account,
       to_account: null,
-      category: "Other / Miscellaneous",
+      category: purpose ? inferMerchantCategory("", purpose) : "Other / Miscellaneous",
       money_context: "Personal",
-      person_name: null,
+      person_name: person,
       date: wib.dateStr,
       time: wib.timeStr,
       confidence_score: amount > 0 ? 0.90 : 0.4,
@@ -708,31 +1607,8 @@ export function parseTelegramText(text: string, referenceDate?: string): ParsedC
   };
 }
 
-function normalizeAccountName(name: string): string {
-  const n = name.toLowerCase();
-  if (n.includes("shopee")) return "ShopeePay";
-  if (n.includes("gopay")) return "GoPay";
-  if (n.includes("jago")) return "Jago Main";
-  if (n.includes("bca poket") || n.includes("tabungan")) return "BCA Poket: Tabungan";
-  if (n.includes("bca")) return "BCA Main";
-  if (n.includes("cash") || n.includes("tunai")) return "Cash";
-  return name;
-}
-
-function inferCategory(text: string): string {
-  const t = text.toLowerCase();
-  if (t.includes("makan") || t.includes("lunch") || t.includes("dinner") || t.includes("sarapan")) return "Main Meals";
-  if (t.includes("snack") || t.includes("jajan") || t.includes("cemilan")) return "Snacks";
-  if (t.includes("kopi") || t.includes("cafe") || t.includes("minum")) return "Cafe & Drinks";
-  if (t.includes("bensin") || t.includes("pertalite") || t.includes("pertamax")) return "Fuel";
-  if (t.includes("parkir") || t.includes("tol")) return "Parking/Toll";
-  if (t.includes("pulsa") || t.includes("kuota") || t.includes("internet")) return "Phone & Internet";
-  if (t.includes("langganan") || t.includes("subscription")) return "Subscriptions";
-  if (t.includes("obat") || t.includes("dokter") || t.includes("klinik")) return "Health";
-  return "Other / Miscellaneous";
-}
-
-export function evaluateAutoApproval(candidate: ParsedCandidate, senderAllowed: boolean): "AutoApproved" | "Pending" {
+export function evaluateAutoApproval(candidate: ParsedCandidate, senderAllowed: boolean): "AutoApproved" | "Pending" | "Ignored" {
+  if (candidate.status === "Ignored") return "Ignored";
   if (!senderAllowed) return "Pending";
   if (candidate.confidence_score < 0.85) return "Pending";
   if (!candidate.amount || candidate.amount <= 0) return "Pending";
