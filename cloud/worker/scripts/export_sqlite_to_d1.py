@@ -111,7 +111,7 @@ def export_d1_sql(db_path: Path, output_sql_path: Path) -> dict:
 
 if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parents[3]
-    db_file = base_dir / "money_tracks.db"
+    db_file = base_dir / "runtime" / "money_tracks.db"
     out_file = base_dir / "cloud" / "worker" / "scripts" / "seed_shadow_d1.sql"
     res = export_d1_sql(db_file, out_file)
     print(json.dumps(res, indent=2))

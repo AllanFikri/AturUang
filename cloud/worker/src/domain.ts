@@ -411,7 +411,7 @@ export async function getDashboard(db: D1Database, monthParam?: string): Promise
 export async function getAccountsList(db: D1Database): Promise<Record<string, any>> {
   const accountsRes = await db
     .prepare(
-      `SELECT name, kind, type, current_balance, balance_date, last_reconciled_at, active
+      `SELECT name, kind, current_balance, balance_date, last_reconciled_at, active, protected, protected_amount, note
        FROM accounts ORDER BY kind ASC, name ASC`
     )
     .all();
