@@ -646,3 +646,39 @@ Operational state:
 The Backfill v2 circuit breaker remains intentionally blocked until the
 deployed correction has been verified and explicitly cleared.
 Checkpoint and offset must not be reset.
+
+
+## Gmail incomplete cleanup metadata false-negative
+
+During the May 2025 Historical Backfill v2 retry, Worker returned
+INCOMPLETE_GMAIL_EVENT_REPAIR_FAILED while recovering an incomplete Gmail
+raw event.
+
+An exact read-only D1 query afterward returned no matching raw_event row.
+
+Root cause:
+The recovery path treated cleanup.meta.changes != 1 as definitive failure,
+although the authoritative post-delete database state showed the raw row
+was already absent.
+
+Correction:
+- 7a8377d fix(gmail): verify incomplete cleanup state
+- mutation metadata remains the fast path.
+- if metadata is inconclusive, Worker queries the exact raw_event id.
+- if the row remains, recovery still fails closed with HTTP 503.
+- if the row is absent, processing safely continues.
+- no broad delete.
+- no checkpoint reset.
+- production SQLite unchanged.
+
+Validation:
+- Prompt13B Intelligence PASS.
+- Google Play cancellation regression PASS.
+- Historical Backfill v2 regression PASS.
+- TypeScript PASS.
+- Worker health PASS.
+- MODE shadow.
+- schema >= 7.
+
+Worker version:
+47d015bc-39dc-48b0-9bf2-fc82490cc382

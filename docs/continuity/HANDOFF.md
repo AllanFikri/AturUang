@@ -213,11 +213,7 @@ Asia/Jakarta / WIB.
 
 ## Immediate next action
 
-Historical Backfill v2 is intentionally blocked after a fail-fast stop.
-
-Completed:
-- 2025-03
-- 2025-04
+Historical Backfill v2 remains intentionally blocked.
 
 Authoritative checkpoint:
 2025-05
@@ -225,27 +221,23 @@ Authoritative checkpoint:
 Failed page:
 - month: 2025-05
 - offset: 0
-- code: BACKFILL_HTTP_FAILURE
+- circuit-breaker code: BACKFILL_HTTP_FAILURE
 
-Root cause correction:
-- 05dadec fix(gmail): classify google play cancellations
-
-Deployed Worker:
-- version: 6c04bb23-6572-47b1-9a2d-e91f00e3c788
-- mode: shadow
+Deployed corrections:
+- Google Play English cancellation lifecycle parser.
+- Gmail incomplete-event post-delete verification.
+- retry-guard implementation: 7a8377d
+- Worker version: 47d015bc-39dc-48b0-9bf2-fc82490cc382
+- MODE: shadow
 - schema: >= 7
 
-Next operational sequence:
-1. Do not reset checkpoint or offset.
-2. Run clearHistoricalBackfillV2Block() exactly once.
-3. Confirm the previous block was BACKFILL_HTTP_FAILURE.
-4. Run backfillHistoricalClosedMonthsV2().
-5. May offset 0 will replay safely through Gmail message-id idempotency and
-   incomplete-ingestion recovery.
-6. BACKFILL_RUNTIME_PAUSE is normal and may be resumed.
-7. Any new BACKFILL_* error means stop and diagnose before retry.
-8. After checkpoint reaches 2026-08, run coverage verification and the full
-   D1 + SQLite integrity audit before pattern analysis.
+Next:
+1. Run clearHistoricalBackfillV2Block() exactly once.
+2. Confirm previous block is BACKFILL_HTTP_FAILURE.
+3. Run backfillHistoricalClosedMonthsV2().
+4. Do not reset checkpoint or offset.
+5. BACKFILL_RUNTIME_PAUSE is resumable.
+6. Any new BACKFILL_* error means stop and diagnose.
 
 
 ## Do not do
