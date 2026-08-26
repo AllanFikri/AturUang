@@ -9,8 +9,14 @@ import {
 } from "./auth";
 import {
   getWibDate,
+  getDashboard,
+  getAccountsList,
+  getTransactionsList,
+  getGoalsSummary,
+  getUpcomingList,
+  getDebtsList,
   reconstructBalance,
-  computeDashboardKpis,
+  getInsightsSummary,
   parseGmailNotification,
   parseTelegramText,
   evaluateAutoApproval,
@@ -59,32 +65,7 @@ export default {
     }
 
     // =================================================================
-    // 2. SHADOW WRITE PROTECTION FOR FINANCIAL MUTATIONS
-    // =================================================================
-    const isShadow = (env.MODE || "shadow").toLowerCase() === "shadow";
-    if (isShadow && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
-      const isStagingIngest =
-        path.startsWith("/api/ingest/") ||
-        path.startsWith("/api/telegram/") ||
-        path.startsWith("/api/ingestion/");
-
-      if (!isStagingIngest) {
-        return new Response(
-          JSON.stringify({
-            status: "error",
-            code: "SHADOW_READ_ONLY",
-            message: "Aplikasi cloud masih berjalan dalam mode Shadow Read-Only. Perubahan data keuangan lokal tidak diizinkan.",
-          }),
-          {
-            status: 503,
-            headers: getSecurityHeaders(),
-          }
-        );
-      }
-    }
-
-    // =================================================================
-    // 3. GMAIL INGESTION RELAY (HMAC-SHA256 Protected)
+    // 2. GMAIL INGESTION RELAY (HMAC-SHA256 Protected)
     // =================================================================
     if (path === "/api/ingest/gmail" && method === "POST") {
       const rawBody = await request.text();
@@ -195,7 +176,7 @@ export default {
     }
 
     // =================================================================
-    // 4. TELEGRAM BOT WEBHOOK
+    // 3. TELEGRAM BOT WEBHOOK
     // =================================================================
     if (path === "/api/telegram/webhook" && method === "POST") {
       const secCheck = verifyTelegramWebhook(request, env.TELEGRAM_SECRET_TOKEN);
@@ -318,13 +299,16 @@ export default {
     }
 
     // =================================================================
-    // 5. STAGING REVIEW API (Admin Token Protected)
+    // 4. AUTHENTICATION FOR STAGING API
     // =================================================================
     const authError = authenticateRequest(request, env);
     if (authError) {
       return authError;
     }
 
+    // =================================================================
+    // 5. STAGING REVIEW API (Admin Token Protected)
+    // =================================================================
     // GET /api/ingestion/pending
     if (path === "/api/ingestion/pending" && method === "GET") {
       const candidates = await env.DB.prepare(
@@ -393,20 +377,129 @@ export default {
     }
 
     // =================================================================
-    // 6. READ-ONLY ENDPOINTS
+    // 6. SHADOW WRITE PROTECTION FOR FINANCIAL MUTATIONS
     // =================================================================
-    if (path === "/api/dashboard" && method === "GET") {
-      const month = url.searchParams.get("month") || getWibDate().monthStr;
-      const kpis = await computeDashboardKpis(env.DB, month);
-      return new Response(JSON.stringify({ kpis }), {
-        status: 200,
-        headers: getSecurityHeaders(),
-      });
+    const isShadow = (env.MODE || "shadow").toLowerCase() === "shadow";
+    if (isShadow && method !== "GET" && method !== "HEAD") {
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          code: "SHADOW_READ_ONLY",
+          message:
+            "Backend Cloudflare D1 beroperasi dalam mode shadow read-only. Seluruh mutasi tulis ditolak untuk menjaga integritas.",
+        }),
+        {
+          status: 503,
+          headers: getSecurityHeaders(),
+        }
+      );
     }
 
-    return new Response(
-      JSON.stringify({ status: "error", message: "Endpoint tidak ditemukan." }),
-      { status: 404, headers: getSecurityHeaders() }
-    );
+    // =================================================================
+    // 7. READ API ROUTING (Prompt 13A Staging Parity)
+    // =================================================================
+    try {
+      if (path === "/api/dashboard") {
+        const month = url.searchParams.get("month") || undefined;
+        const data = await getDashboard(env.DB, month);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/accounts") {
+        const data = await getAccountsList(env.DB);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/transactions") {
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 500);
+        const offset = Math.max(parseInt(url.searchParams.get("offset") || "0", 10), 0);
+        const month = url.searchParams.get("month") || undefined;
+        const data = await getTransactionsList(env.DB, limit, offset, month);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/goals") {
+        const data = await getGoalsSummary(env.DB);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/upcoming") {
+        const data = await getUpcomingList(env.DB);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/debts") {
+        const data = await getDebtsList(env.DB);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/reconstruct-balance") {
+        const account = url.searchParams.get("account") || "";
+        const asOf = url.searchParams.get("as_of") || undefined;
+        if (!account) {
+          return new Response(
+            JSON.stringify({ status: "error", message: "Parameter account diperlukan." }),
+            { status: 400, headers: getSecurityHeaders() }
+          );
+        }
+        const data = await reconstructBalance(env.DB, account, asOf);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/insights" || path === "/api/insights/recurring" || path === "/api/accounts/freshness") {
+        const asOf = url.searchParams.get("as_of") || undefined;
+        const data = await getInsightsSummary(env.DB, asOf);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      // 404 Route Not Found
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          code: "NOT_FOUND",
+          message: `Endpoint '${path}' tidak ditemukan.`,
+        }),
+        {
+          status: 404,
+          headers: getSecurityHeaders(),
+        }
+      );
+    } catch (err: any) {
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Terjadi kesalahan internal pada layanan backend cloud.",
+        }),
+        {
+          status: 500,
+          headers: getSecurityHeaders(),
+        }
+      );
+    }
   },
 };
