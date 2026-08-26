@@ -30,7 +30,7 @@ export function constantTimeEqual(a: string, b: string): boolean {
 }
 
 export function authenticateRequest(request: Request, env: Env): Response | null {
-  const expectedToken = env.STAGING_ADMIN_TOKEN;
+  const expectedToken = (env.STAGING_ADMIN_TOKEN || "").trim();
   if (!expectedToken) {
     // Fail closed: Token tidak dikonfigurasi pada environment
     return new Response(
@@ -148,12 +148,13 @@ export function verifyTelegramWebhook(
   request: Request,
   expectedSecretToken?: string
 ): { valid: boolean; error?: string } {
-  if (!expectedSecretToken) {
+  const cleanExpected = (expectedSecretToken || "").trim();
+  if (!cleanExpected) {
     // Fail-closed: Jika secret belum diisi, tolak seluruh webhook
     return { valid: false, error: "UNCONFIGURED_TELEGRAM_SECRET" };
   }
-  const headerToken = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
-  if (!headerToken || !constantTimeEqual(headerToken, expectedSecretToken)) {
+  const headerToken = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "").trim();
+  if (!headerToken || !constantTimeEqual(headerToken, cleanExpected)) {
     return { valid: false, error: "INVALID_TELEGRAM_SECRET" };
   }
   return { valid: true };
