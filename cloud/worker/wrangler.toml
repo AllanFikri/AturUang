@@ -8,4 +8,4 @@ MODE = "shadow"
 [[d1_databases]]
 binding = "DB"
 database_name = "aturuang-db"
-database_id = "local-d1-placeholder"
+database_id = "9320692c-3bfa-4782-9aec-23bde74873ac"
