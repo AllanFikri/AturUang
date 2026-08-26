@@ -262,6 +262,29 @@ class TestGmailIntelligenceV1(unittest.TestCase):
         )
 
         self.assertIn(
+            "remainingPartial",
+            index_text,
+            "Incomplete Gmail cleanup must verify post-delete state when D1 mutation metadata is inconclusive.",
+        )
+
+        repair_verification = index_text.split(
+            "const remainingPartial",
+            1,
+        )[1].split(
+            "if (remainingPartial)",
+            1,
+        )[0]
+
+        self.assertIn(
+            "SELECT id",
+            repair_verification,
+            "Incomplete Gmail repair must query the exact raw row after inconclusive mutation metadata.",
+        )
+
+        self.assertIn("FROM raw_events", repair_verification)
+        self.assertIn("WHERE id = ?", repair_verification)
+
+        self.assertIn(
             "CANONICAL_EVENT_PERSISTENCE_FAILED",
             index_text,
             "Canonical persistence failures must propagate to HTTP 500.",

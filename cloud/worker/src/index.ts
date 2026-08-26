@@ -180,14 +180,26 @@ export default {
           ).bind(existing.id).run();
 
           if ((cleanup.meta.changes || 0) !== 1) {
-            return new Response(
-              JSON.stringify({
-                status: "error",
-                code: "INCOMPLETE_GMAIL_EVENT_REPAIR_FAILED",
-                message: "Event Gmail parsial tidak dapat dipulihkan dengan aman.",
-              }),
-              { status: 503, headers: getSecurityHeaders() }
-            );
+            // D1 mutation metadata is not used as the sole proof of cleanup.
+            // Verify the authoritative post-delete state before failing.
+            const remainingPartial = await env.DB.prepare(
+              `SELECT id
+               FROM raw_events
+               WHERE id = ?
+                 AND source = 'gmail'
+               LIMIT 1`
+            ).bind(existing.id).first<{ id: number }>();
+
+            if (remainingPartial) {
+              return new Response(
+                JSON.stringify({
+                  status: "error",
+                  code: "INCOMPLETE_GMAIL_EVENT_REPAIR_FAILED",
+                  message: "Event Gmail parsial tidak dapat dipulihkan dengan aman.",
+                }),
+                { status: 503, headers: getSecurityHeaders() }
+              );
+            }
           }
         }
 
