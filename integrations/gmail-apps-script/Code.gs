@@ -142,7 +142,7 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
 
       if (
         rawOffset === null ||
-        !/^\\d+$/.test(rawOffset)
+        !/^\d+$/.test(rawOffset)
       ) {
         console.error(
           "BACKFILL_INVALID_OFFSET" +
