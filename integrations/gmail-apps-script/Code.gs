@@ -430,15 +430,10 @@ function processGmailQueryPage(
 
         if (code === 200) {
           processedCount++;
-        } else if (code === 403) {
-          // A thread can contain a message from another sender.
-          // Strict sender filtering is intentional, so this is not
-          // treated as a historical backfill failure.
-          console.warn(
-            "Ditolak (403 Untrusted Sender): " +
-            fromHeader
-          );
         } else {
+          // Sender trust sudah diperiksa sebelum request.
+          // Karena itu setiap respons non-200 dari Worker harus
+          // menahan checkpoint agar historical evidence tidak terlewat.
           failedCount++;
 
           console.error(
