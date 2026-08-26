@@ -269,6 +269,7 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
  * backfillGmailTransactions() resumes from its stored thread offset.
  * Once checkpoint advances to February, this function refuses to rerun.
  */
+
 function backfillJanuary2025Trial() {
   const props = PropertiesService.getScriptProperties();
 
@@ -440,7 +441,8 @@ function processGmailQueryPage(
       const signatureBytes =
         Utilities.computeHmacSha256Signature(
           toSign,
-          relaySecret
+          relaySecret,
+          Utilities.Charset.UTF_8
         );
 
       const signature = signatureBytes
@@ -480,10 +482,26 @@ function processGmailQueryPage(
           // menahan checkpoint agar historical evidence tidak terlewat.
           failedCount++;
 
+          let workerCode = "UNKNOWN_WORKER_ERROR";
+
+          try {
+            const workerError = JSON.parse(
+              response.getContentText()
+            );
+
+            workerCode =
+              workerError.code ||
+              "NO_ERROR_CODE";
+          } catch (parseError) {
+            workerCode = "UNPARSEABLE_ERROR_RESPONSE";
+          }
+
           console.error(
             "Relay HTTP " +
             code +
-            " untuk Gmail message ID " +
+            " | Worker code=" +
+            workerCode +
+            " | Gmail message ID " +
             messageId
           );
         }
