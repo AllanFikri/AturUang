@@ -204,7 +204,7 @@ export default {
     }
 
     // =================================================================
-    // 3. TELEGRAM BOT WEBHOOK (Atomic Durable Idempotency)
+    // 3. TELEGRAM BOT WEBHOOK (Atomic Durable Transaction Idempotency)
     // =================================================================
     if (path === "/api/telegram/webhook" && method === "POST") {
       const secCheck = verifyTelegramWebhook(request, env.TELEGRAM_SECRET_TOKEN);
@@ -218,7 +218,7 @@ export default {
       try {
         const payload = await request.json<any>();
 
-        // 3a. Handle Callback Query (Inline Keyboard Approve/Reject) with Atomic Durable Guard
+        // 3a. Handle Callback Query (Inline Keyboard Approve/Reject) with Atomic D1 Batch
         if (payload.callback_query) {
           const cb = payload.callback_query;
           const fromUser = cb.from?.id;
@@ -242,8 +242,9 @@ export default {
           }
 
           const targetStatus = action === "approve" ? "Approved" : "Rejected";
+          const opKey = callbackId ? `tg_cb_${callbackId}` : `tg_cand_${candId}_${targetStatus}_${Date.now()}`;
 
-          // Step 1: Check Callback Guard for exact duplicate callback_id replay
+          // Fast-path guard check for exact callback_id replay
           if (callbackId) {
             try {
               const guardRow = await env.DB.prepare(
@@ -262,46 +263,60 @@ export default {
                   { status: 200, headers: getSecurityHeaders() }
                 );
               }
-            } catch {
-              // Abaikan jika tabel guard belum termigrasi
-            }
+            } catch {}
           }
 
-          // Step 2: Atomic conditional state transition (WHERE status = 'Pending')
-          const updateRes = await env.DB.prepare(
-            "UPDATE ingestion_candidates SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
-          ).bind(targetStatus, candId).run();
+          // Atomic D1 Transaction via batch():
+          // 1. Insert callback guard conditionally (while status is Pending)
+          // 2. Insert audit log conditionally (while status is Pending)
+          // 3. Update candidate status conditionally (WHERE status = 'Pending')
+          try {
+            const batchStatements = [];
 
-          const changes = updateRes.meta?.changes || 0;
-
-          if (changes === 1) {
-            // State transition succeeded exactly once!
             if (callbackId) {
-              try {
-                await env.DB.prepare(
-                  "INSERT INTO telegram_callback_guard (callback_id, candidate_id, action) VALUES (?, ?, ?)"
-                ).bind(callbackId, candId, targetStatus).run();
-              } catch {
-                // Abaikan jika tabel guard belum ada
-              }
+              batchStatements.push(
+                env.DB.prepare(
+                  `INSERT INTO telegram_callback_guard (callback_id, candidate_id, action)
+                   SELECT ?, id, ? FROM ingestion_candidates WHERE id = ? AND status = 'Pending'`
+                ).bind(callbackId, targetStatus, candId)
+              );
             }
 
-            await env.DB.prepare(
-              "INSERT INTO ingestion_audit_log (candidate_id, action, actor, details) VALUES (?, ?, 'telegram_user', 'Reviewed via inline button')"
-            ).bind(candId, targetStatus).run();
-
-            return new Response(
-              JSON.stringify({
-                status: "success",
-                action: targetStatus,
-                candidate_id: candId,
-                previous_status: "Pending",
-              }),
-              { status: 200, headers: getSecurityHeaders() }
+            batchStatements.push(
+              env.DB.prepare(
+                `INSERT INTO ingestion_audit_log (candidate_id, action, actor, details, operation_key)
+                 SELECT id, ?, 'telegram_user', 'Reviewed via inline button', ?
+                 FROM ingestion_candidates WHERE id = ? AND status = 'Pending'`
+              ).bind(targetStatus, opKey, candId)
             );
+
+            batchStatements.push(
+              env.DB.prepare(
+                "UPDATE ingestion_candidates SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
+              ).bind(targetStatus, candId)
+            );
+
+            const batchResults = await env.DB.batch(batchStatements);
+            const updateResult = batchResults[batchResults.length - 1];
+            const changes = updateResult?.meta?.changes || 0;
+
+            if (changes === 1) {
+              // All statements succeeded and committed atomically!
+              return new Response(
+                JSON.stringify({
+                  status: "success",
+                  action: targetStatus,
+                  candidate_id: candId,
+                  previous_status: "Pending",
+                }),
+                { status: 200, headers: getSecurityHeaders() }
+              );
+            }
+          } catch (batchErr: any) {
+            // If batch throws UNIQUE constraint error, fallback to current state inspection
           }
 
-          // Step 3: If conditional update affected 0 rows, evaluate current state (DO NOT INSERT AUDIT)
+          // If changes === 0 or batch threw, inspect current state (ZERO partial mutations exist)
           const cand = await env.DB.prepare(
             "SELECT id, status FROM ingestion_candidates WHERE id = ?"
           ).bind(candId).first<{ id: number; status: string }>();
@@ -466,7 +481,7 @@ export default {
     }
 
     // =================================================================
-    // 5. STAGING REVIEW API (Admin Token Protected & Idempotent)
+    // 5. STAGING REVIEW API (Atomic D1 Batch Protected & Idempotent)
     // =================================================================
     // GET /api/ingestion/pending
     if (path === "/api/ingestion/pending" && method === "GET") {
@@ -479,33 +494,40 @@ export default {
       });
     }
 
-    // POST /api/ingestion/:id/approve
+    // POST /api/ingestion/:id/approve (Atomic D1 Batch)
     const approveMatch = path.match(/^\/api\/ingestion\/(\d+)\/approve$/);
     if (approveMatch && method === "POST") {
       const candId = parseInt(approveMatch[1], 10);
-      const updateRes = await env.DB.prepare(
-        "UPDATE ingestion_candidates SET status = 'Approved', reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
-      ).bind(candId).run();
+      const opKey = `admin_approve_${candId}_${Date.now()}`;
 
-      const changes = updateRes.meta?.changes || 0;
+      try {
+        const batchRes = await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO ingestion_audit_log (candidate_id, action, actor, details, operation_key)
+             SELECT id, 'Approved', 'admin_user', 'Approved in shadow mode (staging only)', ?
+             FROM ingestion_candidates WHERE id = ? AND status = 'Pending'`
+          ).bind(opKey, candId),
+          env.DB.prepare(
+            "UPDATE ingestion_candidates SET status = 'Approved', reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
+          ).bind(candId),
+        ]);
 
-      if (changes === 1) {
-        await env.DB.prepare(
-          "INSERT INTO ingestion_audit_log (candidate_id, action, actor, details) VALUES (?, 'Approved', 'admin_user', 'Approved in shadow mode (staging only)')"
-        ).bind(candId).run();
+        const changes = batchRes[1]?.meta?.changes || 0;
+        if (changes === 1) {
+          return new Response(
+            JSON.stringify({
+              status: "success",
+              candidate_id: candId,
+              new_status: "Approved",
+              mode: env.MODE || "shadow",
+              ledger_updated: false,
+            }),
+            { status: 200, headers: getSecurityHeaders() }
+          );
+        }
+      } catch (batchErr: any) {}
 
-        return new Response(
-          JSON.stringify({
-            status: "success",
-            candidate_id: candId,
-            new_status: "Approved",
-            mode: env.MODE || "shadow",
-            ledger_updated: false,
-          }),
-          { status: 200, headers: getSecurityHeaders() }
-        );
-      }
-
+      // Fallback inspection if changes === 0
       const cand = await env.DB.prepare(
         "SELECT id, status FROM ingestion_candidates WHERE id = ?"
       ).bind(candId).first<{ id: number; status: string }>();
@@ -542,30 +564,36 @@ export default {
       );
     }
 
-    // POST /api/ingestion/:id/reject
+    // POST /api/ingestion/:id/reject (Atomic D1 Batch)
     const rejectMatch = path.match(/^\/api\/ingestion\/(\d+)\/reject$/);
     if (rejectMatch && method === "POST") {
       const candId = parseInt(rejectMatch[1], 10);
-      const updateRes = await env.DB.prepare(
-        "UPDATE ingestion_candidates SET status = 'Rejected', reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
-      ).bind(candId).run();
+      const opKey = `admin_reject_${candId}_${Date.now()}`;
 
-      const changes = updateRes.meta?.changes || 0;
+      try {
+        const batchRes = await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO ingestion_audit_log (candidate_id, action, actor, details, operation_key)
+             SELECT id, 'Rejected', 'admin_user', 'Rejected by admin', ?
+             FROM ingestion_candidates WHERE id = ? AND status = 'Pending'`
+          ).bind(opKey, candId),
+          env.DB.prepare(
+            "UPDATE ingestion_candidates SET status = 'Rejected', reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
+          ).bind(candId),
+        ]);
 
-      if (changes === 1) {
-        await env.DB.prepare(
-          "INSERT INTO ingestion_audit_log (candidate_id, action, actor, details) VALUES (?, 'Rejected', 'admin_user', 'Rejected by admin')"
-        ).bind(candId).run();
-
-        return new Response(
-          JSON.stringify({
-            status: "success",
-            candidate_id: candId,
-            new_status: "Rejected",
-          }),
-          { status: 200, headers: getSecurityHeaders() }
-        );
-      }
+        const changes = batchRes[1]?.meta?.changes || 0;
+        if (changes === 1) {
+          return new Response(
+            JSON.stringify({
+              status: "success",
+              candidate_id: candId,
+              new_status: "Rejected",
+            }),
+            { status: 200, headers: getSecurityHeaders() }
+          );
+        }
+      } catch (batchErr: any) {}
 
       const cand = await env.DB.prepare(
         "SELECT id, status FROM ingestion_candidates WHERE id = ?"

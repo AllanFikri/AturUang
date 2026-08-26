@@ -25,6 +25,8 @@ MIGRATION_01 = BASE_DIR / "cloud" / "worker" / "migrations" / "0001_initial_sche
 MIGRATION_02 = BASE_DIR / "cloud" / "worker" / "migrations" / "0002_staging_schema.sql"
 MIGRATION_03 = BASE_DIR / "cloud" / "worker" / "migrations" / "0003_ingestion_connectors.sql"
 MIGRATION_04 = BASE_DIR / "cloud" / "worker" / "migrations" / "0004_durable_nonce_guard.sql"
+MIGRATION_05 = BASE_DIR / "cloud" / "worker" / "migrations" / "0005_telegram_callback_guard.sql"
+MIGRATION_06 = BASE_DIR / "cloud" / "worker" / "migrations" / "0006_atomic_audit_guard.sql"
 
 
 def reset_test_tables(con: sqlite3.Connection):
@@ -33,6 +35,7 @@ def reset_test_tables(con: sqlite3.Connection):
         "reconciliations",
         "balance_snapshots",
         "ingestion_audit_log",
+        "telegram_callback_guard",
         "ingestion_candidates",
         "raw_events",
         "transactions",
@@ -193,11 +196,13 @@ class TestPrompt13aCloudParity(unittest.TestCase):
         self.d1_con.row_factory = sqlite3.Row
         self.d1_con.execute("PRAGMA foreign_keys = ON")
 
-        # Apply D1 migrations 0001, 0002, 0003, 0004
+        # Apply D1 migrations 0001, 0002, 0003, 0004, 0005, 0006
         self.d1_con.executescript(MIGRATION_01.read_text(encoding="utf-8"))
         self.d1_con.executescript(MIGRATION_02.read_text(encoding="utf-8"))
         self.d1_con.executescript(MIGRATION_03.read_text(encoding="utf-8"))
         self.d1_con.executescript(MIGRATION_04.read_text(encoding="utf-8"))
+        self.d1_con.executescript(MIGRATION_05.read_text(encoding="utf-8"))
+        self.d1_con.executescript(MIGRATION_06.read_text(encoding="utf-8"))
 
         # Generate dynamic test seed SQL from test sqlite
         self.test_seed_sql = Path(self.tmp_dir) / "test_seed.sql"
@@ -212,11 +217,13 @@ class TestPrompt13aCloudParity(unittest.TestCase):
     def test_01_migration_fresh_and_idempotent(self):
         """Test 1: D1 migrations execute cleanly on fresh database and are idempotent on re-execution."""
         mig_rows = self.d1_con.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall()
-        self.assertEqual(len(mig_rows), 4)
+        self.assertEqual(len(mig_rows), 6)
         self.assertEqual(mig_rows[0]["version"], 1)
         self.assertEqual(mig_rows[1]["version"], 2)
         self.assertEqual(mig_rows[2]["version"], 3)
         self.assertEqual(mig_rows[3]["version"], 4)
+        self.assertEqual(mig_rows[4]["version"], 5)
+        self.assertEqual(mig_rows[5]["version"], 6)
 
     def test_02_export_source_strictly_readonly(self):
         """Test 2: Export process reads source in read-only mode and leaves file hash unchanged."""
@@ -259,7 +266,6 @@ class TestPrompt13aCloudParity(unittest.TestCase):
 
     def test_05_comprehensive_nonzero_fixture_production_parity(self):
         """Test 5: True parity between Python production canonical services.py and D1 domain calculation across ALL nonzero financial fixtures simultaneously."""
-        # Clean test tables in both SQLite and D1 instances
         for con in (self.sqlite_con, self.d1_con):
             reset_test_tables(con)
 

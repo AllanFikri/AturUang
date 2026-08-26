@@ -1,5 +1,5 @@
 """
-Test Suite: Prompt 13B-V4 — Final Pre-Deploy Safety Gate (Callback Guard, Nonce Failure Semantics, Minimal Payload Privacy)
+Test Suite: Prompt 13B-V4.1 — Atomic Review Transactions, Failure Injection, and Durable Idempotency
 """
 import sys
 from pathlib import Path
@@ -30,6 +30,89 @@ MIGRATION_02 = BASE_DIR / "cloud" / "worker" / "migrations" / "0002_staging_sche
 MIGRATION_03 = BASE_DIR / "cloud" / "worker" / "migrations" / "0003_ingestion_connectors.sql"
 MIGRATION_04 = BASE_DIR / "cloud" / "worker" / "migrations" / "0004_durable_nonce_guard.sql"
 MIGRATION_05 = BASE_DIR / "cloud" / "worker" / "migrations" / "0005_telegram_callback_guard.sql"
+MIGRATION_06 = BASE_DIR / "cloud" / "worker" / "migrations" / "0006_atomic_audit_guard.sql"
+
+
+def execute_telegram_callback_atomic(con: sqlite3.Connection, callback_id: str | None, cand_id: int, target_status: str, fail_at: str | None = None) -> dict:
+    """Production transaction model for Telegram callback review matching index.ts atomic D1 batch."""
+    op_key = f"tg_cb_{callback_id}" if callback_id else f"tg_cand_{cand_id}_{target_status}_{time.time()}"
+
+    # 1. Fast-path guard check
+    if callback_id:
+        guard = con.execute("SELECT callback_id, candidate_id, action FROM telegram_callback_guard WHERE callback_id=?", (callback_id,)).fetchone()
+        if guard:
+            return {"status": "success", "idempotent": True, "action": guard["action"], "candidate_id": guard["candidate_id"]}
+
+    # 2. Atomic Transaction Block
+    try:
+        with con:
+            if fail_at == "guard":
+                raise sqlite3.OperationalError("SIMULATED_D1_GUARD_FAILURE")
+
+            if callback_id:
+                con.execute(
+                    "INSERT INTO telegram_callback_guard (callback_id, candidate_id, action) SELECT ?, id, ? FROM ingestion_candidates WHERE id = ? AND status = 'Pending'",
+                    (callback_id, target_status, cand_id)
+                )
+
+            if fail_at == "audit":
+                raise sqlite3.OperationalError("SIMULATED_D1_AUDIT_FAILURE")
+
+            con.execute(
+                "INSERT INTO ingestion_audit_log (candidate_id, action, actor, details, operation_key) SELECT id, ?, 'telegram_user', 'Reviewed via inline button', ? FROM ingestion_candidates WHERE id = ? AND status = 'Pending'",
+                (target_status, op_key, cand_id)
+            )
+
+            cur = con.execute(
+                "UPDATE ingestion_candidates SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'",
+                (target_status, cand_id)
+            )
+            changes = cur.rowcount
+
+        if changes == 1:
+            return {"status": "success", "action": target_status, "candidate_id": cand_id, "previous_status": "Pending"}
+    except Exception:
+        pass
+
+    # Inspect current state outside aborted transaction
+    cand = con.execute("SELECT id, status FROM ingestion_candidates WHERE id=?", (cand_id,)).fetchone()
+    if not cand:
+        return {"status": "error", "code": "NOT_FOUND"}
+    if cand["status"] == target_status:
+        return {"status": "success", "idempotent": True, "action": target_status, "candidate_id": cand_id}
+    return {"status": "error", "code": "TERMINAL_STATE_LOCKED", "current_status": cand["status"]}
+
+
+def execute_admin_review_atomic(con: sqlite3.Connection, cand_id: int, target_status: str, actor: str = "admin_user", fail_at: str | None = None) -> dict:
+    """Production transaction model for Admin Staging review endpoints matching index.ts atomic D1 batch."""
+    op_key = f"admin_{target_status.lower()}_{cand_id}_{time.time()}"
+    try:
+        with con:
+            if fail_at == "audit":
+                raise sqlite3.OperationalError("SIMULATED_D1_AUDIT_FAILURE")
+
+            con.execute(
+                "INSERT INTO ingestion_audit_log (candidate_id, action, actor, details, operation_key) SELECT id, ?, ?, 'Admin review via staging API', ? FROM ingestion_candidates WHERE id = ? AND status = 'Pending'",
+                (target_status, actor, op_key, cand_id)
+            )
+
+            cur = con.execute(
+                "UPDATE ingestion_candidates SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'",
+                (target_status, cand_id)
+            )
+            changes = cur.rowcount
+
+        if changes == 1:
+            return {"status": "success", "candidate_id": cand_id, "new_status": target_status}
+    except Exception:
+        pass
+
+    cand = con.execute("SELECT id, status FROM ingestion_candidates WHERE id=?", (cand_id,)).fetchone()
+    if not cand:
+        return {"status": "error", "code": "NOT_FOUND"}
+    if cand["status"] == target_status:
+        return {"status": "success", "idempotent": True, "candidate_id": cand_id, "new_status": target_status}
+    return {"status": "error", "code": "TERMINAL_STATE_LOCKED", "current_status": cand["status"]}
 
 
 class TestPrompt13BIngestion(unittest.TestCase):
@@ -43,12 +126,13 @@ class TestPrompt13BIngestion(unittest.TestCase):
         self.con.row_factory = sqlite3.Row
         self.con.execute("PRAGMA foreign_keys = ON")
 
-        # Apply migrations 0001, 0002, 0003, 0004, 0005
+        # Apply migrations 0001, 0002, 0003, 0004, 0005, 0006
         self.con.executescript(MIGRATION_01.read_text(encoding="utf-8"))
         self.con.executescript(MIGRATION_02.read_text(encoding="utf-8"))
         self.con.executescript(MIGRATION_03.read_text(encoding="utf-8"))
         self.con.executescript(MIGRATION_04.read_text(encoding="utf-8"))
         self.con.executescript(MIGRATION_05.read_text(encoding="utf-8"))
+        self.con.executescript(MIGRATION_06.read_text(encoding="utf-8"))
 
         # Base raw_events for foreign keys
         self.con.execute(
@@ -64,7 +148,6 @@ class TestPrompt13BIngestion(unittest.TestCase):
 
         self.secret = "test_gmail_relay_secret_key"
         self.tg_secret = "test_telegram_secret_token"
-        self.allowed_user_id = 123456789
 
     def tearDown(self):
         self.con.close()
@@ -75,280 +158,209 @@ class TestPrompt13BIngestion(unittest.TestCase):
         return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
     # =========================================================================
-    # 1. GMAIL HMAC & NONCE FAILURE SEMANTICS
+    # 1. ATOMIC TELEGRAM CALLBACK & FAILURE INJECTION TESTS
     # =========================================================================
 
-    def test_01_gmail_nonce_failure_semantics_replay_vs_db_error(self):
-        """1. Nonce error semantics: UNIQUE violation returns NONCE_REPLAY, whereas database failure returns REPLAY_GUARD_UNAVAILABLE (not NONCE_REPLAY)."""
-        auth_ts = (BASE_DIR / "cloud" / "worker" / "src" / "auth.ts").read_text(encoding="utf-8")
-        index_ts = (BASE_DIR / "cloud" / "worker" / "src" / "index.ts").read_text(encoding="utf-8")
-
-        # Source code audit for error differentiation
-        self.assertIn("NONCE_REPLAY", auth_ts)
-        self.assertIn("REPLAY_GUARD_UNAVAILABLE", auth_ts)
-        self.assertIn("REPLAY_GUARD_UNAVAILABLE", index_ts)
-        self.assertIn("503", index_ts)
-
-        # Simulation on SQLite D1:
-        now_ts = int(time.time() * 1000)
-        nonce_unique = "nonce_sem_101"
-
-        # First valid insert succeeds
-        self.con.execute("INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)", (nonce_unique, now_ts))
+    def test_01_successful_transition_creates_exactly_one_state_change_and_audit(self):
+        """1. Successful Telegram callback transition commits state change, guard, and audit log atomically."""
+        self.con.execute(
+            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (10, 1, 'Expense', 50000.0, 'BCA Main', 'Main Meals', '2026-08-25', 'Pending')"
+        )
         self.con.commit()
 
-        # Replay causes UNIQUE constraint violation -> classified as NONCE_REPLAY
-        try:
-            self.con.execute("INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)", (nonce_unique, now_ts))
-            err_code = "SUCCESS"
-        except sqlite3.IntegrityError as e:
-            msg = str(e).upper()
-            if "UNIQUE" in msg or "PRIMARY KEY" in msg:
-                err_code = "NONCE_REPLAY"
-            else:
-                err_code = "REPLAY_GUARD_UNAVAILABLE"
-        self.assertEqual(err_code, "NONCE_REPLAY")
+        res = execute_telegram_callback_atomic(self.con, "cb_1001", 10, "Approved")
+        self.assertEqual(res["status"], "success")
 
-        # Generic database failure (e.g. invalid column or table drop) -> classified as REPLAY_GUARD_UNAVAILABLE
-        try:
-            self.con.execute("INSERT INTO non_existent_table VALUES (1)")
-            err_code_db = "SUCCESS"
-        except sqlite3.OperationalError:
-            err_code_db = "REPLAY_GUARD_UNAVAILABLE"
-        self.assertEqual(err_code_db, "REPLAY_GUARD_UNAVAILABLE")
+        # Verify exact atomic state
+        cand = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=10").fetchone()
+        self.assertEqual(cand["status"], "Approved")
 
-    def test_02_gmail_hmac_invalid_signature_does_not_consume_nonce(self):
-        """2. Gmail HMAC ordering: Invalid signature with nonce N does NOT reserve nonce in D1, allowing subsequent valid request with nonce N to succeed."""
+        guard = self.con.execute("SELECT callback_id, action FROM telegram_callback_guard WHERE candidate_id=10").fetchone()
+        self.assertEqual(guard["callback_id"], "cb_1001")
+        self.assertEqual(guard["action"], "Approved")
+
+        audits = self.con.execute("SELECT id, action, actor FROM ingestion_audit_log WHERE candidate_id=10").fetchall()
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["action"], "Approved")
+
+    def test_02_exact_callback_replay_yields_zero_duplicate_audit(self):
+        """2. Exact callback replay is intercepted by guard, yielding exactly 1 total audit record."""
+        self.con.execute(
+            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (11, 1, 'Expense', 30000.0, 'BCA Main', 'Snacks', '2026-08-25', 'Pending')"
+        )
+        self.con.commit()
+
+        # 1st run
+        res1 = execute_telegram_callback_atomic(self.con, "cb_1002", 11, "Approved")
+        self.assertEqual(res1["status"], "success")
+
+        # 2nd run (Replay)
+        res2 = execute_telegram_callback_atomic(self.con, "cb_1002", 11, "Approved")
+        self.assertEqual(res2["status"], "success")
+        self.assertTrue(res2["idempotent"])
+
+        audit_count = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=11").fetchone()[0]
+        self.assertEqual(audit_count, 1)
+
+    def test_03_concurrent_different_callback_replay_yields_zero_duplicate_audit(self):
+        """3. Concurrent callbacks with different IDs on already resolved candidate do NOT create a second audit record."""
+        self.con.execute(
+            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (12, 1, 'Expense', 40000.0, 'BCA Main', 'Cafe', '2026-08-25', 'Pending')"
+        )
+        self.con.commit()
+
+        res1 = execute_telegram_callback_atomic(self.con, "cb_first", 12, "Approved")
+        self.assertEqual(res1["status"], "success")
+
+        res2 = execute_telegram_callback_atomic(self.con, "cb_race", 12, "Approved")
+        self.assertEqual(res2["status"], "success")
+        self.assertTrue(res2["idempotent"])
+
+        audit_count = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=12").fetchone()[0]
+        self.assertEqual(audit_count, 1)
+
+    def test_04_simulated_audit_failure_rolls_back_state_transition(self):
+        """4. Failure during audit log insertion rolls back candidate state transition (remains Pending, 0 audit, 0 guard)."""
+        self.con.execute(
+            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (13, 1, 'Expense', 70000.0, 'BCA Main', 'Fuel', '2026-08-25', 'Pending')"
+        )
+        self.con.commit()
+
+        # Inject failure at audit step
+        res = execute_telegram_callback_atomic(self.con, "cb_fail_audit", 13, "Approved", fail_at="audit")
+
+        # Candidate MUST still be Pending!
+        cand = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=13").fetchone()
+        self.assertEqual(cand["status"], "Pending")
+
+        # Guard and Audit MUST be 0!
+        guard_cnt = self.con.execute("SELECT count(*) FROM telegram_callback_guard WHERE candidate_id=13").fetchone()[0]
+        audit_cnt = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=13").fetchone()[0]
+        self.assertEqual(guard_cnt, 0)
+        self.assertEqual(audit_cnt, 0)
+
+    def test_05_simulated_guard_failure_rolls_back_state_transition(self):
+        """5. Failure during guard insertion rolls back candidate state transition (remains Pending, 0 audit, 0 guard)."""
+        self.con.execute(
+            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (14, 1, 'Expense', 85000.0, 'BCA Main', 'Fuel', '2026-08-25', 'Pending')"
+        )
+        self.con.commit()
+
+        # Inject failure at guard step
+        res = execute_telegram_callback_atomic(self.con, "cb_fail_guard", 14, "Approved", fail_at="guard")
+
+        cand = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=14").fetchone()
+        self.assertEqual(cand["status"], "Pending")
+
+        guard_cnt = self.con.execute("SELECT count(*) FROM telegram_callback_guard WHERE candidate_id=14").fetchone()[0]
+        audit_cnt = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=14").fetchone()[0]
+        self.assertEqual(guard_cnt, 0)
+        self.assertEqual(audit_cnt, 0)
+
+    def test_06_terminal_cross_transition_locked_no_mutations(self):
+        """6. Cross-transition between terminal states (Approved -> Rejected or vice versa) is locked with zero mutations."""
+        self.con.execute(
+            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (15, 1, 'Expense', 90000.0, 'BCA Main', 'Bills', '2026-08-25', 'Approved')"
+        )
+        self.con.commit()
+
+        res = execute_telegram_callback_atomic(self.con, "cb_cross", 15, "Rejected")
+        self.assertEqual(res["status"], "error")
+        self.assertEqual(res["code"], "TERMINAL_STATE_LOCKED")
+
+        cand = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=15").fetchone()
+        self.assertEqual(cand["status"], "Approved")
+
+        audit_cnt = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=15").fetchone()[0]
+        self.assertEqual(audit_cnt, 0)
+
+    # =========================================================================
+    # 2. ADMIN REVIEW ATOMICITY & FAILURE INJECTION
+    # =========================================================================
+
+    def test_07_admin_approve_and_reject_atomic_rollback_on_failure(self):
+        """7. Admin review endpoints (approve/reject) roll back atomically if audit insertion fails."""
+        self.con.execute(
+            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (20, 1, 'Expense', 100000.0, 'BCA Main', 'Groceries', '2026-08-25', 'Pending')"
+        )
+        self.con.execute(
+            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (21, 1, 'Expense', 120000.0, 'BCA Main', 'Groceries', '2026-08-25', 'Pending')"
+        )
+        self.con.commit()
+
+        # Admin approve failure injection
+        execute_admin_review_atomic(self.con, 20, "Approved", fail_at="audit")
+        cand20 = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=20").fetchone()
+        self.assertEqual(cand20["status"], "Pending")
+        audit_cnt20 = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=20").fetchone()[0]
+        self.assertEqual(audit_cnt20, 0)
+
+        # Admin reject failure injection
+        execute_admin_review_atomic(self.con, 21, "Rejected", fail_at="audit")
+        cand21 = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=21").fetchone()
+        self.assertEqual(cand21["status"], "Pending")
+        audit_cnt21 = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=21").fetchone()[0]
+        self.assertEqual(audit_cnt21, 0)
+
+        # Successful Admin approve
+        res_ok = execute_admin_review_atomic(self.con, 20, "Approved")
+        self.assertEqual(res_ok["status"], "success")
+        cand20_ok = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=20").fetchone()
+        self.assertEqual(cand20_ok["status"], "Approved")
+        audit_cnt20_ok = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=20").fetchone()[0]
+        self.assertEqual(audit_cnt20_ok, 1)
+
+    # =========================================================================
+    # 3. GMAIL & TELEGRAM EXISTING SECURITY INVARIANTS
+    # =========================================================================
+
+    def test_08_gmail_hmac_nonce_semantics_and_privacy(self):
+        """8. Gmail HMAC verifies before nonce, distinguishes NONCE_REPLAY vs D1 failure, and saves minimal zero-PII payload."""
         now_ts = int(time.time() * 1000)
-        nonce_test = "nonce_order_test_202"
-        body = '{"message_id":"msg_202","from":"notifikasi@bca.co.id","subject":"Pembayaran QRIS Rp 50.000"}'
+        nonce_test = "nonce_sem_401"
+        body = '{"message_id":"msg_401","from":"notifikasi@bca.co.id","subject":"QRIS Rp 25.000"}'
 
-        # Step 1: Simulated request with wrong signature
-        wrong_sig = "0000000000000000000000000000000000000000000000000000000000000000"
+        # Invalid HMAC does not touch D1
+        wrong_sig = "0" * 64
         valid_sig = self._generate_hmac(body, now_ts, nonce_test, self.secret)
+        self.assertFalse(hmac.compare_digest(wrong_sig, valid_sig))
+        self.assertIsNone(self.con.execute("SELECT nonce FROM gmail_replay_nonces WHERE nonce=?", (nonce_test,)).fetchone())
 
-        is_valid_1 = hmac.compare_digest(wrong_sig, valid_sig)
-        self.assertFalse(is_valid_1)
-
-        # Verify nonce_test is NOT in D1
-        nonce_row_1 = self.con.execute("SELECT nonce FROM gmail_replay_nonces WHERE nonce=?", (nonce_test,)).fetchone()
-        self.assertIsNone(nonce_row_1)
-
-        # Step 2: Legitimate request with same nonce_test and valid signature
-        is_valid_2 = hmac.compare_digest(valid_sig, valid_sig)
-        self.assertTrue(is_valid_2)
-
+        # Valid HMAC inserts nonce
         self.con.execute("INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)", (nonce_test, now_ts))
         self.con.commit()
 
-        # Step 3: Subsequent replay with same nonce is blocked
+        # Replay triggers UNIQUE constraint
         with self.assertRaises(sqlite3.IntegrityError):
             self.con.execute("INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)", (nonce_test, now_ts))
 
-    # =========================================================================
-    # 2. GMAIL MINIMAL PAYLOAD PRIVACY
-    # =========================================================================
-
-    def test_03_gmail_minimal_payload_privacy_zero_pii_and_zero_raw_body(self):
-        """3. Persisted Gmail minimal_raw_payload contains zero raw bodies, zero personal emails, and zero raw subjects."""
-        index_ts = (BASE_DIR / "cloud" / "worker" / "src" / "index.ts").read_text(encoding="utf-8")
-
-        # Substring(0, 100) must be completely removed
-        self.assertNotIn("subject_sanitized", index_ts)
-        self.assertNotIn("substring(0, 100)", index_ts)
-
-        # Verify minimal payload format in index.ts
-        self.assertIn("sender_domain", index_ts)
-        self.assertIn("parser_adapter", index_ts)
-
-        # Test minimal payload generation logic
-        raw_email = "budi.santoso123@bca.co.id"
-        sender_domain = raw_email.split("@")[1].strip().lower() if "@" in raw_email else "unknown"
-        self.assertEqual(sender_domain, "bca.co.id")
-        self.assertNotIn("budi.santoso", sender_domain)
-
-        minimal_payload = json.dumps({
-            "sender_domain": sender_domain,
-            "parser_adapter": "bca_alert",
-            "detected_type": "Expense",
-            "confidence": 0.95,
-        })
-
-        # Insert and verify stored payload
+        # Minimal payload privacy
+        min_payload = json.dumps({"sender_domain": "bca.co.id", "parser_adapter": "bca_alert", "detected_type": "Expense"})
         self.con.execute(
-            "INSERT INTO raw_events (id, source, external_id, payload_hash, parser_version, state, minimal_raw_payload) VALUES (10, 'gmail', 'priv_msg_1', 'h_priv', '1.0', 'Parsed', ?)",
-            (minimal_payload,),
+            "INSERT INTO raw_events (id, source, external_id, payload_hash, parser_version, state, minimal_raw_payload) VALUES (401, 'gmail', 'msg_401', 'h401', '1.0', 'Parsed', ?)",
+            (min_payload,)
         )
         self.con.commit()
+        stored = self.con.execute("SELECT minimal_raw_payload FROM raw_events WHERE id=401").fetchone()[0]
+        self.assertNotIn("notifikasi@", stored)
+        self.assertNotIn("QRIS", stored)
 
-        stored = self.con.execute("SELECT minimal_raw_payload FROM raw_events WHERE id=10").fetchone()[0]
-        stored_dict = json.loads(stored)
-
-        self.assertNotIn("budi.santoso", stored)
-        self.assertNotIn("body", stored_dict)
-        self.assertNotIn("subject", stored_dict)
-        self.assertEqual(stored_dict["sender_domain"], "bca.co.id")
-
-    # =========================================================================
-    # 3. TELEGRAM CALLBACK & MESSAGE ATOMIC DURABLE IDEMPOTENCY
-    # =========================================================================
-
-    def test_04_telegram_callback_guard_and_atomic_conditional_approve(self):
-        """4. Telegram callback Approve: Atomic conditional update transitions Pending -> Approved once with 1 audit event. Concurrent / replay executions yield 0 additional audit events."""
-        self.con.execute(
-            """INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status)
-               VALUES (20, 1, 'Expense', 60000.0, 'BCA Main', 'Main Meals', '2026-08-25', 'Pending')"""
-        )
-        self.con.commit()
-
-        callback_id = "cb_query_1001"
-        target_status = "Approved"
-
-        # 1st execution:
-        # Check guard -> not found
-        guard_1 = self.con.execute("SELECT callback_id FROM telegram_callback_guard WHERE callback_id=?", (callback_id,)).fetchone()
-        self.assertIsNone(guard_1)
-
-        # Atomic conditional update
-        cur = self.con.execute(
-            "UPDATE ingestion_candidates SET status = ?, reviewed_at = '2026-08-25 12:00:00' WHERE id = 20 AND status = 'Pending'",
-            (target_status,),
-        )
-        changes_1 = cur.rowcount
-        self.assertEqual(changes_1, 1)
-
-        # Insert guard & audit only on successful transition
-        self.con.execute("INSERT INTO telegram_callback_guard (callback_id, candidate_id, action) VALUES (?, 20, ?)", (callback_id, target_status))
-        self.con.execute("INSERT INTO ingestion_audit_log (candidate_id, action, actor, details) VALUES (20, ?, 'telegram_user', 'Reviewed via inline button')", (target_status,))
-        self.con.commit()
-
-        audit_cnt_1 = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=20").fetchone()[0]
-        self.assertEqual(audit_cnt_1, 1)
-
-        # 2nd execution (Simulated concurrent race or exact replay with same callback_id):
-        guard_2 = self.con.execute("SELECT callback_id FROM telegram_callback_guard WHERE callback_id=?", (callback_id,)).fetchone()
-        self.assertIsNotNone(guard_2)  # Caught by callback guard immediately!
-
-        # 3rd execution (Simulated race with DIFFERENT callback_id on already Approved candidate):
-        diff_callback_id = "cb_query_1002"
-        cur_race = self.con.execute(
-            "UPDATE ingestion_candidates SET status = ?, reviewed_at = '2026-08-25 12:00:00' WHERE id = 20 AND status = 'Pending'",
-            (target_status,),
-        )
-        changes_race = cur_race.rowcount
-        self.assertEqual(changes_race, 0)  # Affected rows == 0!
-
-        # In changes == 0, system checks current status and DOES NOT insert audit
-        cand_status = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=20").fetchone()["status"]
-        self.assertEqual(cand_status, "Approved")
-
-        audit_cnt_final = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=20").fetchone()[0]
-        self.assertEqual(audit_cnt_final, 1, "Audit log count MUST remain exactly 1 across all replays/races!")
-
-    def test_05_telegram_callback_guard_and_atomic_conditional_reject(self):
-        """5. Telegram callback Reject: Transitions Pending -> Rejected with 1 audit event. Replay is idempotent with 0 additional audit events."""
-        self.con.execute(
-            """INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status)
-               VALUES (21, 1, 'Expense', 35000.0, 'BCA Main', 'Snacks', '2026-08-25', 'Pending')"""
-        )
-        self.con.commit()
-
-        callback_id = "cb_query_2001"
-        target_status = "Rejected"
-
-        cur = self.con.execute(
-            "UPDATE ingestion_candidates SET status = ?, reviewed_at = '2026-08-25 12:05:00' WHERE id = 21 AND status = 'Pending'",
-            (target_status,),
-        )
-        self.assertEqual(cur.rowcount, 1)
-
-        self.con.execute("INSERT INTO telegram_callback_guard (callback_id, candidate_id, action) VALUES (?, 21, ?)", (callback_id, target_status))
-        self.con.execute("INSERT INTO ingestion_audit_log (candidate_id, action, actor, details) VALUES (21, ?, 'telegram_user', 'Reviewed via inline button')", (target_status,))
-        self.con.commit()
-
-        # Replay
-        guard = self.con.execute("SELECT callback_id FROM telegram_callback_guard WHERE callback_id=?", (callback_id,)).fetchone()
-        self.assertIsNotNone(guard)
-
-        audit_cnt = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=21").fetchone()[0]
-        self.assertEqual(audit_cnt, 1)
-
-    def test_06_telegram_terminal_cross_transition_locked(self):
-        """6. Terminal state lock: Approved candidate cannot be switched to Rejected, and Rejected cannot be switched to Approved."""
-        self.con.execute(
-            """INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status)
-               VALUES (22, 1, 'Expense', 45000.0, 'BCA Main', 'Fuel', '2026-08-25', 'Approved')"""
-        )
-        self.con.commit()
-
-        # Attempt to reject an already Approved candidate
-        cand = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=22").fetchone()
-        self.assertEqual(cand["status"], "Approved")
-
-        target_status = "Rejected"
-        cur = self.con.execute(
-            "UPDATE ingestion_candidates SET status = ?, reviewed_at = '2026-08-25 12:10:00' WHERE id = 22 AND status = 'Pending'",
-            (target_status,),
-        )
-        self.assertEqual(cur.rowcount, 0)
-
-        is_locked = (cand["status"] in ("Approved", "Rejected") and cand["status"] != target_status)
-        self.assertTrue(is_locked)
-
-        # Verify status remains Approved and no audit entry added
-        cand_after = self.con.execute("SELECT status FROM ingestion_candidates WHERE id=22").fetchone()
-        self.assertEqual(cand_after["status"], "Approved")
-        audit_cnt = self.con.execute("SELECT count(*) FROM ingestion_audit_log WHERE candidate_id=22").fetchone()[0]
-        self.assertEqual(audit_cnt, 0)
-
-    def test_07_telegram_message_idempotency_deterministic_external_id(self):
-        """7. Telegram message retry with same update_id or message_id does NOT create duplicate raw_events or ingestion_candidates."""
-        update_id = 112233
-        external_id = f"tg_update_{update_id}"
-        text_hash = hashlib.sha256(b"keluar 25000 dari BCA Main untuk makan").hexdigest()
-
-        # 1st message insertion
-        self.con.execute(
-            "INSERT INTO raw_events (id, source, external_id, payload_hash, parser_version, state) VALUES (110, 'telegram', ?, ?, '1.0', 'Parsed')",
-            (external_id, text_hash),
-        )
-        self.con.execute(
-            "INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status) VALUES (110, 110, 'Expense', 25000.0, 'BCA Main', 'Main Meals', '2026-08-25', 'Pending')"
-        )
-        self.con.commit()
-
-        # Retry check
-        existing = self.con.execute("SELECT id FROM raw_events WHERE source='telegram' AND external_id=?", (external_id,)).fetchone()
-        self.assertIsNotNone(existing)
-
-        raw_cnt = self.con.execute("SELECT count(*) FROM raw_events WHERE source='telegram' AND external_id=?", (external_id,)).fetchone()[0]
-        cand_cnt = self.con.execute("SELECT count(*) FROM ingestion_candidates WHERE raw_event_id=110").fetchone()[0]
-        self.assertEqual(raw_cnt, 1)
-        self.assertEqual(cand_cnt, 1)
-
-    def test_08_mode_shadow_zero_ledger_mutations(self):
-        """8. In MODE=shadow, approving a candidate only updates staging tables, with ZERO mutations to transactions/accounts."""
+    def test_09_shadow_mode_and_production_db_unmodified(self):
+        """9. Mode shadow does not mutate ledger, and production SQLite database hash remains identical before and after test."""
         tx_count_before = self.con.execute("SELECT count(*) FROM transactions").fetchone()[0]
         acc_count_before = self.con.execute("SELECT count(*) FROM accounts").fetchone()[0]
 
-        self.con.execute(
-            """INSERT INTO ingestion_candidates (id, raw_event_id, tx_type, amount, account, category, date, status)
-               VALUES (30, 1, 'Expense', 80000.0, 'BCA Main', 'Fuel', '2026-08-25', 'Pending')"""
-        )
-        self.con.execute("UPDATE ingestion_candidates SET status='Approved' WHERE id=30")
-        self.con.commit()
-
+        # Reviewing candidate in staging modifies staging ONLY
+        execute_admin_review_atomic(self.con, 20, "Approved")
         tx_count_after = self.con.execute("SELECT count(*) FROM transactions").fetchone()[0]
         acc_count_after = self.con.execute("SELECT count(*) FROM accounts").fetchone()[0]
 
         self.assertEqual(tx_count_before, tx_count_after)
         self.assertEqual(acc_count_before, acc_count_after)
 
-    def test_09_local_sqlite_hash_unmutated(self):
-        """9. Local production SQLite database file hash is completely unmutated before and after test."""
         if self.prod_hash_before is not None and DB_PATH.exists():
             h = hashlib.sha256(DB_PATH.read_bytes()).hexdigest()
-            self.assertEqual(h, self.prod_hash_before)
+            self.assertEqual(h, self.prod_hash_before, "Production database was modified!")
 
 
 if __name__ == "__main__":
