@@ -261,6 +261,50 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
     totalProcessed
   );
 }
+
+/**
+ * Controlled historical trial ? January 2025 only.
+ *
+ * Safe to rerun while January is partially processed because
+ * backfillGmailTransactions() resumes from its stored thread offset.
+ * Once checkpoint advances to February, this function refuses to rerun.
+ */
+function backfillJanuary2025Trial() {
+  const props = PropertiesService.getScriptProperties();
+
+  const checkpoint =
+    props.getProperty("GMAIL_BACKFILL_CHECKPOINT") ||
+    "2025-01";
+
+  const offsetMonth =
+    props.getProperty("GMAIL_BACKFILL_OFFSET_MONTH");
+
+  if (checkpoint !== "2025-01") {
+    console.error(
+      "JAN_2025_TRIAL_REFUSED: current checkpoint is " +
+      checkpoint
+    );
+    return;
+  }
+
+  if (offsetMonth && offsetMonth !== "2025-01") {
+    console.error(
+      "JAN_2025_TRIAL_REFUSED: unexpected offset month " +
+      offsetMonth
+    );
+    return;
+  }
+
+  console.log(
+    "CONTROLLED_TRIAL_START: January 2025 only."
+  );
+
+  return backfillGmailTransactions(
+    "2025-01",
+    "2025-01"
+  );
+}
+
 function getBackfillStatus() {
   const props = PropertiesService.getScriptProperties();
 
