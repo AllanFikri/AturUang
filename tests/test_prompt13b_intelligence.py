@@ -201,5 +201,34 @@ class TestGmailIntelligenceV1(unittest.TestCase):
         self.assertGreaterEqual(report["total_ledger_events"], 0)
         self.assertEqual(report["db_hash_before"], report["db_hash_after"])
 
+    def test_04_financial_core_unchanged_contract(self):
+        """D. Verify financial core is unchanged from pre-13B behavioral contract and schema assumptions."""
+        # 1. Compare lines 3 to 526 with da9d41e
+        baseline = subprocess.check_output(
+            ["git", "show", "da9d41e:cloud/worker/src/domain.ts"],
+            cwd=str(BASE_DIR),
+            text=True,
+            encoding="utf-8"
+        )
+        with open(BASE_DIR / "cloud" / "worker" / "src" / "domain.ts", "r", encoding="utf-8") as f:
+            current = f.read()
+
+        b_lines = baseline.splitlines()[2:526]
+        c_lines = current.splitlines()[2:526]
+        self.assertEqual(b_lines, c_lines, "Financial core (lines 3-526) modified from da9d41e baseline!")
+
+        # 2. Verify exact column and query assumptions in financial core
+        fc_text = "\n".join(c_lines)
+        self.assertIn("account_name", fc_text)
+        self.assertIn("snapshot_date", fc_text)
+        self.assertIn("snapshot_kind", fc_text)
+        self.assertIn("transaction_type", fc_text)
+        self.assertIn("account_from", fc_text)
+        self.assertIn("account_to", fc_text)
+        self.assertIn("is_deleted", fc_text)
+        self.assertIn("allocated_amount", fc_text)
+        self.assertIn("covers_upcoming_id", fc_text)
+        self.assertIn("linked_goal_id", fc_text)
+
 if __name__ == "__main__":
     unittest.main()

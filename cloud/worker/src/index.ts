@@ -1,4 +1,4 @@
-// index.ts: Cloudflare Worker Entrypoint untuk AturUang (Shadow Mode, Connectors & Canonical Event Engine)
+// index.ts: Cloudflare Worker Entrypoint untuk AturUang (Shadow Mode & Ingestion Connectors)
 import {
   Env,
   authenticateRequest,
@@ -19,7 +19,6 @@ import {
   reconstructBalance,
   getInsightsSummary,
   parseGmailIntelligence,
-  parseGmailNotification,
   parseTelegramText,
   evaluateAutoApproval,
 } from "./domain";
@@ -79,7 +78,6 @@ export default {
     if (path === "/api/ingest/gmail" && method === "POST") {
       const rawBody = await request.text();
 
-      // A. Verify HMAC & Replay Guard
       const hmacCheck = await verifyGmailHmac(request, rawBody, env.GMAIL_RELAY_SECRET, env.DB);
       if (!hmacCheck.valid) {
         const errCode = hmacCheck.error || "HMAC_VERIFICATION_FAILED";
@@ -112,7 +110,7 @@ export default {
           );
         }
 
-        // B. Strict Sender Trust Validation (Fail-closed BEFORE any DB/Candidate insert)
+        // Strict evidence-backed sender trust (Fail-closed BEFORE any DB/Candidate insert)
         const senderCheck = isGmailSenderTrusted(from || "");
         if (!senderCheck.trusted) {
           return new Response(
@@ -134,7 +132,7 @@ export default {
           .map((b) => b.toString(16).padStart(2, "0"))
           .join("");
 
-        // C. Idempotency check on raw_events
+        // Idempotency check on raw_events
         const existing = await env.DB.prepare(
           "SELECT id, state FROM raw_events WHERE source = 'gmail' AND external_id = ?"
         ).bind(message_id).first<{ id: number; state: string }>();
@@ -151,10 +149,10 @@ export default {
           );
         }
 
-        // D. Transaction Intelligence Engine v1
+        // Transaction Intelligence Engine v1
         const canonEv = parseGmailIntelligence(subject || "", body || "", from || "", internal_date);
 
-        // Minimal sanitized non-PII payload: zero raw email, zero raw body, zero sensitive subject
+        // Minimal sanitized non-PII payload
         const minimalPayload = JSON.stringify({
           sender: senderCheck.email,
           event_kind: canonEv.event_kind,
@@ -199,10 +197,9 @@ export default {
           candidateId = candRes.meta.last_row_id;
         }
 
-        // E. Insert / Correlate Canonical Financial Event (Migration 0007)
+        // Insert / correlate Canonical Financial Event (Migration 0007)
         let canonDbId: number | null = null;
         try {
-          // Check if canonical event with same transaction_reference or external_order_id exists
           let existingCanon: { id: number } | null = null;
           if (canonEv.transaction_reference) {
             existingCanon = await env.DB.prepare(
@@ -259,11 +256,9 @@ export default {
                VALUES (?, ?, ?, ?)`
             ).bind(canonDbId, rawEventId, candidateId, canonEv.evidence_role).run();
           }
-        } catch {
-          // Schema 0007 fallback if not yet migrated
-        }
+        } catch {}
 
-        // F. Update source freshness
+        // Update source freshness
         await env.DB.prepare(
           `INSERT INTO source_sync_state (source, last_attempt_at, last_success_at, last_event_at, status)
            VALUES ('gmail', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, 'OK')
@@ -748,123 +743,139 @@ export default {
       );
     }
 
+    // GET /api/sources/freshness
+    if (path === "/api/sources/freshness" && method === "GET") {
+      const freshness = await env.DB.prepare("SELECT * FROM source_sync_state").all();
+      return new Response(JSON.stringify(freshness.results), {
+        status: 200,
+        headers: getSecurityHeaders(),
+      });
+    }
+
     // =================================================================
-    // 6. READ-ONLY SHADOW QUERY REPLICA ENDPOINTS
+    // 6. SHADOW WRITE PROTECTION FOR FINANCIAL MUTATIONS
     // =================================================================
-    if ((env.MODE || "shadow") === "shadow" && method !== "GET" && (
-      path.startsWith("/api/dashboard") ||
-      path.startsWith("/api/accounts") ||
-      path.startsWith("/api/transactions") ||
-      path.startsWith("/api/goals") ||
-      path.startsWith("/api/upcoming") ||
-      path.startsWith("/api/debts") ||
-      path.startsWith("/api/reconstruct-balance") ||
-      path.startsWith("/api/insights")
-    )) {
+    const isShadow = (env.MODE || "shadow").toLowerCase() === "shadow";
+    if (isShadow && method !== "GET" && method !== "HEAD") {
       return new Response(
         JSON.stringify({
           status: "error",
           code: "SHADOW_READ_ONLY",
-          message: "Worker dalam mode shadow tidak melayani mutasi data finansial.",
+          message:
+            "Backend Cloudflare D1 beroperasi dalam mode shadow read-only. Seluruh mutasi tulis ditolak untuk menjaga integritas.",
         }),
-        { status: 503, headers: getSecurityHeaders() }
+        {
+          status: 503,
+          headers: getSecurityHeaders(),
+        }
       );
     }
 
-    if (path === "/api/dashboard" && method === "GET") {
-      const month = url.searchParams.get("month") || undefined;
-      const data = await getDashboard(env.DB, month);
-      return new Response(JSON.stringify(data), {
-        status: 200,
-        headers: getSecurityHeaders(),
-      });
-    }
-
-    if (path === "/api/accounts" && method === "GET") {
-      const data = await getAccountsList(env.DB);
-      return new Response(JSON.stringify(data), {
-        status: 200,
-        headers: getSecurityHeaders(),
-      });
-    }
-
-    if (path === "/api/transactions" && method === "GET") {
-      const limit = parseInt(url.searchParams.get("limit") || "20", 10);
-      const offset = parseInt(url.searchParams.get("offset") || "0", 10);
-      const month = url.searchParams.get("month") || undefined;
-      const data = await getTransactionsList(env.DB, limit, offset, month);
-      return new Response(JSON.stringify(data), {
-        status: 200,
-        headers: getSecurityHeaders(),
-      });
-    }
-
-    if (path === "/api/goals" && method === "GET") {
-      const data = await getGoalsSummary(env.DB);
-      return new Response(JSON.stringify(data), {
-        status: 200,
-        headers: getSecurityHeaders(),
-      });
-    }
-
-    if (path === "/api/upcoming" && method === "GET") {
-      const data = await getUpcomingList(env.DB);
-      return new Response(JSON.stringify(data), {
-        status: 200,
-        headers: getSecurityHeaders(),
-      });
-    }
-
-    if (path === "/api/debts" && method === "GET") {
-      const data = await getDebtsList(env.DB);
-      return new Response(JSON.stringify(data), {
-        status: 200,
-        headers: getSecurityHeaders(),
-      });
-    }
-
-    if (path === "/api/reconstruct-balance" && method === "GET") {
-      const acc = url.searchParams.get("account");
-      const asOf = url.searchParams.get("as_of") || undefined;
-      if (!acc) {
-        return new Response(
-          JSON.stringify({ status: "error", code: "BAD_REQUEST", message: "Parameter 'account' wajib disertakan." }),
-          { status: 400, headers: getSecurityHeaders() }
-        );
-      }
-      try {
-        const data = await reconstructBalance(env.DB, acc, asOf);
+    // =================================================================
+    // 7. READ API ROUTING (Prompt 13A Staging Parity)
+    // =================================================================
+    try {
+      if (path === "/api/dashboard") {
+        const month = url.searchParams.get("month") || undefined;
+        const data = await getDashboard(env.DB, month);
         return new Response(JSON.stringify(data), {
           status: 200,
           headers: getSecurityHeaders(),
         });
-      } catch {
-        return new Response(
-          JSON.stringify({ status: "error", code: "ACCOUNT_NOT_FOUND", message: "Akun tidak ditemukan." }),
-          { status: 404, headers: getSecurityHeaders() }
-        );
       }
-    }
 
-    if (path === "/api/insights" && method === "GET") {
-      const data = await getInsightsSummary(env.DB);
-      return new Response(JSON.stringify(data), {
-        status: 200,
-        headers: getSecurityHeaders(),
-      });
-    }
-
-    // 7. Default 404
-    return new Response(
-      JSON.stringify({
-        status: "error",
-        code: "NOT_FOUND",
-        message: `Endpoint '${path}' tidak ditemukan pada Worker AturUang.`,
-      }),
-      {
-        status: 404,
-        headers: getSecurityHeaders(),
+      if (path === "/api/accounts") {
+        const data = await getAccountsList(env.DB);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
       }
-    );
+
+      if (path === "/api/transactions") {
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10), 500);
+        const offset = Math.max(parseInt(url.searchParams.get("offset") || "0", 10), 0);
+        const month = url.searchParams.get("month") || undefined;
+        const data = await getTransactionsList(env.DB, limit, offset, month);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/goals") {
+        const data = await getGoalsSummary(env.DB);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/upcoming") {
+        const data = await getUpcomingList(env.DB);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/debts") {
+        const data = await getDebtsList(env.DB);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/reconstruct-balance") {
+        const account = url.searchParams.get("account") || "";
+        const asOf = url.searchParams.get("as_of") || undefined;
+        if (!account) {
+          return new Response(
+            JSON.stringify({ status: "error", message: "Parameter account diperlukan." }),
+            { status: 400, headers: getSecurityHeaders() }
+          );
+        }
+        const data = await reconstructBalance(env.DB, account, asOf);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      if (path === "/api/insights" || path === "/api/insights/recurring" || path === "/api/accounts/freshness") {
+        const asOf = url.searchParams.get("as_of") || undefined;
+        const data = await getInsightsSummary(env.DB, asOf);
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: getSecurityHeaders(),
+        });
+      }
+
+      // 404 Route Not Found
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          code: "NOT_FOUND",
+          message: `Endpoint '${path}' tidak ditemukan.`,
+        }),
+        {
+          status: 404,
+          headers: getSecurityHeaders(),
+        }
+      );
+    } catch {
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          code: "INTERNAL_SERVER_ERROR",
+          message: "Terjadi kesalahan internal pada layanan backend cloud.",
+        }),
+        {
+          status: 500,
+          headers: getSecurityHeaders(),
+        }
+      );
+    }
   },
 };
