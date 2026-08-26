@@ -118,22 +118,27 @@ export async function verifyGmailHmac(
   }
 
   // 6. HANYA setelah signature terverifikasi valid, lakukan reservasi nonce secara durable di D1
-  if (db) {
-    try {
-      // Auto-prune nonce lama (>10 menit)
-      const pruneCutoff = now - 600000;
-      await db.prepare("DELETE FROM gmail_replay_nonces WHERE timestamp < ?").bind(pruneCutoff).run();
+  if (!db) {
+    // Database tidak tersedia -> fail closed (REPLAY_GUARD_UNAVAILABLE)
+    return { valid: false, error: "REPLAY_GUARD_UNAVAILABLE" };
+  }
 
-      // Insert new nonce (PRIMARY KEY constraint mencegah replay lintas instance)
-      await db.prepare(
-        "INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)"
-      ).bind(nonce, timestamp).run();
-    } catch (err: any) {
-      if (err.message && err.message.includes("UNIQUE")) {
-        return { valid: false, error: "NONCE_REPLAY" };
-      }
+  try {
+    // Auto-prune nonce lama (>10 menit)
+    const pruneCutoff = now - 600000;
+    await db.prepare("DELETE FROM gmail_replay_nonces WHERE timestamp < ?").bind(pruneCutoff).run();
+
+    // Insert new nonce (PRIMARY KEY constraint mencegah replay lintas instance)
+    await db.prepare(
+      "INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)"
+    ).bind(nonce, timestamp).run();
+  } catch (err: any) {
+    const errMsg = String(err?.message || "").toUpperCase();
+    if (errMsg.includes("UNIQUE") || errMsg.includes("PRIMARY KEY") || errMsg.includes("CONSTRAINT")) {
       return { valid: false, error: "NONCE_REPLAY" };
     }
+    // Database failure / connection error DILARANG dilabeli NONCE_REPLAY
+    return { valid: false, error: "REPLAY_GUARD_UNAVAILABLE" };
   }
 
   return { valid: true };
