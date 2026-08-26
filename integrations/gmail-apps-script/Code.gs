@@ -86,7 +86,20 @@ function backfillGmailTransactions(startYearMonth, endYearMonth) {
     const query = 'after:' + afterDate + ' before:' + beforeDate + ' ' + TRUSTED_SENDER_QUERY;
     console.log("Memproses jendela: " + query);
 
-    const count = processGmailQuery(query, workerUrl, relaySecret, 100);
+    // Enforce monthly bounds again at message level because Gmail search
+    // returns threads and getMessages() may include messages outside the window.
+    const startDate = new Date(current.year, current.month - 1, 1, 0, 0, 0, 0);
+    const endDate = new Date(nextYM.year, nextYM.month - 1, 1, 0, 0, 0, 0);
+
+    const count = processGmailQuery(
+      query,
+      workerUrl,
+      relaySecret,
+      100,
+      startDate,
+      endDate
+    );
+
     totalProcessed += count;
 
     // Simpan checkpoint bulan berikutnya
@@ -115,7 +128,7 @@ function resetBackfillCheckpoint() {
 /**
  * Core processor loop (Message-level inspection)
  */
-function processGmailQuery(query, workerUrl, relaySecret, maxThreads) {
+function processGmailQuery(query, workerUrl, relaySecret, maxThreads, startDate, endDate) {
   const threads = GmailApp.search(query, 0, maxThreads);
   let processedCount = 0;
 
@@ -123,6 +136,18 @@ function processGmailQuery(query, workerUrl, relaySecret, maxThreads) {
     const messages = threads[i].getMessages();
     for (let j = 0; j < messages.length; j++) {
       const msg = messages[j];
+      const messageDate = msg.getDate();
+
+      // Historical backfill: inclusive start, exclusive end.
+      // Live relay leaves startDate/endDate undefined.
+      if (startDate && messageDate < startDate) {
+        continue;
+      }
+
+      if (endDate && messageDate >= endDate) {
+        continue;
+      }
+
       const fromHeader = msg.getFrom();
 
       // Enforce message-level strict sender trust
@@ -136,7 +161,7 @@ function processGmailQuery(query, workerUrl, relaySecret, maxThreads) {
         from: fromHeader,
         subject: msg.getSubject(),
         body: msg.getPlainBody().substring(0, 2000), // Minimal excerpt
-        internal_date: msg.getDate().toISOString(),
+        internal_date: messageDate.toISOString(),
       };
 
       const rawBody = JSON.stringify(payload);

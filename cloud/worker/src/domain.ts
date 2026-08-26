@@ -521,7 +521,7 @@ export interface ParsedCandidate {
   time?: string | null;
   confidence_score: number;
   reasons: string;
-  status: "Pending" | "AutoApproved";
+  status: "Pending" | "AutoApproved" | "Ignored";
 }
 
 
@@ -776,33 +776,129 @@ export function parseGmailIntelligence(
         candidate: cand,
       };
     }
-
-    // C. BCA Poket (Pembuatan / Tambah Dana / Pindahkan Poket)
+    // C. BCA Poket
     if (cleanBody.includes("poket") || cleanSubj.includes("poket")) {
-      const amount = parseIndonesianAmount(bodyText) || 0;
-      const pocketMatch = bodyText.match(/(?:nama poket|poket)\s*[:]?\s*([a-zA-Z0-9\s]+)/i);
-      const pocketName = pocketMatch ? pocketMatch[1].trim() : "Tabungan";
-      const toPocket = `BCA Poket: ${pocketName}`;
+      const isPocketClosure =
+        cleanBody.includes("penutupan poket") ||
+        cleanBody.includes("tutup poket") ||
+        cleanSubj.includes("penutupan poket");
 
-      const cand: ParsedCandidate = {
-        tx_type: "Transfer",
-        amount,
-        account: "BCA Main",
-        to_account: toPocket,
-        category: "Allocation Movement",
-        money_context: "Personal",
-        person_name: null,
-        date: wib.dateStr,
-        time: wib.timeStr,
-        confidence_score: 0.95,
-        reasons: `BCA Poket: Pergerakan alokasi dana ke ${toPocket}. Bukan pengeluaran ledger.`,
-        status: "AutoApproved",
-      };
+      // Ambil nama Poket secara lebih ketat agar tidak menyapu banyak baris email.
+      const pocketMatch = bodyText.match(
+        /nama\s+poket\s*[\r\n\s]*:\s*[\r\n\s]*([^\r\n]+)/i
+      );
+      const pocketName = pocketMatch
+        ? pocketMatch[1].trim()
+        : "Tabungan";
+
+      const pocketAccount = `BCA Poket: ${pocketName}`;
+
+      // Penutupan Poket memakai "Total Saldo" sebagai dana yang kembali
+      // ke rekening induk. Jangan memakai currency pertama secara generik,
+      // karena email dapat berisi "Saldo Poket IDR 0.00" lebih dahulu.
+      let amount: number = 0;
+
+      if (isPocketClosure) {
+        const totalSaldoMatch = bodyText.match(
+          /total\s+saldo\s*[\r\n\s]*:\s*[\r\n\s]*(?:rp\.?|idr)?\s*([\d.,]+)/i
+        );
+
+        amount = totalSaldoMatch
+          ? (parseIndonesianAmount(`Total: IDR ${totalSaldoMatch[1]}`) || 0)
+          : (parseIndonesianAmount(bodyText) || 0);
+      } else {
+        amount = parseIndonesianAmount(bodyText) || 0;
+      }
+
+      const refMatch = bodyText.match(
+        /nomor\s+referensi\s*[\r\n\s]*:\s*[\r\n\s]*([a-zA-Z0-9]+)/i
+      );
+      const refId = refMatch ? refMatch[1] : null;
+
+      // Penutupan Poket berarti dana kembali dari Poket ke BCA Main.
+      if (isPocketClosure) {
+        const cand: ParsedCandidate | null =
+          amount > 0
+            ? {
+                tx_type: "Transfer",
+                amount,
+                account: pocketAccount,
+                to_account: "BCA Main",
+                category: "Allocation Movement",
+                money_context: "Personal",
+                person_name: null,
+                date: wib.dateStr,
+                time: wib.timeStr,
+                confidence_score: 0.95,
+                reasons:
+                  `BCA Poket: Penutupan ${pocketAccount}; sisa dana kembali ke BCA Main. Bukan pengeluaran ledger.`,
+                status: "AutoApproved",
+              }
+            : null;
+
+        return {
+          event_id: refId
+            ? `bca_poket_close_${refId}`
+            : `bca_poket_close_${Date.now()}`,
+          occurred_at_wib: occurredAtWib,
+          status: amount > 0 ? "AutoApproved" : "Ignored",
+          event_kind: "ALLOCATION_MOVEMENT",
+          financial_class: "Internal Transfer",
+          financial_direction: "Neutral",
+          amount,
+          currency: "IDR",
+          fee_amount: 0,
+          source_account_alias: pocketAccount,
+          destination_account_alias: "BCA Main",
+          destination_owner_type: "SELF",
+          merchant_normalized: null,
+          merchant_pan: null,
+          merchant_location: null,
+          counterparty_normalized: "BCA Main",
+          description_normalized: `Penutupan BCA Poket (${pocketName})`,
+          transaction_reference: refId,
+          external_order_id: null,
+          confidence: 0.95,
+          recommended_action:
+            amount > 0
+              ? "Record Allocation Movement Poket -> BCA Main"
+              : "Keep as lifecycle evidence; zero ledger mutation",
+          review_reason:
+            amount > 0
+              ? null
+              : "Penutupan Poket tanpa nominal perpindahan dana yang dapat dicatat.",
+          evidence_role: "LIFECYCLE_STATUS",
+          candidate: cand,
+        };
+      }
+
+      // Aktivitas Poket selain penutupan mempertahankan perilaku lama:
+      // BCA Main -> Poket sebagai allocation/internal movement.
+      const cand: ParsedCandidate | null =
+        amount > 0
+          ? {
+              tx_type: "Transfer",
+              amount,
+              account: "BCA Main",
+              to_account: pocketAccount,
+              category: "Allocation Movement",
+              money_context: "Personal",
+              person_name: null,
+              date: wib.dateStr,
+              time: wib.timeStr,
+              confidence_score: 0.95,
+              reasons:
+                `BCA Poket: Pergerakan alokasi dana ke ${pocketAccount}. Bukan pengeluaran ledger.`,
+              status: "AutoApproved",
+            }
+          : null;
 
       return {
-        event_id: `bca_poket_${Date.now()}`,
+        event_id: refId
+          ? `bca_poket_${refId}`
+          : `bca_poket_${Date.now()}`,
         occurred_at_wib: occurredAtWib,
-        status: "AutoApproved",
+        status: amount > 0 ? "AutoApproved" : "Ignored",
         event_kind: "ALLOCATION_MOVEMENT",
         financial_class: "Internal Transfer",
         financial_direction: "Neutral",
@@ -810,18 +906,24 @@ export function parseGmailIntelligence(
         currency: "IDR",
         fee_amount: 0,
         source_account_alias: "BCA Main",
-        destination_account_alias: toPocket,
+        destination_account_alias: pocketAccount,
         destination_owner_type: "SELF",
         merchant_normalized: null,
         merchant_pan: null,
         merchant_location: null,
-        counterparty_normalized: toPocket,
+        counterparty_normalized: pocketAccount,
         description_normalized: `BCA Poket Alokasi (${pocketName})`,
-        transaction_reference: null,
+        transaction_reference: refId,
         external_order_id: null,
         confidence: 0.95,
-        recommended_action: "Record Allocation Movement (Internal)",
-        review_reason: null,
+        recommended_action:
+          amount > 0
+            ? "Record Allocation Movement (Internal)"
+            : "Keep as evidence; zero ledger mutation",
+        review_reason:
+          amount > 0
+            ? null
+            : "Aktivitas Poket tanpa nominal perpindahan dana yang dapat dicatat.",
         evidence_role: "PRIMARY_PAYMENT",
         candidate: cand,
       };

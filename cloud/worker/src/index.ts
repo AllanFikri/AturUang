@@ -173,8 +173,9 @@ export default {
         let candidateId: number | null = null;
         let autoStatus = "Ignored";
 
-        if (canonEv.candidate) {
+        if (canonEv.candidate && Number(canonEv.candidate.amount) > 0) {
           autoStatus = evaluateAutoApproval(canonEv.candidate, true);
+
           const candRes = await env.DB.prepare(
             `INSERT INTO ingestion_candidates
              (raw_event_id, tx_type, amount, account, to_account, category, money_context, person_name, date, time, confidence_score, status, reasons)
@@ -194,7 +195,13 @@ export default {
             autoStatus,
             canonEv.candidate.reasons
           ).run();
+
           candidateId = candRes.meta.last_row_id;
+        } else if (canonEv.candidate) {
+          // Fail-safe: kandidat dengan nominal nol/tidak valid
+          // tetap boleh menjadi raw/canonical evidence,
+          // tetapi tidak boleh masuk ingestion_candidates.
+          autoStatus = "Ignored";
         }
 
         // Insert / correlate Canonical Financial Event (Migration 0007)
