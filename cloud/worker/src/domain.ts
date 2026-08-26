@@ -1375,13 +1375,38 @@ export function parseGmailIntelligence(
   // 4. GOOGLE PLAY (googleplay-noreply@google.com)
   // -----------------------------------------------------------------------
   if (cleanFrom.includes("googleplay-noreply@google.com")) {
-    const amount = parseIndonesianAmount(bodyText) || 0;
-    const orderMatch = bodyText.match(/(?:nomor pesanan|order number)\s*[:]?\s*(GPA\.[\d\-]+)/i);
+    const orderMatch = bodyText.match(
+      /(?:nomor pesanan|order number)\s*[:]?\s*(GPA\.[\d\-]+)/i
+    );
     const orderId = orderMatch ? orderMatch[1] : null;
 
-    if (cleanBody.includes("dibatalkan") || cleanBody.includes("declined") || cleanBody.includes("ditolak") || amount === 0) {
+    // Detect non-charge lifecycle semantics BEFORE generic amount parsing.
+    // Otherwise digits from app names, GPA IDs, or dates can be mistaken
+    // for transaction amounts.
+    const isCancellation =
+      cleanSubj.includes("canceled") ||
+      cleanSubj.includes("cancelled") ||
+      cleanSubj.includes("dibatalkan") ||
+      cleanBody.includes("has been canceled") ||
+      cleanBody.includes("has been cancelled") ||
+      cleanBody.includes("subscription canceled") ||
+      cleanBody.includes("subscription cancelled") ||
+      cleanBody.includes("dibatalkan");
+
+    const isDeclined =
+      cleanBody.includes("declined") ||
+      cleanBody.includes("ditolak");
+
+    const lifecycleKey =
+      (occurredAt || occurredAtWib)
+        .replace(/[^0-9]/g, "")
+        .slice(0, 14) || "unknown";
+
+    if (isCancellation || isDeclined) {
       return {
-        event_id: orderId ? `gplay_${orderId}` : `gplay_cancel_${Date.now()}`,
+        event_id: orderId
+          ? `gplay_lifecycle_${orderId}_${lifecycleKey}`
+          : `gplay_lifecycle_${lifecycleKey}`,
         occurred_at_wib: occurredAtWib,
         status: "Ignored",
         event_kind: "NON_TRANSACTION",
@@ -1397,12 +1422,53 @@ export function parseGmailIntelligence(
         merchant_pan: null,
         merchant_location: null,
         counterparty_normalized: "Google Play",
-        description_normalized: "Google Play Trial/Cancellation",
+        description_normalized: isCancellation
+          ? "Google Play Subscription Cancellation"
+          : "Google Play Declined/Rejected Notice",
+        transaction_reference: null,
+        external_order_id: orderId,
+        confidence: 0.99,
+        recommended_action:
+          "Keep as lifecycle evidence; zero ledger mutation",
+        review_reason: isCancellation
+          ? "Subscription cancellation notice; no financial charge."
+          : "Declined/rejected Google Play event; no completed charge.",
+        evidence_role: "LIFECYCLE_STATUS",
+        candidate: null,
+      };
+    }
+
+    const amount = parseIndonesianAmount(bodyText) || 0;
+
+    if (amount === 0) {
+      return {
+        event_id: orderId
+          ? `gplay_lifecycle_${orderId}_${lifecycleKey}`
+          : `gplay_lifecycle_${lifecycleKey}`,
+        occurred_at_wib: occurredAtWib,
+        status: "Ignored",
+        event_kind: "NON_TRANSACTION",
+        financial_class: "Ignore",
+        financial_direction: "Neutral",
+        amount: 0,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: null,
+        destination_account_alias: null,
+        destination_owner_type: "MERCHANT",
+        merchant_normalized: "Google Play",
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "Google Play",
+        description_normalized:
+          "Google Play Non-charge Lifecycle Notice",
         transaction_reference: null,
         external_order_id: orderId,
         confidence: 0.95,
-        recommended_action: "Ignore non-charge",
-        review_reason: "Trial or cancellation; zero financial charge.",
+        recommended_action:
+          "Keep as lifecycle evidence; zero ledger mutation",
+        review_reason:
+          "Google Play notice without a financial charge.",
         evidence_role: "LIFECYCLE_STATUS",
         candidate: null,
       };
@@ -1419,12 +1485,15 @@ export function parseGmailIntelligence(
       date: wib.dateStr,
       time: wib.timeStr,
       confidence_score: 0.95,
-      reasons: `Google Play: Pembelian aplikasi / langganan digital (${orderId || "Order"}).`,
+      reasons:
+        `Google Play: Pembelian aplikasi / langganan digital (${orderId || "Order"}).`,
       status: "AutoApproved",
     };
 
     return {
-      event_id: orderId ? `gplay_${orderId}` : `gplay_${Date.now()}`,
+      event_id: orderId
+        ? `gplay_${orderId}`
+        : `gplay_${Date.now()}`,
       occurred_at_wib: occurredAtWib,
       status: "AutoApproved",
       event_kind: "DIGITAL_PURCHASE",
