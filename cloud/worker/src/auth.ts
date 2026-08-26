@@ -72,10 +72,12 @@ export async function verifyGmailHmac(
   secret?: string,
   db?: D1Database
 ): Promise<{ valid: boolean; error?: string }> {
+  // 1. Validasi secret
   if (!secret) {
     return { valid: false, error: "UNCONFIGURED_GMAIL_SECRET" };
   }
 
+  // 2. Validasi required headers
   const signature = request.headers.get("X-Signature") || "";
   const timestampStr = request.headers.get("X-Timestamp") || "";
   const nonce = request.headers.get("X-Nonce") || "";
@@ -84,37 +86,18 @@ export async function verifyGmailHmac(
     return { valid: false, error: "MISSING_HMAC_HEADERS" };
   }
 
+  // 3. Validasi timestamp / tolerance window (5 menit)
   const timestamp = parseInt(timestampStr, 10);
   if (isNaN(timestamp)) {
     return { valid: false, error: "INVALID_TIMESTAMP" };
   }
 
   const now = Date.now();
-  // 5 minutes (300,000 ms) window tolerance
   if (Math.abs(now - timestamp) > 300000) {
     return { valid: false, error: "EXPIRED_TIMESTAMP" };
   }
 
-  // Durable Nonce Replay Check in D1
-  if (db) {
-    try {
-      // Clean old nonces (>10 minutes)
-      const pruneCutoff = now - 600000;
-      await db.prepare("DELETE FROM gmail_replay_nonces WHERE timestamp < ?").bind(pruneCutoff).run();
-
-      // Insert new nonce (PRIMARY KEY constraint prevents replay)
-      await db.prepare(
-        "INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)"
-      ).bind(nonce, timestamp).run();
-    } catch (err: any) {
-      if (err.message && err.message.includes("UNIQUE")) {
-        return { valid: false, error: "NONCE_REPLAY" };
-      }
-      return { valid: false, error: "NONCE_REPLAY" };
-    }
-  }
-
-  // Compute HMAC-SHA256
+  // 4. Hitung expected HMAC-SHA256
   const payloadToSign = `${timestampStr}.${nonce}.${rawBody}`;
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -129,8 +112,28 @@ export async function verifyGmailHmac(
   const hashArray = Array.from(new Uint8Array(sigBuffer));
   const expectedSig = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 
+  // 5. Constant-time compare signature SEBELUM menyentuh atau mereserve nonce
   if (!constantTimeEqual(signature.toLowerCase(), expectedSig.toLowerCase())) {
     return { valid: false, error: "INVALID_SIGNATURE" };
+  }
+
+  // 6. HANYA setelah signature terverifikasi valid, lakukan reservasi nonce secara durable di D1
+  if (db) {
+    try {
+      // Auto-prune nonce lama (>10 menit)
+      const pruneCutoff = now - 600000;
+      await db.prepare("DELETE FROM gmail_replay_nonces WHERE timestamp < ?").bind(pruneCutoff).run();
+
+      // Insert new nonce (PRIMARY KEY constraint mencegah replay lintas instance)
+      await db.prepare(
+        "INSERT INTO gmail_replay_nonces (nonce, timestamp) VALUES (?, ?)"
+      ).bind(nonce, timestamp).run();
+    } catch (err: any) {
+      if (err.message && err.message.includes("UNIQUE")) {
+        return { valid: false, error: "NONCE_REPLAY" };
+      }
+      return { valid: false, error: "NONCE_REPLAY" };
+    }
   }
 
   return { valid: true };

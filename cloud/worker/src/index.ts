@@ -191,7 +191,7 @@ export default {
     }
 
     // =================================================================
-    // 3. TELEGRAM BOT WEBHOOK
+    // 3. TELEGRAM BOT WEBHOOK (Idempotent Callbacks & Messages)
     // =================================================================
     if (path === "/api/telegram/webhook" && method === "POST") {
       const secCheck = verifyTelegramWebhook(request, env.TELEGRAM_SECRET_TOKEN);
@@ -205,7 +205,7 @@ export default {
       try {
         const payload = await request.json<any>();
 
-        // Handle Callback Query (Inline Keyboard Approve/Reject)
+        // 3a. Handle Callback Query (Inline Keyboard Approve/Reject) with Strict Idempotency
         if (payload.callback_query) {
           const cb = payload.callback_query;
           const fromUser = cb.from?.id;
@@ -220,24 +220,76 @@ export default {
           const [action, candIdStr] = data.split(":");
           const candId = parseInt(candIdStr, 10);
 
-          if (candId && (action === "approve" || action === "reject")) {
-            const newStatus = action === "approve" ? "Approved" : "Rejected";
-            await env.DB.prepare(
-              "UPDATE ingestion_candidates SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?"
-            ).bind(newStatus, candId).run();
-
-            await env.DB.prepare(
-              "INSERT INTO ingestion_audit_log (candidate_id, action, actor, details) VALUES (?, ?, 'telegram_user', 'Reviewed via inline button')"
-            ).bind(candId, newStatus).run();
-
+          if (!candId || (action !== "approve" && action !== "reject")) {
             return new Response(
-              JSON.stringify({ status: "success", action: newStatus, candidate_id: candId }),
+              JSON.stringify({ status: "error", code: "BAD_REQUEST", message: "Format aksi callback tidak valid." }),
+              { status: 400, headers: getSecurityHeaders() }
+            );
+          }
+
+          const targetStatus = action === "approve" ? "Approved" : "Rejected";
+
+          // Fetch current candidate state
+          const cand = await env.DB.prepare(
+            "SELECT id, status FROM ingestion_candidates WHERE id = ?"
+          ).bind(candId).first<{ id: number; status: string }>();
+
+          if (!cand) {
+            return new Response(
+              JSON.stringify({ status: "error", code: "NOT_FOUND", message: "Kandidat transaksi tidak ditemukan." }),
+              { status: 404, headers: getSecurityHeaders() }
+            );
+          }
+
+          // Case 1: Replay of the exact same terminal state -> Idempotent HTTP 200, NO duplicate audit event
+          if (cand.status === targetStatus) {
+            return new Response(
+              JSON.stringify({
+                status: "success",
+                idempotent: true,
+                action: targetStatus,
+                candidate_id: candId,
+                message: `Kandidat #${candId} sudah berstatus '${targetStatus}' (idempoten).`,
+              }),
               { status: 200, headers: getSecurityHeaders() }
             );
           }
+
+          // Case 2: Attempting to switch between terminal states (Approved -> Rejected or vice versa) -> Locked
+          if (cand.status === "Approved" || cand.status === "Rejected") {
+            return new Response(
+              JSON.stringify({
+                status: "error",
+                code: "TERMINAL_STATE_LOCKED",
+                message: `Status kandidat sudah final ('${cand.status}') dan tidak dapat diubah.`,
+                current_status: cand.status,
+                candidate_id: candId,
+              }),
+              { status: 400, headers: getSecurityHeaders() }
+            );
+          }
+
+          // Case 3: Transition from Pending -> targetStatus (Approved / Rejected)
+          await env.DB.prepare(
+            "UPDATE ingestion_candidates SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
+          ).bind(targetStatus, candId).run();
+
+          await env.DB.prepare(
+            "INSERT INTO ingestion_audit_log (candidate_id, action, actor, details) VALUES (?, ?, 'telegram_user', 'Reviewed via inline button')"
+          ).bind(candId, targetStatus).run();
+
+          return new Response(
+            JSON.stringify({
+              status: "success",
+              action: targetStatus,
+              candidate_id: candId,
+              previous_status: "Pending",
+            }),
+            { status: 200, headers: getSecurityHeaders() }
+          );
         }
 
-        // Handle Message Input
+        // 3b. Handle Message Input with Canonical Deterministic Idempotency
         if (payload.message) {
           const msg = payload.message;
           const fromUser = msg.from?.id;
@@ -249,7 +301,6 @@ export default {
           }
 
           const text = (msg.text || "").trim();
-          const msgId = msg.message_id ? String(msg.message_id) : `tg_${Date.now()}`;
 
           // Commands
           if (text === "/status") {
@@ -262,17 +313,53 @@ export default {
             );
           }
 
+          // Deterministic External ID from Telegram payload (update_id or message_id)
+          const externalId = payload.update_id
+            ? `tg_update_${payload.update_id}`
+            : msg.message_id
+            ? `tg_msg_${msg.message_id}`
+            : null;
+
+          if (!externalId) {
+            return new Response(
+              JSON.stringify({ status: "error", code: "BAD_REQUEST", message: "Identifier pesan Telegram tidak valid." }),
+              { status: 400, headers: getSecurityHeaders() }
+            );
+          }
+
+          // Idempotency check on raw_events
+          const existing = await env.DB.prepare(
+            "SELECT id, state FROM raw_events WHERE source = 'telegram' AND external_id = ?"
+          ).bind(externalId).first<{ id: number; state: string }>();
+
+          if (existing) {
+            const existingCand = await env.DB.prepare(
+              "SELECT id, status FROM ingestion_candidates WHERE raw_event_id = ?"
+            ).bind(existing.id).first<{ id: number; status: string }>();
+
+            return new Response(
+              JSON.stringify({
+                status: "success",
+                duplicate: true,
+                raw_event_id: existing.id,
+                candidate_id: existingCand?.id || null,
+                message: "Pesan Telegram telah diproses sebelumnya (idempoten).",
+              }),
+              { status: 200, headers: getSecurityHeaders() }
+            );
+          }
+
           // Compute deterministic SHA-256
           const hashBuf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
           const textHash = Array.from(new Uint8Array(hashBuf))
             .map((b) => b.toString(16).padStart(2, "0"))
             .join("");
 
-          // Handle structured text
+          // Insert raw event
           const rawRes = await env.DB.prepare(
             `INSERT INTO raw_events (source, external_id, occurred_at, payload_hash, parser_version, state, minimal_raw_payload)
              VALUES ('telegram', ?, CURRENT_TIMESTAMP, ?, '1.0.0', 'Parsed', ?)`
-          ).bind(msgId, textHash, JSON.stringify({ length: text.length })).run();
+          ).bind(externalId, textHash, JSON.stringify({ length: text.length })).run();
 
           const rawEventId = rawRes.meta.last_row_id;
           const cand = parseTelegramText(text);
@@ -300,6 +387,7 @@ export default {
           return new Response(
             JSON.stringify({
               status: "success",
+              raw_event_id: rawEventId,
               candidate_id: candRes.meta.last_row_id,
               candidate: cand,
             }),
@@ -328,7 +416,7 @@ export default {
     }
 
     // =================================================================
-    // 5. STAGING REVIEW API (Admin Token Protected)
+    // 5. STAGING REVIEW API (Admin Token Protected & Idempotent)
     // =================================================================
     // GET /api/ingestion/pending
     if (path === "/api/ingestion/pending" && method === "GET") {
@@ -345,9 +433,45 @@ export default {
     const approveMatch = path.match(/^\/api\/ingestion\/(\d+)\/approve$/);
     if (approveMatch && method === "POST") {
       const candId = parseInt(approveMatch[1], 10);
-      // In MODE=shadow: update review status in staging, DO NOT mutate transactions ledger!
+      const cand = await env.DB.prepare(
+        "SELECT id, status FROM ingestion_candidates WHERE id = ?"
+      ).bind(candId).first<{ id: number; status: string }>();
+
+      if (!cand) {
+        return new Response(
+          JSON.stringify({ status: "error", code: "NOT_FOUND", message: "Kandidat tidak ditemukan." }),
+          { status: 404, headers: getSecurityHeaders() }
+        );
+      }
+
+      if (cand.status === "Approved") {
+        return new Response(
+          JSON.stringify({
+            status: "success",
+            idempotent: true,
+            candidate_id: candId,
+            new_status: "Approved",
+            mode: env.MODE || "shadow",
+            ledger_updated: false,
+          }),
+          { status: 200, headers: getSecurityHeaders() }
+        );
+      }
+
+      if (cand.status === "Rejected") {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            code: "TERMINAL_STATE_LOCKED",
+            message: "Status kandidat sudah final ('Rejected') dan tidak dapat diubah.",
+            candidate_id: candId,
+          }),
+          { status: 400, headers: getSecurityHeaders() }
+        );
+      }
+
       await env.DB.prepare(
-        "UPDATE ingestion_candidates SET status = 'Approved', reviewed_at = CURRENT_TIMESTAMP WHERE id = ?"
+        "UPDATE ingestion_candidates SET status = 'Approved', reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
       ).bind(candId).run();
 
       await env.DB.prepare(
@@ -370,8 +494,43 @@ export default {
     const rejectMatch = path.match(/^\/api\/ingestion\/(\d+)\/reject$/);
     if (rejectMatch && method === "POST") {
       const candId = parseInt(rejectMatch[1], 10);
+      const cand = await env.DB.prepare(
+        "SELECT id, status FROM ingestion_candidates WHERE id = ?"
+      ).bind(candId).first<{ id: number; status: string }>();
+
+      if (!cand) {
+        return new Response(
+          JSON.stringify({ status: "error", code: "NOT_FOUND", message: "Kandidat tidak ditemukan." }),
+          { status: 404, headers: getSecurityHeaders() }
+        );
+      }
+
+      if (cand.status === "Rejected") {
+        return new Response(
+          JSON.stringify({
+            status: "success",
+            idempotent: true,
+            candidate_id: candId,
+            new_status: "Rejected",
+          }),
+          { status: 200, headers: getSecurityHeaders() }
+        );
+      }
+
+      if (cand.status === "Approved") {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            code: "TERMINAL_STATE_LOCKED",
+            message: "Status kandidat sudah final ('Approved') dan tidak dapat diubah.",
+            candidate_id: candId,
+          }),
+          { status: 400, headers: getSecurityHeaders() }
+        );
+      }
+
       await env.DB.prepare(
-        "UPDATE ingestion_candidates SET status = 'Rejected', reviewed_at = CURRENT_TIMESTAMP WHERE id = ?"
+        "UPDATE ingestion_candidates SET status = 'Rejected', reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'Pending'"
       ).bind(candId).run();
 
       await env.DB.prepare(

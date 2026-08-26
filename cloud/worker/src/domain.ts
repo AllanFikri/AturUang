@@ -37,6 +37,56 @@ export function getWibDate(dateObj = new Date()): { dateStr: string; monthStr: s
   return { dateStr, monthStr, timeStr };
 }
 
+export async function getUpcomingActiveCoverage(
+  db: D1Database,
+  upcomingId?: number
+): Promise<Map<number, number> | number> {
+  const covMap = new Map<number, number>();
+
+  // 1. Coverage dari protected_allocations (legacy engine)
+  try {
+    const paRows = await db
+      .prepare(
+        `SELECT covers_upcoming_id, COALESCE(SUM(amount), 0.0) as cov
+         FROM protected_allocations
+         WHERE status = 'Active' AND covers_upcoming_id IS NOT NULL
+         GROUP BY covers_upcoming_id`
+      )
+      .all<{ covers_upcoming_id: number; cov: number }>();
+
+    for (const r of paRows.results || []) {
+      const cur = covMap.get(r.covers_upcoming_id) || 0.0;
+      covMap.set(r.covers_upcoming_id, round2(cur + Number(r.cov || 0)));
+    }
+  } catch {
+    // Tabel protected_allocations opsional pada skema murni
+  }
+
+  // 2. Coverage dari allocation_goals (engine baru melalui upcoming.linked_goal_id)
+  try {
+    const goalRows = await db
+      .prepare(
+        `SELECT u.id, COALESCE(ag.allocated_amount, 0.0) as cov
+         FROM upcoming u
+         JOIN allocation_goals ag ON u.linked_goal_id = ag.id
+         WHERE ag.status = 'Active' AND u.linked_goal_id IS NOT NULL`
+      )
+      .all<{ id: number; cov: number }>();
+
+    for (const r of goalRows.results || []) {
+      const cur = covMap.get(r.id) || 0.0;
+      covMap.set(r.id, round2(cur + Number(r.cov || 0)));
+    }
+  } catch {
+    // Abaikan jika kolom linked_goal_id belum termigrasi
+  }
+
+  if (upcomingId !== undefined) {
+    return covMap.get(upcomingId) || 0.0;
+  }
+  return covMap;
+}
+
 export async function reconstructBalance(
   db: D1Database,
   accountName: string,
@@ -278,16 +328,13 @@ export async function computeDashboardKpis(
     )
     .all<{ id: number; amount: number; status: string; reserve_now: number }>();
 
+  const covMap = (await getUpcomingActiveCoverage(db)) as Map<number, number>;
   let totalXeff = 0.0;
   for (const u of upcomings.results || []) {
     if (u.status === "Tentative" && Number(u.reserve_now || 0) === 0) {
       continue; // Tentative without reserve_now does not deduct
     }
-    const covRes = await db
-      .prepare("SELECT COALESCE(SUM(amount), 0.0) as cov FROM protected_allocations WHERE covers_upcoming_id = ? AND status = 'Active'")
-      .bind(u.id)
-      .first<{ cov: number }>();
-    const cov = Number(covRes?.cov || 0);
+    const cov = covMap.get(u.id) || 0.0;
     const amt = Number(u.amount || 0);
     totalXeff += Math.max(0.0, amt - cov);
   }
