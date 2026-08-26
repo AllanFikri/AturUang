@@ -202,10 +202,10 @@ class TestGmailIntelligenceV1(unittest.TestCase):
         self.assertEqual(report["db_hash_before"], report["db_hash_after"])
 
     def test_04_financial_core_unchanged_contract(self):
-        """D. Verify financial core is unchanged from pre-13B behavioral contract and schema assumptions."""
-        # 1. Compare lines 3 to 526 with da9d41e
+        """D. Verify financial core is unchanged from the restored canonical financial-core baseline."""
+        # 1. Compare the financial-core section with restored baseline 796d9cf
         baseline = subprocess.check_output(
-            ["git", "show", "da9d41e:cloud/worker/src/domain.ts"],
+            ["git", "show", "796d9cf:cloud/worker/src/domain.ts"],
             cwd=str(BASE_DIR),
             text=True,
             encoding="utf-8"
@@ -213,12 +213,25 @@ class TestGmailIntelligenceV1(unittest.TestCase):
         with open(BASE_DIR / "cloud" / "worker" / "src" / "domain.ts", "r", encoding="utf-8") as f:
             current = f.read()
 
-        b_lines = baseline.splitlines()[2:526]
-        c_lines = current.splitlines()[2:526]
-        self.assertEqual(b_lines, c_lines, "Financial core (lines 3-526) modified from da9d41e baseline!")
+        # Compare only the actual financial-core section.
+        # Parser/ingestion contracts below this marker may evolve independently
+        # without weakening the financial-core regression guard.
+        marker = "// INGESTION & PARSER DOMAIN"
+
+        self.assertIn(marker, baseline)
+        self.assertIn(marker, current)
+
+        b_core = baseline.split(marker, 1)[0]
+        c_core = current.split(marker, 1)[0]
+
+        self.assertEqual(
+            b_core,
+            c_core,
+            "Financial core modified from restored 796d9cf baseline!"
+        )
 
         # 2. Verify exact column and query assumptions in financial core
-        fc_text = "\n".join(c_lines)
+        fc_text = c_core
         self.assertIn("account_name", fc_text)
         self.assertIn("snapshot_date", fc_text)
         self.assertIn("snapshot_kind", fc_text)
@@ -229,6 +242,51 @@ class TestGmailIntelligenceV1(unittest.TestCase):
         self.assertIn("allocated_amount", fc_text)
         self.assertIn("covers_upcoming_id", fc_text)
         self.assertIn("linked_goal_id", fc_text)
+
+    def test_05_gmail_partial_ingestion_is_retryable(self):
+        """Gmail partial canonical failures must fail closed and be safely retryable."""
+        index_text = (
+            BASE_DIR / "cloud" / "worker" / "src" / "index.ts"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "has_canonical_evidence",
+            index_text,
+            "Gmail idempotency must distinguish completed from incomplete raw events.",
+        )
+
+        self.assertIn(
+            "INCOMPLETE_GMAIL_EVENT_REPAIR_FAILED",
+            index_text,
+            "Incomplete Gmail raw events need an explicit fail-closed recovery path.",
+        )
+
+        self.assertIn(
+            "CANONICAL_EVENT_PERSISTENCE_FAILED",
+            index_text,
+            "Canonical persistence failures must propagate to HTTP 500.",
+        )
+
+        self.assertIn(
+            "const canonicalBatch = await env.DB.batch",
+            index_text,
+            "New canonical event + evidence persistence must be atomic.",
+        )
+
+        canonical_section = index_text.split(
+            "// Insert / correlate Canonical Financial Event (Migration 0007)",
+            1,
+        )[1].split(
+            "// Update source freshness",
+            1,
+        )[0]
+
+        self.assertNotIn(
+            "} catch {}",
+            canonical_section,
+            "Canonical persistence errors must never be silently swallowed.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

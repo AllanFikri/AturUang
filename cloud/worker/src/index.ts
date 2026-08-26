@@ -132,21 +132,63 @@ export default {
           .map((b) => b.toString(16).padStart(2, "0"))
           .join("");
 
-        // Idempotency check on raw_events
+        // Idempotency + incomplete-ingestion recovery.
+        // Completed Gmail messages must already have canonical evidence.
+        // A raw row without evidence is an incomplete previous attempt and
+        // may be safely removed/reprocessed using the same Gmail message ID.
         const existing = await env.DB.prepare(
-          "SELECT id, state FROM raw_events WHERE source = 'gmail' AND external_id = ?"
-        ).bind(message_id).first<{ id: number; state: string }>();
+          `SELECT
+             r.id,
+             r.state,
+             CASE WHEN EXISTS (
+               SELECT 1
+               FROM canonical_event_evidence e
+               WHERE e.raw_event_id = r.id
+             ) THEN 1 ELSE 0 END AS has_canonical_evidence
+           FROM raw_events r
+           WHERE r.source = 'gmail' AND r.external_id = ?`
+        ).bind(message_id).first<{
+          id: number;
+          state: string;
+          has_canonical_evidence: number;
+        }>();
 
         if (existing) {
-          return new Response(
-            JSON.stringify({
-              status: "success",
-              duplicate: true,
-              raw_event_id: existing.id,
-              message: "Email telah diproses sebelumnya (idempoten).",
-            }),
-            { status: 200, headers: getSecurityHeaders() }
-          );
+          if (Number(existing.has_canonical_evidence || 0) === 1) {
+            return new Response(
+              JSON.stringify({
+                status: "success",
+                duplicate: true,
+                raw_event_id: existing.id,
+                message: "Email telah diproses sebelumnya (idempoten).",
+              }),
+              { status: 200, headers: getSecurityHeaders() }
+            );
+          }
+
+          // Self-heal a partial previous Gmail ingestion.
+          // ingestion_candidates cascades through raw_event_id.
+          const cleanup = await env.DB.prepare(
+            `DELETE FROM raw_events
+             WHERE id = ?
+               AND source = 'gmail'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM canonical_event_evidence e
+                 WHERE e.raw_event_id = raw_events.id
+               )`
+          ).bind(existing.id).run();
+
+          if ((cleanup.meta.changes || 0) !== 1) {
+            return new Response(
+              JSON.stringify({
+                status: "error",
+                code: "INCOMPLETE_GMAIL_EVENT_REPAIR_FAILED",
+                message: "Event Gmail parsial tidak dapat dipulihkan dengan aman.",
+              }),
+              { status: 503, headers: getSecurityHeaders() }
+            );
+          }
         }
 
         // Transaction Intelligence Engine v1
@@ -205,9 +247,13 @@ export default {
         }
 
         // Insert / correlate Canonical Financial Event (Migration 0007)
+        // Fail closed: raw/candidate ingestion is NOT considered successful
+        // until canonical evidence has also been persisted.
         let canonDbId: number | null = null;
+
         try {
           let existingCanon: { id: number } | null = null;
+
           if (canonEv.transaction_reference) {
             existingCanon = await env.DB.prepare(
               "SELECT id FROM canonical_financial_events WHERE transaction_reference = ? LIMIT 1"
@@ -220,8 +266,23 @@ export default {
 
           if (existingCanon) {
             canonDbId = existingCanon.id;
+
+            const evidenceRes = await env.DB.prepare(
+              `INSERT INTO canonical_event_evidence
+               (canonical_event_id, raw_event_id, candidate_id, evidence_role)
+               VALUES (?, ?, ?, ?)`
+            ).bind(
+              canonDbId,
+              rawEventId,
+              candidateId,
+              canonEv.evidence_role
+            ).run();
+
+            if ((evidenceRes.meta.changes || 0) !== 1) {
+              throw new Error("CANONICAL_EVIDENCE_INSERT_FAILED");
+            }
           } else {
-            const insCanon = await env.DB.prepare(
+            const canonicalInsert = env.DB.prepare(
               `INSERT INTO canonical_financial_events
                (event_id, occurred_at_wib, status, event_kind, financial_class, financial_direction,
                 amount, currency, fee_amount, source_account_alias, destination_account_alias,
@@ -252,18 +313,44 @@ export default {
               canonEv.confidence,
               canonEv.recommended_action,
               canonEv.review_reason
-            ).run();
-            canonDbId = insCanon.meta.last_row_id;
-          }
+            );
 
-          if (canonDbId && rawEventId) {
-            await env.DB.prepare(
+            // Canonical row + its evidence are one atomic D1 batch.
+            // If evidence fails, the newly-created canonical row rolls back.
+            const evidenceInsert = env.DB.prepare(
               `INSERT INTO canonical_event_evidence
                (canonical_event_id, raw_event_id, candidate_id, evidence_role)
-               VALUES (?, ?, ?, ?)`
-            ).bind(canonDbId, rawEventId, candidateId, canonEv.evidence_role).run();
+               SELECT id, ?, ?, ?
+               FROM canonical_financial_events
+               WHERE event_id = ?`
+            ).bind(
+              rawEventId,
+              candidateId,
+              canonEv.evidence_role,
+              canonEv.event_id
+            );
+
+            const canonicalBatch = await env.DB.batch([
+              canonicalInsert,
+              evidenceInsert,
+            ]);
+
+            canonDbId =
+              canonicalBatch[0]?.meta?.last_row_id || null;
+
+            const evidenceChanges =
+              canonicalBatch[1]?.meta?.changes || 0;
+
+            if (!canonDbId || evidenceChanges !== 1) {
+              throw new Error("CANONICAL_BATCH_PERSISTENCE_FAILED");
+            }
           }
-        } catch {}
+        } catch (canonicalErr: any) {
+          // Outer Gmail handler returns HTTP 500.
+          // Apps Script therefore preserves its historical checkpoint.
+          // Retry will self-heal the incomplete raw row above.
+          throw new Error("CANONICAL_EVENT_PERSISTENCE_FAILED");
+        }
 
         // Update source freshness
         await env.DB.prepare(
