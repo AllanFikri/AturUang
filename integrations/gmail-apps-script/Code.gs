@@ -1598,3 +1598,716 @@ function postBcaQrisRepair_(
 
   return parsed;
 }
+/**
+ * =====================================================================
+ * BCA QRIS AUTOMATIC REPAIR ORCHESTRATOR
+ *
+ * Run startBcaQrisAutoRepair() ONCE.
+ *
+ * - D1 remains the authoritative checkpoint.
+ * - Each execution is bounded by runBcaQrisTargetedRepair_().
+ * - Remaining work is continued with a one-shot trigger.
+ * - Completion sends email.
+ * - Failure sends email and stops continuation.
+ * - Historical backfill checkpoint is never used.
+ * =====================================================================
+ */
+
+const BCA_AUTO_HANDLER =
+  "continueBcaQrisAutoRepair_";
+
+const BCA_AUTO_STATE =
+  "BCA_QRIS_AUTO_STATE";
+
+const BCA_AUTO_EMAIL =
+  "BCA_QRIS_AUTO_EMAIL";
+
+const BCA_AUTO_INITIAL =
+  "BCA_QRIS_AUTO_INITIAL";
+
+const BCA_AUTO_REMAINING =
+  "BCA_QRIS_AUTO_REMAINING";
+
+const BCA_AUTO_UPDATED =
+  "BCA_QRIS_AUTO_UPDATED";
+
+const BCA_AUTO_ERROR =
+  "BCA_QRIS_AUTO_ERROR";
+
+const BCA_AUTO_EXPECTED_START =
+  1080;
+
+const BCA_AUTO_DELAY_MS =
+  60 * 1000;
+
+
+function startBcaQrisAutoRepair() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const state =
+    String(
+      props.getProperty(
+        BCA_AUTO_STATE
+      ) || ""
+    );
+
+  if (state === "RUNNING") {
+    console.log(
+      "BCA_QRIS_AUTO_ALREADY_RUNNING"
+    );
+
+    return getBcaQrisAutoRepairStatus();
+  }
+
+  if (
+    state === "FAILED" ||
+    state === "STOPPED"
+  ) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_BLOCKED_STATE"
+    );
+  }
+
+  const workerUrl =
+    props.getProperty("WORKER_URL");
+
+  const relaySecret =
+    props.getProperty(
+      "GMAIL_RELAY_SECRET"
+    );
+
+  if (!workerUrl || !relaySecret) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_CONFIG_MISSING"
+    );
+  }
+
+  const email =
+    String(
+      Session
+        .getEffectiveUser()
+        .getEmail() || ""
+    ).trim();
+
+  if (!email) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_NOTIFY_EMAIL_UNAVAILABLE"
+    );
+  }
+
+  if (
+    MailApp.getRemainingDailyQuota() <
+    1
+  ) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_NOTIFY_QUOTA_UNAVAILABLE"
+    );
+  }
+
+  props.setProperty(
+    BCA_AUTO_EMAIL,
+    email
+  );
+
+  deleteBcaQrisAutoTriggers_();
+
+  const remaining =
+    getBcaQrisRemaining_(
+      workerUrl,
+      relaySecret
+    );
+
+  if (
+    remaining !==
+    BCA_AUTO_EXPECTED_START
+  ) {
+    return failBcaQrisAutoRepair_(
+      "BCA_QRIS_REPAIR_BASELINE_MISMATCH",
+      remaining
+    );
+  }
+
+  props.setProperty(
+    BCA_AUTO_STATE,
+    "RUNNING"
+  );
+
+  props.setProperty(
+    BCA_AUTO_INITIAL,
+    String(remaining)
+  );
+
+  props.setProperty(
+    BCA_AUTO_REMAINING,
+    String(remaining)
+  );
+
+  props.setProperty(
+    BCA_AUTO_UPDATED,
+    new Date().toISOString()
+  );
+
+  props.deleteProperty(
+    BCA_AUTO_ERROR
+  );
+
+  console.log(
+    "BCA_QRIS_AUTO_STARTED" +
+    " | remaining=" +
+    remaining
+  );
+
+  return continueBcaQrisAutoRepair_();
+}
+
+
+function continueBcaQrisAutoRepair_() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  if (
+    props.getProperty(
+      BCA_AUTO_STATE
+    ) !== "RUNNING"
+  ) {
+    deleteBcaQrisAutoTriggers_();
+
+    console.log(
+      "BCA_QRIS_AUTO_CONTINUATION_NOOP"
+    );
+
+    return;
+  }
+
+  const workerUrl =
+    props.getProperty("WORKER_URL");
+
+  const relaySecret =
+    props.getProperty(
+      "GMAIL_RELAY_SECRET"
+    );
+
+  if (!workerUrl || !relaySecret) {
+    return failBcaQrisAutoRepair_(
+      "BCA_QRIS_REPAIR_CONFIG_MISSING",
+      null
+    );
+  }
+
+  try {
+    const before =
+      getBcaQrisRemaining_(
+        workerUrl,
+        relaySecret
+      );
+
+    const initial =
+      Number(
+        props.getProperty(
+          BCA_AUTO_INITIAL
+        ) ||
+        BCA_AUTO_EXPECTED_START
+      );
+
+    console.log(
+      "BCA_QRIS_AUTO_EXECUTION_START" +
+      " | repaired_total=" +
+      Math.max(
+        initial - before,
+        0
+      ) +
+      " | remaining_before=" +
+      before
+    );
+
+    const result =
+      runBcaQrisTargetedRepair_(
+        null
+      );
+
+    const after =
+      getBcaQrisRemaining_(
+        workerUrl,
+        relaySecret
+      );
+
+    const repairedThisRun =
+      Math.max(
+        before - after,
+        0
+      );
+
+    const repairedTotal =
+      Math.max(
+        initial - after,
+        0
+      );
+
+    props.setProperty(
+      BCA_AUTO_REMAINING,
+      String(after)
+    );
+
+    props.setProperty(
+      BCA_AUTO_UPDATED,
+      new Date().toISOString()
+    );
+
+    console.log(
+      "BCA_QRIS_AUTO_PROGRESS" +
+      " | repaired_this_run=" +
+      repairedThisRun +
+      " | repaired_total=" +
+      repairedTotal +
+      " | remaining=" +
+      after
+    );
+
+    if (
+      after === 0 ||
+      (
+        result &&
+        result.status === "completed"
+      )
+    ) {
+      deleteBcaQrisAutoTriggers_();
+
+      props.setProperty(
+        BCA_AUTO_STATE,
+        "COMPLETED"
+      );
+
+      props.setProperty(
+        BCA_AUTO_REMAINING,
+        "0"
+      );
+
+      props.setProperty(
+        BCA_AUTO_UPDATED,
+        new Date().toISOString()
+      );
+
+      const sent =
+        sendBcaQrisAutoEmail_(
+          "AturUang - BCA QRIS Repair Selesai",
+          [
+            "Status: COMPLETED",
+            "Remaining target: 0",
+            "Repaired after canary: " +
+              repairedTotal,
+            "Completed at: " +
+              new Date().toISOString(),
+            "",
+            "Seluruh collapsed BCA QRIS evidence",
+            "telah selesai diproses.",
+            "",
+            "Tahap berikutnya:",
+            "final canonical integrity audit."
+          ].join("\n")
+        );
+
+      console.log(
+        "BCA_QRIS_AUTO_COMPLETED" +
+        " | repaired_total=" +
+        repairedTotal +
+        " | remaining=0" +
+        " | email=" +
+        (
+          sent
+            ? "sent"
+            : "failed"
+        )
+      );
+
+      return;
+    }
+
+    if (after >= before) {
+      return failBcaQrisAutoRepair_(
+        "BCA_QRIS_REPAIR_NO_PROGRESS",
+        after
+      );
+    }
+
+    scheduleBcaQrisAutoTrigger_(
+      after
+    );
+  } catch (e) {
+    const code =
+      extractBcaQrisSafeCode_(e);
+
+    let remaining = null;
+
+    try {
+      remaining =
+        getBcaQrisRemaining_(
+          workerUrl,
+          relaySecret
+        );
+    } catch (ignored) {
+      const stored =
+        props.getProperty(
+          BCA_AUTO_REMAINING
+        );
+
+      if (stored !== null) {
+        remaining =
+          Number(stored);
+      }
+    }
+
+    return failBcaQrisAutoRepair_(
+      code,
+      remaining
+    );
+  }
+}
+
+
+function getBcaQrisAutoRepairStatus() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const initialRaw =
+    props.getProperty(
+      BCA_AUTO_INITIAL
+    );
+
+  const remainingRaw =
+    props.getProperty(
+      BCA_AUTO_REMAINING
+    );
+
+  const initial =
+    initialRaw === null
+      ? null
+      : Number(initialRaw);
+
+  const remaining =
+    remainingRaw === null
+      ? null
+      : Number(remainingRaw);
+
+  const repaired =
+    (
+      initial === null ||
+      remaining === null
+    )
+      ? null
+      : Math.max(
+          initial - remaining,
+          0
+        );
+
+  const result = {
+    state:
+      props.getProperty(
+        BCA_AUTO_STATE
+      ) || "IDLE",
+    initial_remaining:
+      initial,
+    repaired_total:
+      repaired,
+    remaining:
+      remaining,
+    updated_at:
+      props.getProperty(
+        BCA_AUTO_UPDATED
+      ),
+    error:
+      props.getProperty(
+        BCA_AUTO_ERROR
+      )
+  };
+
+  console.log(
+    "BCA_QRIS_AUTO_STATUS" +
+    " | state=" +
+    result.state +
+    " | repaired_total=" +
+    (
+      repaired === null
+        ? "unknown"
+        : repaired
+    ) +
+    " | remaining=" +
+    (
+      remaining === null
+        ? "unknown"
+        : remaining
+    ) +
+    (
+      result.error
+        ? " | error=" +
+          result.error
+        : ""
+    )
+  );
+
+  return result;
+}
+
+
+function stopBcaQrisAutoRepair() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  deleteBcaQrisAutoTriggers_();
+
+  props.setProperty(
+    BCA_AUTO_STATE,
+    "STOPPED"
+  );
+
+  props.setProperty(
+    BCA_AUTO_UPDATED,
+    new Date().toISOString()
+  );
+
+  console.log(
+    "BCA_QRIS_AUTO_STOPPED" +
+    " | future_continuations=disabled"
+  );
+}
+
+
+function getBcaQrisRemaining_(
+  workerUrl,
+  relaySecret
+) {
+  const response =
+    postBcaQrisRepair_(
+      workerUrl,
+      relaySecret,
+      {
+        action: "next",
+        limit: 1
+      }
+    );
+
+  const remaining =
+    Number(
+      response &&
+      response.remaining
+    );
+
+  if (
+    !Number.isInteger(remaining) ||
+    remaining < 0
+  ) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_INVALID_REMAINING"
+    );
+  }
+
+  return remaining;
+}
+
+
+function scheduleBcaQrisAutoTrigger_(
+  remaining
+) {
+  deleteBcaQrisAutoTriggers_();
+
+  ScriptApp
+    .newTrigger(
+      BCA_AUTO_HANDLER
+    )
+    .timeBased()
+    .after(
+      BCA_AUTO_DELAY_MS
+    )
+    .create();
+
+  console.log(
+    "BCA_QRIS_AUTO_RESCHEDULED" +
+    " | remaining=" +
+    remaining +
+    " | next_run=approximately_1_minute"
+  );
+}
+
+
+function deleteBcaQrisAutoTriggers_() {
+  const triggers =
+    ScriptApp.getProjectTriggers();
+
+  for (
+    let i = 0;
+    i < triggers.length;
+    i++
+  ) {
+    if (
+      triggers[i]
+        .getHandlerFunction() ===
+      BCA_AUTO_HANDLER
+    ) {
+      ScriptApp.deleteTrigger(
+        triggers[i]
+      );
+    }
+  }
+}
+
+
+function failBcaQrisAutoRepair_(
+  code,
+  remaining
+) {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  deleteBcaQrisAutoTriggers_();
+
+  const safeCode =
+    String(
+      code ||
+      "BCA_QRIS_REPAIR_UNEXPECTED_EXCEPTION"
+    )
+      .toUpperCase()
+      .replace(
+        /[^A-Z0-9_]/g,
+        "_"
+      );
+
+  props.setProperty(
+    BCA_AUTO_STATE,
+    "FAILED"
+  );
+
+  props.setProperty(
+    BCA_AUTO_ERROR,
+    safeCode
+  );
+
+  props.setProperty(
+    BCA_AUTO_UPDATED,
+    new Date().toISOString()
+  );
+
+  if (
+    remaining !== null &&
+    Number.isFinite(
+      Number(remaining)
+    )
+  ) {
+    props.setProperty(
+      BCA_AUTO_REMAINING,
+      String(remaining)
+    );
+  }
+
+  const sent =
+    sendBcaQrisAutoEmail_(
+      "AturUang - BCA QRIS Repair Gagal",
+      [
+        "Status: FAILED",
+        "Code: " +
+          safeCode,
+        "Remaining target: " +
+          (
+            remaining === null
+              ? "unknown"
+              : remaining
+          ),
+        "Failed at: " +
+          new Date().toISOString(),
+        "",
+        "Auto-repair dihentikan.",
+        "Continuation trigger telah dibersihkan.",
+        "",
+        "Jangan restart sebelum error",
+        "selesai didiagnosis."
+      ].join("\n")
+    );
+
+  console.error(
+    "BCA_QRIS_AUTO_FAILED" +
+    " | code=" +
+    safeCode +
+    " | remaining=" +
+    (
+      remaining === null
+        ? "unknown"
+        : remaining
+    ) +
+    " | email=" +
+    (
+      sent
+        ? "sent"
+        : "failed"
+    )
+  );
+
+  throw new Error(
+    safeCode
+  );
+}
+
+
+function extractBcaQrisSafeCode_(e) {
+  const raw =
+    String(
+      e &&
+      e.message
+        ? e.message
+        : e || ""
+    );
+
+  const match =
+    raw.match(
+      /BCA_QRIS_REPAIR_[A-Z0-9_]+/
+    );
+
+  return match
+    ? match[0]
+    : "BCA_QRIS_REPAIR_UNEXPECTED_EXCEPTION";
+}
+
+
+function sendBcaQrisAutoEmail_(
+  subject,
+  body
+) {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const email =
+    String(
+      props.getProperty(
+        BCA_AUTO_EMAIL
+      ) || ""
+    ).trim();
+
+  if (!email) {
+    console.error(
+      "BCA_QRIS_NOTIFY_FAILED" +
+      " | code=EMAIL_UNAVAILABLE"
+    );
+
+    return false;
+  }
+
+  try {
+    MailApp.sendEmail({
+      to: email,
+      subject: subject,
+      body: body,
+      name: "AturUang"
+    });
+
+    console.log(
+      "BCA_QRIS_NOTIFICATION_SENT"
+    );
+
+    return true;
+  } catch (e) {
+    console.error(
+      "BCA_QRIS_NOTIFY_FAILED" +
+      " | code=MAILAPP_SEND_FAILED"
+    );
+
+    return false;
+  }
+}
