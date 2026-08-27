@@ -2311,3 +2311,115 @@ function sendBcaQrisAutoEmail_(
     return false;
   }
 }
+
+/**
+ * Resume only the known fail-closed parse-rejected run
+ * after the semantic Worker fix has been deployed.
+ */
+function resumeBcaQrisAutoRepairAfterFix() {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const state =
+    String(
+      props.getProperty(
+        BCA_AUTO_STATE
+      ) || ""
+    );
+
+  const failedCode =
+    String(
+      props.getProperty(
+        BCA_AUTO_ERROR
+      ) || ""
+    );
+
+  const initial =
+    Number(
+      props.getProperty(
+        BCA_AUTO_INITIAL
+      )
+    );
+
+  if (state !== "FAILED") {
+    throw new Error(
+      "BCA_QRIS_REPAIR_RESUME_STATE_MISMATCH"
+    );
+  }
+
+  if (
+    failedCode !==
+    "BCA_QRIS_REPAIR_WORKER_BCA_QRIS_REPAIR_PARSE_REJECTED"
+  ) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_RESUME_ERROR_MISMATCH"
+    );
+  }
+
+  if (initial !== 1080) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_RESUME_INITIAL_MISMATCH"
+    );
+  }
+
+  const workerUrl =
+    props.getProperty(
+      "WORKER_URL"
+    );
+
+  const relaySecret =
+    props.getProperty(
+      "GMAIL_RELAY_SECRET"
+    );
+
+  if (!workerUrl || !relaySecret) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_CONFIG_MISSING"
+    );
+  }
+
+  assertBcaQrisRepairWorkerReady_(
+    workerUrl
+  );
+
+  const remaining =
+    getBcaQrisRemaining_(
+      workerUrl,
+      relaySecret
+    );
+
+  if (remaining !== 1079) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_RESUME_BASELINE_MISMATCH"
+    );
+  }
+
+  deleteBcaQrisAutoTriggers_();
+
+  props.setProperty(
+    BCA_AUTO_STATE,
+    "RUNNING"
+  );
+
+  props.setProperty(
+    BCA_AUTO_REMAINING,
+    String(remaining)
+  );
+
+  props.setProperty(
+    BCA_AUTO_UPDATED,
+    new Date().toISOString()
+  );
+
+  props.deleteProperty(
+    BCA_AUTO_ERROR
+  );
+
+  console.log(
+    "BCA_QRIS_AUTO_RESUMED_AFTER_FIX" +
+    " | repaired_total=1" +
+    " | remaining=1079"
+  );
+
+  return continueBcaQrisAutoRepair_();
+}

@@ -738,26 +738,98 @@ export default {
               ""
           ).trim();
 
-        if (
-          canonEv.event_kind !==
-            "MERCHANT_PAYMENT" ||
-          canonEv.financial_class !==
-            "Expense" ||
-          canonEv.financial_direction !==
-            "Debit" ||
-          canonEv.evidence_role !==
-            "PRIMARY_PAYMENT" ||
-          !Number.isFinite(
+        const normalizedCounterparty =
+          String(
+            canonEv.counterparty_normalized ||
+              ""
+          ).trim();
+
+        const replayBodyHasQris =
+          String(body || "")
+            .toLowerCase()
+            .includes("qris") ||
+          String(subject || "")
+            .toLowerCase()
+            .includes("qris");
+
+        const validAmount =
+          Number.isFinite(
             Number(canonEv.amount)
-          ) ||
-          Number(canonEv.amount) <= 0 ||
-          !normalizedRef ||
-          normalizedRef.toLowerCase() ===
-            "erensi" ||
-          canonEv.event_id === badEventId ||
-          !normalizedMerchant ||
-          normalizedMerchant.toLowerCase() ===
-            "qris merchant"
+          ) &&
+          Number(canonEv.amount) > 0;
+
+        const validReference =
+          Boolean(normalizedRef) &&
+          normalizedRef
+            .toLowerCase() !==
+            "erensi";
+
+        const isMerchantPaymentRepair =
+          canonEv.status ===
+            "AutoApproved" &&
+          canonEv.event_kind ===
+            "MERCHANT_PAYMENT" &&
+          canonEv.financial_class ===
+            "Expense" &&
+          canonEv.financial_direction ===
+            "Debit" &&
+          canonEv.evidence_role ===
+            "PRIMARY_PAYMENT" &&
+          canonEv.candidate?.tx_type ===
+            "Expense" &&
+          canonEv.candidate?.status ===
+            "AutoApproved" &&
+          Boolean(normalizedMerchant) &&
+          normalizedMerchant
+            .toLowerCase() !==
+            "qris merchant";
+
+        const isTransferQrisRepair =
+          canonEv.status ===
+            "Pending" &&
+          canonEv.event_kind ===
+            "EXTERNAL_TRANSFER" &&
+          canonEv.financial_class ===
+            "Pending Review" &&
+          canonEv.financial_direction ===
+            "Debit" &&
+          canonEv.evidence_role ===
+            "PRIMARY_PAYMENT" &&
+          canonEv.description_normalized ===
+            "Transfer QRIS BCA" &&
+          canonEv.candidate?.tx_type ===
+            "Expense" &&
+          canonEv.candidate?.status ===
+            "Pending" &&
+          Boolean(normalizedCounterparty) &&
+          normalizedCounterparty
+            .toLowerCase() !==
+            "third party";
+
+        const isFailedQrisRepair =
+          canonEv.status ===
+            "Ignored" &&
+          canonEv.event_kind ===
+            "FAILED_ATTEMPT" &&
+          canonEv.financial_class ===
+            "Ignore" &&
+          canonEv.financial_direction ===
+            "Neutral" &&
+          canonEv.evidence_role ===
+            "LIFECYCLE_STATUS" &&
+          canonEv.candidate == null;
+
+        if (
+          !replayBodyHasQris ||
+          !validAmount ||
+          !validReference ||
+          canonEv.event_id ===
+            badEventId ||
+          (
+            !isMerchantPaymentRepair &&
+            !isTransferQrisRepair &&
+            !isFailedQrisRepair
+          )
         ) {
           return new Response(
             JSON.stringify({
@@ -765,7 +837,7 @@ export default {
               code:
                 "BCA_QRIS_REPAIR_PARSE_REJECTED",
               message:
-                "Email tidak menghasilkan canonical QRIS yang aman untuk repair.",
+                "Email tidak menghasilkan semantic QRIS yang aman untuk repair.",
             }),
             {
               status: 422,
@@ -774,16 +846,27 @@ export default {
           );
         }
 
+        const expectedCandidateStatus =
+          isFailedQrisRepair
+            ? "Rejected"
+            : String(
+                canonEv.candidate?.status ||
+                ""
+              );
+
         const evidenceLookup =
           await env.DB.prepare(
             `SELECT
                e.id AS evidence_id,
                e.raw_event_id,
                e.candidate_id,
+               e.evidence_role AS current_evidence_role,
                r.payload_hash,
                c.id AS current_canonical_id,
                c.event_id AS current_event_id,
-               ic.amount AS candidate_amount
+               ic.amount AS candidate_amount,
+               ic.status AS candidate_status,
+               ic.applied_transaction_id
              FROM raw_events r
              JOIN canonical_event_evidence e
                ON e.raw_event_id = r.id
@@ -800,11 +883,20 @@ export default {
           .all<{
             evidence_id: number;
             raw_event_id: number;
-            candidate_id: number | null;
+            candidate_id:
+              number | null;
+            current_evidence_role:
+              string;
             payload_hash: string;
-            current_canonical_id: number;
-            current_event_id: string;
+            current_canonical_id:
+              number;
+            current_event_id:
+              string;
             candidate_amount:
+              number | null;
+            candidate_status:
+              string | null;
+            applied_transaction_id:
               number | null;
           }>();
 
@@ -859,6 +951,25 @@ export default {
         }
 
         if (
+          current.applied_transaction_id !==
+          null
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_CANDIDATE_ALREADY_APPLIED",
+              message:
+                "Candidate target sudah pernah diaplikasikan dan tidak boleh direklasifikasi otomatis.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        if (
           String(
             current.payload_hash || ""
           ).toLowerCase() !==
@@ -902,14 +1013,20 @@ export default {
           );
         }
 
-        // Idempotent retry after a previously successful repair.
+        // Idempotent retry.
         if (
           current.current_event_id !==
           badEventId
         ) {
           if (
             current.current_event_id ===
-            canonEv.event_id
+              canonEv.event_id &&
+            current.current_evidence_role ===
+              canonEv.evidence_role &&
+            current.candidate_status ===
+              expectedCandidateStatus &&
+            current.applied_transaction_id ===
+              null
           ) {
             return new Response(
               JSON.stringify({
@@ -950,11 +1067,14 @@ export default {
         type RepairCanonicalRow = {
           id: number;
           event_id: string;
+          status: string;
           event_kind: string;
           financial_class: string;
           financial_direction: string;
           amount: number;
           merchant_normalized:
+            string | null;
+          counterparty_normalized:
             string | null;
         };
 
@@ -963,11 +1083,13 @@ export default {
             `SELECT
                id,
                event_id,
+               status,
                event_kind,
                financial_class,
                financial_direction,
                amount,
-               merchant_normalized
+               merchant_normalized,
+               counterparty_normalized
              FROM canonical_financial_events
              WHERE transaction_reference = ?
              ORDER BY id
@@ -1001,16 +1123,19 @@ export default {
           referenceRows.length === 1
             ? referenceRows[0]
             : null;
+
         const byEventId =
           await env.DB.prepare(
             `SELECT
                id,
                event_id,
+               status,
                event_kind,
                financial_class,
                financial_direction,
                amount,
-               merchant_normalized
+               merchant_normalized,
+               counterparty_normalized
              FROM canonical_financial_events
              WHERE event_id = ?
              LIMIT 1`
@@ -1060,54 +1185,34 @@ export default {
         }
 
         const existingTarget =
-          byEventId || byReference;
+          byEventId ||
+          byReference;
 
         if (existingTarget) {
-          const existingMerchant =
-            String(
-              existingTarget
-                .merchant_normalized ||
-                ""
-            )
-              .trim()
-              .toLowerCase();
+          const sameSignature =
+            existingTarget.status ===
+              canonEv.status &&
+            existingTarget.event_kind ===
+              canonEv.event_kind &&
+            existingTarget.financial_class ===
+              canonEv.financial_class &&
+            existingTarget.financial_direction ===
+              canonEv.financial_direction &&
+            Math.abs(
+              Number(
+                existingTarget.amount
+              ) -
+                Number(canonEv.amount)
+            ) < 0.005;
 
-          // Do not silently reuse an incomplete historical
-          // placeholder canonical during repair.
-          if (
-            !existingMerchant ||
-            existingMerchant ===
-              "qris merchant"
-          ) {
-            return new Response(
-              JSON.stringify({
-                status: "error",
-                code:
-                  "BCA_QRIS_REPAIR_EXISTING_CANONICAL_INCOMPLETE",
-                message:
-                  "Canonical target yang sudah ada belum memiliki merchant yang cukup kuat.",
-              }),
-              {
-                status: 409,
-                headers:
-                  getSecurityHeaders(),
-              }
-            );
-          }
-
-          if (
-            !isCanonicalCorrelationCompatible(
-              canonEv,
-              existingTarget
-            )
-          ) {
+          if (!sameSignature) {
             return new Response(
               JSON.stringify({
                 status: "error",
                 code:
                   "BCA_QRIS_REPAIR_CANONICAL_CONFLICT",
                 message:
-                  "Canonical existing tidak kompatibel dengan evidence repair.",
+                  "Canonical existing memiliki signature semantic berbeda.",
               }),
               {
                 status: 409,
@@ -1117,22 +1222,205 @@ export default {
             );
           }
 
-          await env.DB.prepare(
-            `UPDATE canonical_event_evidence
-             SET canonical_event_id = ?
-             WHERE id = ?
-               AND canonical_event_id = ?
-               AND raw_event_id = ?
-               AND candidate_id = ?`
-          )
-          .bind(
-            existingTarget.id,
-            current.evidence_id,
-            current.current_canonical_id,
-            current.raw_event_id,
-            current.candidate_id
-          )
-          .run();
+          if (
+            isMerchantPaymentRepair
+          ) {
+            const existingMerchant =
+              String(
+                existingTarget
+                  .merchant_normalized ||
+                  ""
+              )
+                .trim()
+                .toLowerCase();
+
+            if (
+              !existingMerchant ||
+              existingMerchant ===
+                "qris merchant"
+            ) {
+              return new Response(
+                JSON.stringify({
+                  status: "error",
+                  code:
+                    "BCA_QRIS_REPAIR_EXISTING_CANONICAL_INCOMPLETE",
+                  message:
+                    "Canonical payment existing belum memiliki merchant yang kuat.",
+                }),
+                {
+                  status: 409,
+                  headers:
+                    getSecurityHeaders(),
+                }
+              );
+            }
+
+            if (
+              !isCanonicalCorrelationCompatible(
+                canonEv,
+                existingTarget
+              )
+            ) {
+              return new Response(
+                JSON.stringify({
+                  status: "error",
+                  code:
+                    "BCA_QRIS_REPAIR_CANONICAL_CONFLICT",
+                  message:
+                    "Canonical payment existing tidak kompatibel.",
+                }),
+                {
+                  status: 409,
+                  headers:
+                    getSecurityHeaders(),
+                }
+              );
+            }
+          }
+
+          if (
+            isTransferQrisRepair
+          ) {
+            const existingCounterparty =
+              String(
+                existingTarget
+                  .counterparty_normalized ||
+                  ""
+              )
+                .trim()
+                .toLowerCase();
+
+            if (
+              !existingCounterparty ||
+              existingCounterparty ===
+                "third party" ||
+              existingCounterparty !==
+                normalizedCounterparty
+                  .toLowerCase()
+            ) {
+              return new Response(
+                JSON.stringify({
+                  status: "error",
+                  code:
+                    "BCA_QRIS_REPAIR_CANONICAL_CONFLICT",
+                  message:
+                    "Canonical transfer existing tidak memiliki counterparty yang cocok.",
+                }),
+                {
+                  status: 409,
+                  headers:
+                    getSecurityHeaders(),
+                }
+              );
+            }
+          }
+        }
+
+        const candidateRepair =
+          canonEv.candidate ||
+          null;
+
+        const candidateUpdate =
+          candidateRepair
+            ? env.DB.prepare(
+                `UPDATE ingestion_candidates
+                 SET tx_type = ?,
+                     account = ?,
+                     to_account = ?,
+                     category = ?,
+                     money_context = ?,
+                     person_name = ?,
+                     date = ?,
+                     time = ?,
+                     confidence_score = ?,
+                     status = ?,
+                     reasons = ?
+                 WHERE id = ?
+                   AND raw_event_id = ?
+                   AND applied_transaction_id IS NULL
+                   AND ABS(amount - ?) < 0.005
+                   AND EXISTS (
+                     SELECT 1
+                     FROM canonical_event_evidence
+                     WHERE id = ?
+                       AND canonical_event_id = ?
+                       AND raw_event_id = ?
+                       AND candidate_id = ?
+                   )`
+              ).bind(
+                candidateRepair.tx_type,
+                candidateRepair.account,
+                candidateRepair.to_account ??
+                  null,
+                candidateRepair.category,
+                candidateRepair.money_context,
+                candidateRepair.person_name ??
+                  null,
+                candidateRepair.date,
+                candidateRepair.time ??
+                  null,
+                candidateRepair.confidence_score,
+                candidateRepair.status,
+                candidateRepair.reasons,
+                current.candidate_id,
+                current.raw_event_id,
+                canonEv.amount,
+                current.evidence_id,
+                current.current_canonical_id,
+                current.raw_event_id,
+                current.candidate_id
+              )
+            : env.DB.prepare(
+                `UPDATE ingestion_candidates
+                 SET status = 'Rejected',
+                     reasons = ?
+                 WHERE id = ?
+                   AND raw_event_id = ?
+                   AND applied_transaction_id IS NULL
+                   AND ABS(amount - ?) < 0.005
+                   AND EXISTS (
+                     SELECT 1
+                     FROM canonical_event_evidence
+                     WHERE id = ?
+                       AND canonical_event_id = ?
+                       AND raw_event_id = ?
+                       AND candidate_id = ?
+                   )`
+              ).bind(
+                "BCA QRIS: transaksi gagal; candidate lama ditolak saat targeted semantic repair.",
+                current.candidate_id,
+                current.raw_event_id,
+                canonEv.amount,
+                current.evidence_id,
+                current.current_canonical_id,
+                current.raw_event_id,
+                current.candidate_id
+              );
+
+        if (existingTarget) {
+          const moveExisting =
+            env.DB.prepare(
+              `UPDATE canonical_event_evidence
+               SET canonical_event_id = ?,
+                   evidence_role = ?
+               WHERE id = ?
+                 AND canonical_event_id = ?
+                 AND raw_event_id = ?
+                 AND candidate_id = ?`
+            )
+            .bind(
+              existingTarget.id,
+              canonEv.evidence_role,
+              current.evidence_id,
+              current.current_canonical_id,
+              current.raw_event_id,
+              current.candidate_id
+            );
+
+          await env.DB.batch([
+            candidateUpdate,
+            moveExisting,
+          ]);
         } else {
           const canonicalInsert =
             env.DB.prepare(
@@ -1185,11 +1473,12 @@ export default {
             env.DB.prepare(
               `UPDATE canonical_event_evidence
                SET canonical_event_id = (
-                 SELECT id
-                 FROM canonical_financial_events
-                 WHERE event_id = ?
-                 LIMIT 1
-               )
+                     SELECT id
+                     FROM canonical_financial_events
+                     WHERE event_id = ?
+                     LIMIT 1
+                   ),
+                   evidence_role = ?
                WHERE id = ?
                  AND canonical_event_id = ?
                  AND raw_event_id = ?
@@ -1197,41 +1486,68 @@ export default {
             )
             .bind(
               canonEv.event_id,
+              canonEv.evidence_role,
               current.evidence_id,
               current.current_canonical_id,
               current.raw_event_id,
               current.candidate_id
             );
 
-          // Same atomic-batch model already used by normal
-          // canonical ingestion.
           await env.DB.batch([
             canonicalInsert,
+            candidateUpdate,
             moveEvidence,
           ]);
         }
 
-        // D1 mutation metadata is not authoritative.
-        // Verify the post-repair state directly.
         const postRepair =
           await env.DB.prepare(
             `SELECT
                c.id AS canonical_event_id,
                c.event_id,
+               c.status AS canonical_status,
+               c.event_kind,
+               c.financial_class,
+               c.financial_direction,
+               c.amount AS canonical_amount,
                e.raw_event_id,
-               e.candidate_id
+               e.candidate_id,
+               e.evidence_role,
+               ic.raw_event_id AS candidate_raw_event_id,
+               ic.status AS candidate_status,
+               ic.applied_transaction_id
              FROM canonical_event_evidence e
              JOIN canonical_financial_events c
                ON c.id = e.canonical_event_id
+             JOIN ingestion_candidates ic
+               ON ic.id = e.candidate_id
              WHERE e.id = ?
              LIMIT 1`
           )
           .bind(current.evidence_id)
           .first<{
-            canonical_event_id: number;
+            canonical_event_id:
+              number;
             event_id: string;
+            canonical_status:
+              string;
+            event_kind: string;
+            financial_class:
+              string;
+            financial_direction:
+              string;
+            canonical_amount:
+              number;
             raw_event_id: number;
             candidate_id:
+              number | null;
+            evidence_role:
+              string;
+            candidate_raw_event_id:
+              number;
+            candidate_status:
+              string;
+            applied_transaction_id:
               number | null;
           }>();
 
@@ -1239,10 +1555,32 @@ export default {
           !postRepair ||
           postRepair.event_id !==
             canonEv.event_id ||
+          postRepair.canonical_status !==
+            canonEv.status ||
+          postRepair.event_kind !==
+            canonEv.event_kind ||
+          postRepair.financial_class !==
+            canonEv.financial_class ||
+          postRepair.financial_direction !==
+            canonEv.financial_direction ||
+          Math.abs(
+            Number(
+              postRepair.canonical_amount
+            ) -
+              Number(canonEv.amount)
+          ) >= 0.005 ||
           postRepair.raw_event_id !==
             current.raw_event_id ||
           postRepair.candidate_id !==
-            current.candidate_id
+            current.candidate_id ||
+          postRepair.evidence_role !==
+            canonEv.evidence_role ||
+          postRepair.candidate_raw_event_id !==
+            current.raw_event_id ||
+          postRepair.candidate_status !==
+            expectedCandidateStatus ||
+          postRepair.applied_transaction_id !==
+            null
         ) {
           return new Response(
             JSON.stringify({
@@ -1250,7 +1588,7 @@ export default {
               code:
                 "BCA_QRIS_REPAIR_POSTCHECK_FAILED",
               message:
-                "Post-repair evidence state tidak sesuai kontrak.",
+                "Post-repair canonical/evidence/candidate state tidak sesuai kontrak.",
             }),
             {
               status: 500,

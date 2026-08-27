@@ -1,8 +1,8 @@
 """
-Structural safety contract for the targeted BCA QRIS canonical repair.
+Structural safety contract for targeted BCA QRIS repair.
 
-This test intentionally does not claim D1 behavioral proof.
-It verifies the source-level safety boundaries before deployment.
+This test is structural only.
+D1 behavioral proof comes from the canary and repair audits.
 """
 
 from pathlib import Path
@@ -24,7 +24,6 @@ APPS = (
     / "Code.gs"
 ).read_text(encoding="utf-8")
 
-
 route_start = INDEX.index(
     "// 2b. TARGETED BCA QRIS CANONICAL REPAIR"
 )
@@ -38,44 +37,51 @@ repair_route = INDEX[
     route_start:route_end
 ]
 
-
-required_worker_markers = [
-    '/api/repair/bca-qris',
-    'verifyGmailHmac',
-    'BCA_QRIS_REPAIR_NOT_SHADOW',
-    'bca_qris_erensi',
+required_worker = [
+    "/api/repair/bca-qris",
+    "verifyGmailHmac",
+    "BCA_QRIS_REPAIR_NOT_SHADOW",
+    "bca_qris_erensi",
     'action === "next"',
     'action !== "repair"',
-    'parseGmailIntelligence',
-    'BCA_QRIS_REPAIR_PAYLOAD_HASH_MISMATCH',
-    'candidate_amount',
-    'isCanonicalCorrelationCompatible',
-    'UPDATE canonical_event_evidence',
-    'INSERT INTO canonical_financial_events',
-    'BCA_QRIS_REPAIR_POSTCHECK_FAILED',
-    'BCA_QRIS_REPAIR_REFERENCE_MULTIPLICITY',
-    'referenceRows.length > 1',
-    'WHERE EXISTS (',
-    'already_repaired',
+    "parseGmailIntelligence",
+    "BCA_QRIS_REPAIR_PAYLOAD_HASH_MISMATCH",
+    "BCA_QRIS_REPAIR_AMOUNT_MISMATCH",
+    "BCA_QRIS_REPAIR_CANDIDATE_ALREADY_APPLIED",
+    "BCA_QRIS_REPAIR_REFERENCE_MULTIPLICITY",
+    "referenceRows.length > 1",
+    "BCA_QRIS_REPAIR_POSTCHECK_FAILED",
+    "UPDATE ingestion_candidates",
+    "applied_transaction_id IS NULL",
+    "UPDATE canonical_event_evidence",
+    "evidence_role = ?",
+    "INSERT INTO canonical_financial_events",
+    "WHERE EXISTS (",
+    "FAILED_ATTEMPT",
+    "EXTERNAL_TRANSFER",
+    "isFailedQrisRepair",
+    "isTransferQrisRepair",
+    "isMerchantPaymentRepair",
+    "candidate_status",
+    "current_evidence_role",
+    "already_repaired",
 ]
 
-for marker in required_worker_markers:
+for marker in required_worker:
     assert marker in repair_route, (
-        f"Missing Worker repair safety marker: {marker}"
+        f"Missing Worker repair marker: {marker}"
     )
-
 
 for forbidden in [
     "DELETE FROM raw_events",
     "DELETE FROM ingestion_candidates",
     "DELETE FROM canonical_financial_events",
+    "DELETE FROM canonical_event_evidence",
     "UPDATE raw_events",
-    "UPDATE ingestion_candidates",
 ]:
     assert forbidden not in repair_route, (
-        f"Forbidden destructive repair behavior: {forbidden}"
+        f"Forbidden repair behavior: {forbidden}"
     )
-
 
 assert (
     "current.current_event_id !=="
@@ -92,15 +98,15 @@ assert (
     in repair_route
 )
 
-
 apps_start = APPS.index(
     "TARGETED BCA QRIS COLLAPSED-CANONICAL REPAIR"
 )
 
-repair_apps = APPS[apps_start:]
+repair_apps = APPS[
+    apps_start:
+]
 
-
-required_apps_markers = [
+required_apps = [
     "repairBcaQrisCanary",
     "repairBcaQrisCollapsedCanonical",
     "GmailApp.getMessageById",
@@ -109,13 +115,13 @@ required_apps_markers = [
     "postBcaQrisRepair_",
     "BCA_QRIS_REPAIR_CANARY_PASS",
     "BCA_QRIS_REPAIR_COMPLETED",
+    "resumeBcaQrisAutoRepairAfterFix",
 ]
 
-for marker in required_apps_markers:
+for marker in required_apps:
     assert marker in repair_apps, (
         f"Missing Apps Script repair marker: {marker}"
     )
-
 
 for forbidden in [
     "GMAIL_BACKFILL_CHECKPOINT",
@@ -129,7 +135,18 @@ for forbidden in [
         f"from historical backfill: {forbidden}"
     )
 
-
-print("BCA_QRIS_TARGETED_REPAIR_STRUCTURE: PASS")
-print("BCA_QRIS_TARGETED_REPAIR_NONDESTRUCTIVE: PASS")
-print("BCA_QRIS_TARGETED_REPAIR_BACKFILL_ISOLATION: PASS")
+print(
+    "BCA_QRIS_TARGETED_REPAIR_STRUCTURE: PASS"
+)
+print(
+    "BCA_QRIS_TARGETED_REPAIR_NONDESTRUCTIVE: PASS"
+)
+print(
+    "BCA_QRIS_TARGETED_REPAIR_CANDIDATE_GUARD: PASS"
+)
+print(
+    "BCA_QRIS_TARGETED_REPAIR_EVIDENCE_ROLE: PASS"
+)
+print(
+    "BCA_QRIS_TARGETED_REPAIR_BACKFILL_ISOLATION: PASS"
+)

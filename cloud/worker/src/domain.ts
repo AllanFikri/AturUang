@@ -757,10 +757,35 @@ export function parseGmailIntelligence(
   // -----------------------------------------------------------------------
   if (cleanFrom.includes("bca.co.id")) {
     // A. Failed transaction / Gagal
-    if (cleanBody.includes("status transaksi: gagal") || cleanBody.includes("transaksi gagal") || cleanBody.includes("transaksi ditolak") || cleanSubj.includes("gagal")) {
-      const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+    const failedStatusLabel = bodyText.match(
+      /(?:^|\r?\n)\s*(?:status|status\s+transaksi)\s*(?::\s*|\r?\n\s*:\s*)gagal\b/im
+    );
+
+    if (
+      failedStatusLabel ||
+      cleanBody.includes("status transaksi: gagal") ||
+      cleanBody.includes("transaksi gagal") ||
+      cleanBody.includes("transaksi ditolak") ||
+      cleanSubj.includes("gagal")
+    ) {
+      const amount =
+        parseIndonesianAmount(bodyText) ||
+        parseIndonesianAmount(subject) ||
+        0;
+
+      const failedRefMatch = bodyText.match(
+        /(?:^|\r?\n)\s*(?:nomor\s+referensi|no\.\s*referensi|no\s+referensi|referensi|reference|ref)\s*(?::\s*|\r?\n\s*:\s*)([^\r\n]+)/im
+      );
+
+      const failedRef =
+        failedRefMatch
+          ? failedRefMatch[1].trim()
+          : null;
+
       return {
-        event_id: `bca_fail_${Date.now()}`,
+        event_id: failedRef
+          ? `bca_fail_${failedRef}`
+          : `bca_fail_${Date.now()}`,
         occurred_at_wib: occurredAtWib,
         status: "Ignored",
         event_kind: "FAILED_ATTEMPT",
@@ -776,12 +801,15 @@ export function parseGmailIntelligence(
         merchant_pan: null,
         merchant_location: null,
         counterparty_normalized: null,
-        description_normalized: "BCA Alert: Transaksi Gagal/Ditolak",
-        transaction_reference: null,
+        description_normalized:
+          "BCA Alert: Transaksi Gagal/Ditolak",
+        transaction_reference: failedRef,
         external_order_id: null,
-        confidence: 0.95,
-        recommended_action: "Ignore failed transaction",
-        review_reason: "Failed attempt; zero ledger mutation.",
+        confidence: 0.99,
+        recommended_action:
+          "Ignore failed transaction",
+        review_reason:
+          "Failed attempt; zero ledger mutation.",
         evidence_role: "LIFECYCLE_STATUS",
         candidate: null,
       };
@@ -989,32 +1017,128 @@ export function parseGmailIntelligence(
     }
 
     // D. BCA QRIS
-    if (cleanBody.includes("qris") || cleanSubj.includes("qris")) {
-      const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+    if (
+      cleanBody.includes("qris") ||
+      cleanSubj.includes("qris")
+    ) {
+      const amount =
+        parseIndonesianAmount(bodyText) ||
+        parseIndonesianAmount(subject) ||
+        0;
 
-      // BCA QRIS emails exist in both compact single-line form:
-      //   Merchant: Example
-      // and real myBCA multi-line form:
-      //   Pembayaran Ke
-      //   :
-      //   Example
-      //
-      // Match explicit field labels from the beginning of a line so words
-      // such as "Merchant" inside a field value cannot become a false label.
-      const extractQrisField = (labels: string[]): string | null => {
-        const escapedLabels = labels.map((label) =>
-          label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      const extractQrisField =
+        (labels: string[]): string | null => {
+          const escapedLabels =
+            labels.map((label) =>
+              label.replace(
+                /[.*+?^${}()|[\]\\]/g,
+                "\\$&"
+              )
+            );
+
+          const fieldMatch =
+            bodyText.match(
+              new RegExp(
+                `(?:^|\\r?\\n)\\s*(?:${escapedLabels.join("|")})\\s*(?::\\s*|\\r?\\n\\s*:\\s*)([^\\r\\n]+)`,
+                "im"
+              )
+            );
+
+          return fieldMatch
+            ? fieldMatch[1].trim()
+            : null;
+        };
+
+      const qrisType =
+        extractQrisField([
+          "Jenis Transaksi",
+        ]) || "";
+
+      const refId =
+        extractQrisField([
+          "Nomor Referensi",
+          "No. Referensi",
+          "No Referensi",
+          "Referensi",
+          "Reference",
+          "Ref",
+        ]);
+
+      const recipientName =
+        extractQrisField([
+          "Nama Penerima",
+          "Penerima",
+          "Nama Tujuan",
+        ]);
+
+      const isTransferQris =
+        /\btransfer\s+qris\b/i.test(
+          qrisType
         );
 
-        const fieldMatch = bodyText.match(
-          new RegExp(
-            `(?:^|\\r?\\n)\\s*(?:${escapedLabels.join("|")})\\s*(?::\\s*|\\r?\\n\\s*:\\s*)([^\\r\\n]+)`,
-            "im"
-          )
-        );
+      if (isTransferQris) {
+        const counterparty =
+          recipientName ||
+          "Third Party";
 
-        return fieldMatch ? fieldMatch[1].trim() : null;
-      };
+        const cand: ParsedCandidate = {
+          tx_type: "Expense",
+          amount,
+          account: "BCA Main",
+          to_account: null,
+          category:
+            "Other / Miscellaneous",
+          money_context: "Personal",
+          person_name: null,
+          date: wib.dateStr,
+          time: wib.timeStr,
+          confidence_score: 0.80,
+          reasons:
+            "BCA Transfer QRIS: transfer ke pihak lain; review konteks sebelum ledger.",
+          status: "Pending",
+        };
+
+        return {
+          event_id: refId
+            ? `bca_qris_transfer_${refId}`
+            : `bca_qris_transfer_${Date.now()}`,
+          occurred_at_wib: occurredAtWib,
+          status: "Pending",
+          event_kind:
+            "EXTERNAL_TRANSFER",
+          financial_class:
+            "Pending Review",
+          financial_direction:
+            "Debit",
+          amount,
+          currency: "IDR",
+          fee_amount: 0,
+          source_account_alias:
+            "BCA Main",
+          destination_account_alias:
+            null,
+          destination_owner_type:
+            "OTHER_PERSON",
+          merchant_normalized: null,
+          merchant_pan: null,
+          merchant_location: null,
+          counterparty_normalized:
+            counterparty,
+          description_normalized:
+            "Transfer QRIS BCA",
+          transaction_reference:
+            refId,
+          external_order_id: null,
+          confidence: 0.80,
+          recommended_action:
+            "Review recipient and context before ledger classification",
+          review_reason:
+            "Transfer QRIS ke pihak lain memerlukan review konteks.",
+          evidence_role:
+            "PRIMARY_PAYMENT",
+          candidate: cand,
+        };
+      }
 
       const merchantName =
         extractQrisField([
@@ -1023,7 +1147,8 @@ export function parseGmailIntelligence(
           "Merchant",
           "Pembayaran Kepada",
           "Kepada",
-        ]) || "QRIS Merchant";
+        ]) ||
+        "QRIS Merchant";
 
       const pan =
         extractQrisField([
@@ -1039,17 +1164,82 @@ export function parseGmailIntelligence(
           "Kota",
         ]);
 
-      const refId =
-        extractQrisField([
-          "Nomor Referensi",
-          "No. Referensi",
-          "No Referensi",
-          "Referensi",
-          "Reference",
-          "Ref",
-        ]);
+      const isPaymentQris =
+        /\bpembayaran\s+qris\b/i.test(
+          qrisType
+        ) ||
+        (
+          !qrisType &&
+          merchantName !==
+            "QRIS Merchant"
+        );
 
-      const category = inferMerchantCategory(merchantName, bodyText);
+      if (!isPaymentQris) {
+        const cand: ParsedCandidate = {
+          tx_type: "Expense",
+          amount,
+          account: "BCA Main",
+          to_account: null,
+          category:
+            "Other / Miscellaneous",
+          money_context: "Personal",
+          person_name: null,
+          date: wib.dateStr,
+          time: wib.timeStr,
+          confidence_score: 0.50,
+          reasons:
+            "BCA QRIS: tipe transaksi belum dikenali secara aman.",
+          status: "Pending",
+        };
+
+        return {
+          event_id: refId
+            ? `bca_qris_review_${refId}`
+            : `bca_qris_review_${Date.now()}`,
+          occurred_at_wib: occurredAtWib,
+          status: "Pending",
+          event_kind:
+            "EXTERNAL_TRANSFER",
+          financial_class:
+            "Pending Review",
+          financial_direction:
+            "Debit",
+          amount,
+          currency: "IDR",
+          fee_amount: 0,
+          source_account_alias:
+            "BCA Main",
+          destination_account_alias:
+            null,
+          destination_owner_type:
+            "UNKNOWN",
+          merchant_normalized: null,
+          merchant_pan: null,
+          merchant_location: null,
+          counterparty_normalized:
+            recipientName ||
+            "Third Party",
+          description_normalized:
+            "QRIS BCA - review required",
+          transaction_reference:
+            refId,
+          external_order_id: null,
+          confidence: 0.50,
+          recommended_action:
+            "Manual review",
+          review_reason:
+            "Jenis QRIS belum cocok dengan Pembayaran QRIS atau Transfer QRIS.",
+          evidence_role:
+            "PRIMARY_PAYMENT",
+          candidate: cand,
+        };
+      }
+
+      const category =
+        inferMerchantCategory(
+          merchantName,
+          bodyText
+        );
 
       const cand: ParsedCandidate = {
         tx_type: "Expense",
@@ -1062,34 +1252,49 @@ export function parseGmailIntelligence(
         date: wib.dateStr,
         time: wib.timeStr,
         confidence_score: 0.95,
-        reasons: `BCA QRIS: Pembayaran berhasil ke ${merchantName}.`,
+        reasons:
+          `BCA QRIS: Pembayaran berhasil ke ${merchantName}.`,
         status: "AutoApproved",
       };
 
       return {
-        event_id: refId ? `bca_qris_${refId}` : `bca_qris_${Date.now()}`,
+        event_id: refId
+          ? `bca_qris_${refId}`
+          : `bca_qris_${Date.now()}`,
         occurred_at_wib: occurredAtWib,
         status: "AutoApproved",
-        event_kind: "MERCHANT_PAYMENT",
-        financial_class: "Expense",
-        financial_direction: "Debit",
+        event_kind:
+          "MERCHANT_PAYMENT",
+        financial_class:
+          "Expense",
+        financial_direction:
+          "Debit",
         amount,
         currency: "IDR",
         fee_amount: 0,
-        source_account_alias: "BCA Main",
-        destination_account_alias: null,
-        destination_owner_type: "MERCHANT",
-        merchant_normalized: merchantName,
+        source_account_alias:
+          "BCA Main",
+        destination_account_alias:
+          null,
+        destination_owner_type:
+          "MERCHANT",
+        merchant_normalized:
+          merchantName,
         merchant_pan: pan,
         merchant_location: location,
-        counterparty_normalized: merchantName,
-        description_normalized: `Pembayaran QRIS ${merchantName}`,
-        transaction_reference: refId,
+        counterparty_normalized:
+          merchantName,
+        description_normalized:
+          `Pembayaran QRIS ${merchantName}`,
+        transaction_reference:
+          refId,
         external_order_id: null,
         confidence: 0.95,
-        recommended_action: "Record QRIS Expense",
+        recommended_action:
+          "Record QRIS Expense",
         review_reason: null,
-        evidence_role: "PRIMARY_PAYMENT",
+        evidence_role:
+          "PRIMARY_PAYMENT",
         candidate: cand,
       };
     }
