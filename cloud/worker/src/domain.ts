@@ -991,14 +991,63 @@ export function parseGmailIntelligence(
     // D. BCA QRIS
     if (cleanBody.includes("qris") || cleanSubj.includes("qris")) {
       const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
-      const merchantMatch = bodyText.match(/(?:merchant|nama merchant|pembayaran kepada|kepada)\s*[:]?\s*([a-zA-Z0-9\s\.,\-_]+?)(?:\r|\n|pan|lokasi|tanggal|$)/i);
-      const merchantName = merchantMatch ? merchantMatch[1].trim() : "QRIS Merchant";
-      const panMatch = bodyText.match(/(?:pan|nmid)\s*[:]?\s*([a-zA-Z0-9]+)/i);
-      const pan = panMatch ? panMatch[1].trim() : null;
-      const locMatch = bodyText.match(/(?:lokasi|kota)\s*[:]?\s*([a-zA-Z0-9\s]+)/i);
-      const location = locMatch ? locMatch[1].trim() : null;
-      const refMatch = bodyText.match(/(?:(?:no\.?\s*)?referensi|reference|ref)\b\s*:?\s*([a-zA-Z0-9][a-zA-Z0-9._-]*)/i);
-      const refId = refMatch ? refMatch[1] : null;
+
+      // BCA QRIS emails exist in both compact single-line form:
+      //   Merchant: Example
+      // and real myBCA multi-line form:
+      //   Pembayaran Ke
+      //   :
+      //   Example
+      //
+      // Match explicit field labels from the beginning of a line so words
+      // such as "Merchant" inside a field value cannot become a false label.
+      const extractQrisField = (labels: string[]): string | null => {
+        const escapedLabels = labels.map((label) =>
+          label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+        );
+
+        const fieldMatch = bodyText.match(
+          new RegExp(
+            `(?:^|\\r?\\n)\\s*(?:${escapedLabels.join("|")})\\s*(?::\\s*|\\r?\\n\\s*:\\s*)([^\\r\\n]+)`,
+            "im"
+          )
+        );
+
+        return fieldMatch ? fieldMatch[1].trim() : null;
+      };
+
+      const merchantName =
+        extractQrisField([
+          "Pembayaran Ke",
+          "Nama Merchant",
+          "Merchant",
+          "Pembayaran Kepada",
+          "Kepada",
+        ]) || "QRIS Merchant";
+
+      const pan =
+        extractQrisField([
+          "Merchant PAN",
+          "NMID",
+          "PAN",
+        ]);
+
+      const location =
+        extractQrisField([
+          "Lokasi Merchant",
+          "Lokasi",
+          "Kota",
+        ]);
+
+      const refId =
+        extractQrisField([
+          "Nomor Referensi",
+          "No. Referensi",
+          "No Referensi",
+          "Referensi",
+          "Reference",
+          "Ref",
+        ]);
 
       const category = inferMerchantCategory(merchantName, bodyText);
 
