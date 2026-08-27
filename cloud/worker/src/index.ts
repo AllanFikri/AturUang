@@ -458,6 +458,863 @@ export default {
       }
     }
 
+
+    // =================================================================
+    // 2b. TARGETED BCA QRIS CANONICAL REPAIR
+    //
+    // Purpose:
+    // - repair only evidence currently collapsed into bca_qris_erensi;
+    // - preserve raw_event_id and candidate_id;
+    // - verify replayed Gmail payload against the original payload_hash;
+    // - never delete raw_events, ingestion_candidates, or the bad canonical;
+    // - fail closed on any identity/economic mismatch.
+    //
+    // Manual recovery only. MODE must be exactly "shadow".
+    // =================================================================
+    if (path === "/api/repair/bca-qris" && method === "POST") {
+      const rawBody = await request.text();
+
+      const hmacCheck = await verifyGmailHmac(
+        request,
+        rawBody,
+        env.GMAIL_RELAY_SECRET,
+        env.DB
+      );
+
+      if (!hmacCheck.valid) {
+        const errCode =
+          hmacCheck.error ||
+          "HMAC_VERIFICATION_FAILED";
+
+        const statusCode =
+          errCode === "REPLAY_GUARD_UNAVAILABLE"
+            ? 503
+            : 401;
+
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            code: errCode,
+            message:
+              "Otentikasi repair Gmail ditolak.",
+          }),
+          {
+            status: statusCode,
+            headers: getSecurityHeaders(),
+          }
+        );
+      }
+
+      if (
+        String(env.MODE || "").toLowerCase() !==
+        "shadow"
+      ) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            code: "BCA_QRIS_REPAIR_NOT_SHADOW",
+            message:
+              "Targeted repair hanya diizinkan dalam mode shadow.",
+          }),
+          {
+            status: 409,
+            headers: getSecurityHeaders(),
+          }
+        );
+      }
+
+      try {
+        const payload = JSON.parse(rawBody);
+        const action =
+          String(payload?.action || "").trim();
+
+        const badEventId =
+          "bca_qris_erensi";
+
+        // -----------------------------------------------------
+        // NEXT
+        //
+        // D1 itself is the repair checkpoint:
+        // once evidence is moved away from the bad canonical,
+        // the message automatically disappears from this queue.
+        // -----------------------------------------------------
+        if (action === "next") {
+          const rawLimit =
+            Number(payload?.limit || 10);
+
+          const limit =
+            Number.isInteger(rawLimit)
+              ? Math.min(
+                  Math.max(rawLimit, 1),
+                  25
+                )
+              : 10;
+
+          const targetResult =
+            await env.DB.prepare(
+              `SELECT
+                 r.external_id AS message_id
+               FROM canonical_event_evidence e
+               JOIN canonical_financial_events c
+                 ON c.id = e.canonical_event_id
+               JOIN raw_events r
+                 ON r.id = e.raw_event_id
+               WHERE c.event_id = ?
+                 AND r.source = 'gmail'
+               ORDER BY e.id
+               LIMIT ?`
+            )
+            .bind(
+              badEventId,
+              limit
+            )
+            .all<{
+              message_id: string;
+            }>();
+
+          const remainingRow =
+            await env.DB.prepare(
+              `SELECT
+                 COUNT(*) AS remaining
+               FROM canonical_event_evidence e
+               JOIN canonical_financial_events c
+                 ON c.id = e.canonical_event_id
+               JOIN raw_events r
+                 ON r.id = e.raw_event_id
+               WHERE c.event_id = ?
+                 AND r.source = 'gmail'`
+            )
+            .bind(badEventId)
+            .first<{
+              remaining: number;
+            }>();
+
+          return new Response(
+            JSON.stringify({
+              status: "success",
+              action: "next",
+              remaining:
+                Number(
+                  remainingRow?.remaining || 0
+                ),
+              message_ids:
+                (targetResult.results || [])
+                  .map(
+                    (row) =>
+                      String(
+                        row.message_id || ""
+                      )
+                  )
+                  .filter(Boolean),
+            }),
+            {
+              status: 200,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        if (action !== "repair") {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_INVALID_ACTION",
+              message:
+                "Action repair tidak dikenal.",
+            }),
+            {
+              status: 400,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        const {
+          message_id,
+          from,
+          subject,
+          body,
+          internal_date,
+        } = payload;
+
+        if (
+          !message_id ||
+          !from ||
+          typeof body !== "string" ||
+          !internal_date
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_BAD_REQUEST",
+              message:
+                "Payload repair tidak lengkap.",
+            }),
+            {
+              status: 400,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        const senderCheck =
+          isGmailSenderTrusted(from);
+
+        if (
+          !senderCheck.trusted ||
+          senderCheck.email !==
+            "bca@bca.co.id"
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_INVALID_SENDER",
+              message:
+                "Repair hanya menerima bukti BCA yang dipercaya.",
+            }),
+            {
+              status: 403,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        // Rebuild the exact original Gmail relay payload.
+        //
+        // Property order intentionally matches Code.gs:
+        // message_id, from, subject, body, internal_date.
+        const originalRelayBody =
+          JSON.stringify({
+            message_id,
+            from,
+            subject: subject || "",
+            body,
+            internal_date,
+          });
+
+        const originalHashBuffer =
+          await crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(
+              originalRelayBody
+            )
+          );
+
+        const replayedPayloadHash =
+          Array.from(
+            new Uint8Array(
+              originalHashBuffer
+            )
+          )
+            .map(
+              (b) =>
+                b
+                  .toString(16)
+                  .padStart(2, "0")
+            )
+            .join("");
+
+        // Parse with the currently deployed parser.
+        const canonEv =
+          parseGmailIntelligence(
+            subject || "",
+            body,
+            from,
+            internal_date
+          );
+
+        const normalizedRef =
+          String(
+            canonEv.transaction_reference ||
+              ""
+          ).trim();
+
+        const normalizedMerchant =
+          String(
+            canonEv.merchant_normalized ||
+              ""
+          ).trim();
+
+        if (
+          canonEv.event_kind !==
+            "MERCHANT_PAYMENT" ||
+          canonEv.financial_class !==
+            "Expense" ||
+          canonEv.financial_direction !==
+            "Debit" ||
+          canonEv.evidence_role !==
+            "PRIMARY_PAYMENT" ||
+          !Number.isFinite(
+            Number(canonEv.amount)
+          ) ||
+          Number(canonEv.amount) <= 0 ||
+          !normalizedRef ||
+          normalizedRef.toLowerCase() ===
+            "erensi" ||
+          canonEv.event_id === badEventId ||
+          !normalizedMerchant ||
+          normalizedMerchant.toLowerCase() ===
+            "qris merchant"
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_PARSE_REJECTED",
+              message:
+                "Email tidak menghasilkan canonical QRIS yang aman untuk repair.",
+            }),
+            {
+              status: 422,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        const evidenceLookup =
+          await env.DB.prepare(
+            `SELECT
+               e.id AS evidence_id,
+               e.raw_event_id,
+               e.candidate_id,
+               r.payload_hash,
+               c.id AS current_canonical_id,
+               c.event_id AS current_event_id,
+               ic.amount AS candidate_amount
+             FROM raw_events r
+             JOIN canonical_event_evidence e
+               ON e.raw_event_id = r.id
+             JOIN canonical_financial_events c
+               ON c.id = e.canonical_event_id
+             LEFT JOIN ingestion_candidates ic
+               ON ic.id = e.candidate_id
+             WHERE r.source = 'gmail'
+               AND r.external_id = ?
+             ORDER BY e.id
+             LIMIT 2`
+          )
+          .bind(message_id)
+          .all<{
+            evidence_id: number;
+            raw_event_id: number;
+            candidate_id: number | null;
+            payload_hash: string;
+            current_canonical_id: number;
+            current_event_id: string;
+            candidate_amount:
+              number | null;
+          }>();
+
+        const evidenceRows =
+          evidenceLookup.results || [];
+
+        if (evidenceRows.length !== 1) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_EVIDENCE_MULTIPLICITY",
+              message:
+                "Target repair harus memiliki tepat satu evidence row.",
+            }),
+            {
+              status:
+                evidenceRows.length === 0
+                  ? 404
+                  : 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        const current =
+          evidenceRows[0];
+
+        if (
+          !current.candidate_id ||
+          current.candidate_amount ===
+            null ||
+          !Number.isFinite(
+            Number(
+              current.candidate_amount
+            )
+          )
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_CANDIDATE_MISSING",
+              message:
+                "Candidate evidence tidak lengkap.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        if (
+          String(
+            current.payload_hash || ""
+          ).toLowerCase() !==
+          replayedPayloadHash.toLowerCase()
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_PAYLOAD_HASH_MISMATCH",
+              message:
+                "Payload Gmail replay tidak identik dengan evidence asli.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        if (
+          Math.abs(
+            Number(
+              current.candidate_amount
+            ) -
+              Number(canonEv.amount)
+          ) >= 0.005
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_AMOUNT_MISMATCH",
+              message:
+                "Nominal hasil reparse berbeda dari candidate asli.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        // Idempotent retry after a previously successful repair.
+        if (
+          current.current_event_id !==
+          badEventId
+        ) {
+          if (
+            current.current_event_id ===
+            canonEv.event_id
+          ) {
+            return new Response(
+              JSON.stringify({
+                status: "success",
+                action: "repair",
+                repaired: false,
+                already_repaired: true,
+                raw_event_id:
+                  current.raw_event_id,
+                candidate_id:
+                  current.candidate_id,
+                canonical_event_id:
+                  current.current_canonical_id,
+              }),
+              {
+                status: 200,
+                headers:
+                  getSecurityHeaders(),
+              }
+            );
+          }
+
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_TARGET_MOVED_ELSEWHERE",
+              message:
+                "Evidence sudah tidak berada pada canonical target repair.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        type RepairCanonicalRow = {
+          id: number;
+          event_id: string;
+          event_kind: string;
+          financial_class: string;
+          financial_direction: string;
+          amount: number;
+          merchant_normalized:
+            string | null;
+        };
+
+        const referenceLookup =
+          await env.DB.prepare(
+            `SELECT
+               id,
+               event_id,
+               event_kind,
+               financial_class,
+               financial_direction,
+               amount,
+               merchant_normalized
+             FROM canonical_financial_events
+             WHERE transaction_reference = ?
+             ORDER BY id
+             LIMIT 2`
+          )
+          .bind(
+            canonEv.transaction_reference
+          )
+          .all<RepairCanonicalRow>();
+
+        const referenceRows =
+          referenceLookup.results || [];
+
+        if (referenceRows.length > 1) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_REFERENCE_MULTIPLICITY",
+              message:
+                "Transaction reference dimiliki lebih dari satu canonical.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        const byReference =
+          referenceRows.length === 1
+            ? referenceRows[0]
+            : null;
+        const byEventId =
+          await env.DB.prepare(
+            `SELECT
+               id,
+               event_id,
+               event_kind,
+               financial_class,
+               financial_direction,
+               amount,
+               merchant_normalized
+             FROM canonical_financial_events
+             WHERE event_id = ?
+             LIMIT 1`
+          )
+          .bind(canonEv.event_id)
+          .first<RepairCanonicalRow>();
+
+        if (
+          byReference &&
+          byReference.event_id !==
+            canonEv.event_id
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_REFERENCE_CONFLICT",
+              message:
+                "Reference sudah dimiliki canonical lain.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        if (
+          byReference &&
+          byEventId &&
+          byReference.id !==
+            byEventId.id
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_CANONICAL_AMBIGUOUS",
+              message:
+                "Reference dan event ID menunjuk canonical berbeda.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        const existingTarget =
+          byEventId || byReference;
+
+        if (existingTarget) {
+          const existingMerchant =
+            String(
+              existingTarget
+                .merchant_normalized ||
+                ""
+            )
+              .trim()
+              .toLowerCase();
+
+          // Do not silently reuse an incomplete historical
+          // placeholder canonical during repair.
+          if (
+            !existingMerchant ||
+            existingMerchant ===
+              "qris merchant"
+          ) {
+            return new Response(
+              JSON.stringify({
+                status: "error",
+                code:
+                  "BCA_QRIS_REPAIR_EXISTING_CANONICAL_INCOMPLETE",
+                message:
+                  "Canonical target yang sudah ada belum memiliki merchant yang cukup kuat.",
+              }),
+              {
+                status: 409,
+                headers:
+                  getSecurityHeaders(),
+              }
+            );
+          }
+
+          if (
+            !isCanonicalCorrelationCompatible(
+              canonEv,
+              existingTarget
+            )
+          ) {
+            return new Response(
+              JSON.stringify({
+                status: "error",
+                code:
+                  "BCA_QRIS_REPAIR_CANONICAL_CONFLICT",
+                message:
+                  "Canonical existing tidak kompatibel dengan evidence repair.",
+              }),
+              {
+                status: 409,
+                headers:
+                  getSecurityHeaders(),
+              }
+            );
+          }
+
+          await env.DB.prepare(
+            `UPDATE canonical_event_evidence
+             SET canonical_event_id = ?
+             WHERE id = ?
+               AND canonical_event_id = ?
+               AND raw_event_id = ?
+               AND candidate_id = ?`
+          )
+          .bind(
+            existingTarget.id,
+            current.evidence_id,
+            current.current_canonical_id,
+            current.raw_event_id,
+            current.candidate_id
+          )
+          .run();
+        } else {
+          const canonicalInsert =
+            env.DB.prepare(
+              `INSERT INTO canonical_financial_events
+               (event_id, occurred_at_wib, status, event_kind, financial_class, financial_direction,
+                amount, currency, fee_amount, source_account_alias, destination_account_alias,
+                destination_owner_type, merchant_normalized, merchant_pan, merchant_location,
+                counterparty_normalized, description_normalized, transaction_reference,
+                external_order_id, confidence, recommended_action, review_reason)
+               SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+               WHERE EXISTS (
+                 SELECT 1
+                 FROM canonical_event_evidence
+                 WHERE id = ?
+                   AND canonical_event_id = ?
+                   AND raw_event_id = ?
+                   AND candidate_id = ?
+               )`
+            )
+            .bind(
+              canonEv.event_id,
+              canonEv.occurred_at_wib,
+              canonEv.status,
+              canonEv.event_kind,
+              canonEv.financial_class,
+              canonEv.financial_direction,
+              canonEv.amount,
+              canonEv.currency,
+              canonEv.fee_amount,
+              canonEv.source_account_alias,
+              canonEv.destination_account_alias,
+              canonEv.destination_owner_type,
+              canonEv.merchant_normalized,
+              canonEv.merchant_pan,
+              canonEv.merchant_location,
+              canonEv.counterparty_normalized,
+              canonEv.description_normalized,
+              canonEv.transaction_reference,
+              canonEv.external_order_id,
+              canonEv.confidence,
+              canonEv.recommended_action,
+              canonEv.review_reason,
+              current.evidence_id,
+              current.current_canonical_id,
+              current.raw_event_id,
+              current.candidate_id
+            );
+
+          const moveEvidence =
+            env.DB.prepare(
+              `UPDATE canonical_event_evidence
+               SET canonical_event_id = (
+                 SELECT id
+                 FROM canonical_financial_events
+                 WHERE event_id = ?
+                 LIMIT 1
+               )
+               WHERE id = ?
+                 AND canonical_event_id = ?
+                 AND raw_event_id = ?
+                 AND candidate_id = ?`
+            )
+            .bind(
+              canonEv.event_id,
+              current.evidence_id,
+              current.current_canonical_id,
+              current.raw_event_id,
+              current.candidate_id
+            );
+
+          // Same atomic-batch model already used by normal
+          // canonical ingestion.
+          await env.DB.batch([
+            canonicalInsert,
+            moveEvidence,
+          ]);
+        }
+
+        // D1 mutation metadata is not authoritative.
+        // Verify the post-repair state directly.
+        const postRepair =
+          await env.DB.prepare(
+            `SELECT
+               c.id AS canonical_event_id,
+               c.event_id,
+               e.raw_event_id,
+               e.candidate_id
+             FROM canonical_event_evidence e
+             JOIN canonical_financial_events c
+               ON c.id = e.canonical_event_id
+             WHERE e.id = ?
+             LIMIT 1`
+          )
+          .bind(current.evidence_id)
+          .first<{
+            canonical_event_id: number;
+            event_id: string;
+            raw_event_id: number;
+            candidate_id:
+              number | null;
+          }>();
+
+        if (
+          !postRepair ||
+          postRepair.event_id !==
+            canonEv.event_id ||
+          postRepair.raw_event_id !==
+            current.raw_event_id ||
+          postRepair.candidate_id !==
+            current.candidate_id
+        ) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_POSTCHECK_FAILED",
+              message:
+                "Post-repair evidence state tidak sesuai kontrak.",
+            }),
+            {
+              status: 500,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        const remainingRow =
+          await env.DB.prepare(
+            `SELECT
+               COUNT(*) AS remaining
+             FROM canonical_event_evidence e
+             JOIN canonical_financial_events c
+               ON c.id = e.canonical_event_id
+             WHERE c.event_id = ?`
+          )
+          .bind(badEventId)
+          .first<{
+            remaining: number;
+          }>();
+
+        return new Response(
+          JSON.stringify({
+            status: "success",
+            action: "repair",
+            repaired: true,
+            already_repaired: false,
+            raw_event_id:
+              current.raw_event_id,
+            candidate_id:
+              current.candidate_id,
+            canonical_event_id:
+              postRepair.canonical_event_id,
+            remaining:
+              Number(
+                remainingRow?.remaining || 0
+              ),
+          }),
+          {
+            status: 200,
+            headers: getSecurityHeaders(),
+          }
+        );
+      } catch (repairError: any) {
+        console.error(
+          "BCA_QRIS_TARGETED_REPAIR_FAILURE"
+        );
+
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            code:
+              "BCA_QRIS_REPAIR_INTERNAL_ERROR",
+            message:
+              "Targeted BCA QRIS repair gagal secara fail-closed.",
+          }),
+          {
+            status: 500,
+            headers: getSecurityHeaders(),
+          }
+        );
+      }
+    }
     // =================================================================
     // 3. TELEGRAM BOT WEBHOOK (X-Telegram-Bot-Api-Secret-Token, Zero Ledger Mutation)
     // =================================================================

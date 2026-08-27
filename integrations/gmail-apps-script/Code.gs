@@ -1119,3 +1119,482 @@ function compareYearMonth(a, b) {
   if (a.year !== b.year) return a.year - b.year;
   return a.month - b.month;
 }
+/**
+ * =====================================================================
+ * TARGETED BCA QRIS COLLAPSED-CANONICAL REPAIR
+ *
+ * Manual recovery only.
+ *
+ * D1 is the checkpoint:
+ * - Worker returns only Gmail message IDs whose evidence is still
+ *   attached to bca_qris_erensi.
+ * - successful repair moves that evidence away;
+ * - therefore repaired messages disappear automatically from "next".
+ *
+ * This does NOT use or modify historical backfill checkpoint/offset.
+ * =====================================================================
+ */
+
+function repairBcaQrisCanary() {
+  return runBcaQrisTargetedRepair_(1);
+}
+
+
+function repairBcaQrisCollapsedCanonical() {
+  return runBcaQrisTargetedRepair_(null);
+}
+
+
+function runBcaQrisTargetedRepair_(maxItems) {
+  const props =
+    PropertiesService.getScriptProperties();
+
+  const workerUrl =
+    props.getProperty("WORKER_URL");
+
+  const relaySecret =
+    props.getProperty(
+      "GMAIL_RELAY_SECRET"
+    );
+
+  if (!workerUrl || !relaySecret) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_CONFIG_MISSING"
+    );
+  }
+
+  const lock =
+    LockService.getScriptLock();
+
+  if (!lock.tryLock(1000)) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_ALREADY_RUNNING"
+    );
+  }
+
+  const startedAt = Date.now();
+
+  // Leave enough room before Apps Script hard timeout.
+  const MAX_RUNTIME_MS =
+    3.5 * 60 * 1000;
+
+  let repairedThisRun = 0;
+
+  try {
+    assertBcaQrisRepairWorkerReady_(
+      workerUrl
+    );
+
+    while (true) {
+      if (
+        Date.now() - startedAt >=
+        MAX_RUNTIME_MS
+      ) {
+        console.log(
+          "BCA_QRIS_REPAIR_RUNTIME_PAUSE" +
+          " | repaired_this_run=" +
+          repairedThisRun
+        );
+
+        return {
+          status: "paused",
+          repaired: repairedThisRun,
+        };
+      }
+
+      if (
+        maxItems !== null &&
+        repairedThisRun >= maxItems
+      ) {
+        console.log(
+          "BCA_QRIS_REPAIR_CANARY_PASS" +
+          " | repaired=" +
+          repairedThisRun
+        );
+
+        return {
+          status: "canary_pass",
+          repaired: repairedThisRun,
+        };
+      }
+
+      const batchLimit =
+        maxItems !== null
+          ? 1
+          : 10;
+
+      const next =
+        postBcaQrisRepair_(
+          workerUrl,
+          relaySecret,
+          {
+            action: "next",
+            limit: batchLimit,
+          }
+        );
+
+      const remaining =
+        Number(next.remaining || 0);
+
+      const messageIds =
+        Array.isArray(
+          next.message_ids
+        )
+          ? next.message_ids
+          : [];
+
+      if (remaining === 0) {
+        console.log(
+          "BCA_QRIS_REPAIR_COMPLETED" +
+          " | repaired_this_run=" +
+          repairedThisRun +
+          " | remaining=0"
+        );
+
+        return {
+          status: "completed",
+          repaired:
+            repairedThisRun,
+          remaining: 0,
+        };
+      }
+
+      if (messageIds.length === 0) {
+        throw new Error(
+          "BCA_QRIS_REPAIR_EMPTY_TARGET_PAGE"
+        );
+      }
+
+      for (
+        let i = 0;
+        i < messageIds.length;
+        i++
+      ) {
+        if (
+          maxItems !== null &&
+          repairedThisRun >= maxItems
+        ) {
+          break;
+        }
+
+        if (
+          Date.now() - startedAt >=
+          MAX_RUNTIME_MS
+        ) {
+          break;
+        }
+
+        let msg;
+
+        try {
+          msg =
+            GmailApp.getMessageById(
+              messageIds[i]
+            );
+        } catch (gmailError) {
+          throw new Error(
+            "BCA_QRIS_REPAIR_GMAIL_MESSAGE_UNAVAILABLE"
+          );
+        }
+
+        if (!msg) {
+          throw new Error(
+            "BCA_QRIS_REPAIR_GMAIL_MESSAGE_UNAVAILABLE"
+          );
+        }
+
+        const fromHeader =
+          msg.getFrom();
+
+        if (
+          extractCleanEmail(
+            fromHeader
+          ) !== "bca@bca.co.id"
+        ) {
+          throw new Error(
+            "BCA_QRIS_REPAIR_GMAIL_SENDER_MISMATCH"
+          );
+        }
+
+        const messageDate =
+          msg.getDate();
+
+        const repairResult =
+          postBcaQrisRepair_(
+            workerUrl,
+            relaySecret,
+            {
+              action: "repair",
+              message_id:
+                msg.getId(),
+              from:
+                fromHeader,
+              subject:
+                msg.getSubject(),
+              body:
+                msg
+                  .getPlainBody()
+                  .substring(
+                    0,
+                    2000
+                  ),
+              internal_date:
+                messageDate.toISOString(),
+            }
+          );
+
+        if (
+          !repairResult ||
+          (
+            repairResult.repaired !==
+              true &&
+            repairResult
+              .already_repaired !==
+              true
+          )
+        ) {
+          throw new Error(
+            "BCA_QRIS_REPAIR_INVALID_SUCCESS_RESPONSE"
+          );
+        }
+
+        repairedThisRun++;
+
+        if (maxItems !== null) {
+          const remainingAfter =
+            repairResult.remaining !==
+            undefined
+              ? Number(
+                  repairResult.remaining
+                )
+              : Math.max(
+                  remaining - 1,
+                  0
+                );
+
+          console.log(
+            "BCA_QRIS_REPAIR_CANARY_PASS" +
+            " | repaired=1" +
+            " | remaining_after=" +
+            remainingAfter
+          );
+
+          return {
+            status: "canary_pass",
+            repaired: 1,
+            remaining:
+              remainingAfter,
+          };
+        }
+      }
+    }
+  } catch (e) {
+    const rawMessage =
+      String(
+        e && e.message
+          ? e.message
+          : e || ""
+      );
+
+    const codeMatch =
+      rawMessage.match(
+        /BCA_QRIS_REPAIR_[A-Z0-9_]+/
+      );
+
+    const safeCode =
+      codeMatch
+        ? codeMatch[0]
+        : "BCA_QRIS_REPAIR_UNEXPECTED_EXCEPTION";
+
+    console.error(
+      "BCA_QRIS_REPAIR_STOP" +
+      " | code=" +
+      safeCode
+    );
+
+    throw new Error(safeCode);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+function assertBcaQrisRepairWorkerReady_(
+  workerUrl
+) {
+  let response;
+
+  try {
+    response =
+      UrlFetchApp.fetch(
+        workerUrl.replace(
+          /\/+$/,
+          ""
+        ) + "/health",
+        {
+          method: "get",
+          muteHttpExceptions:
+            true,
+        }
+      );
+  } catch (healthError) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_HEALTH_FETCH_FAILED"
+    );
+  }
+
+  if (
+    response.getResponseCode() !==
+    200
+  ) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_HEALTH_HTTP_FAILED"
+    );
+  }
+
+  let health;
+
+  try {
+    health =
+      JSON.parse(
+        response.getContentText()
+      );
+  } catch (parseError) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_HEALTH_INVALID_JSON"
+    );
+  }
+
+  if (
+    !health ||
+    health.status !== "ok" ||
+    String(
+      health.mode || ""
+    ).toLowerCase() !==
+      "shadow" ||
+    Number(
+      health.schema_version
+    ) < 7
+  ) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_HEALTH_CONTRACT_FAILED"
+    );
+  }
+}
+
+
+function postBcaQrisRepair_(
+  workerUrl,
+  relaySecret,
+  payload
+) {
+  const rawBody =
+    JSON.stringify(payload);
+
+  const timestamp =
+    Date.now().toString();
+
+  const nonce =
+    Utilities.getUuid();
+
+  const toSign =
+    timestamp +
+    "." +
+    nonce +
+    "." +
+    rawBody;
+
+  const signatureBytes =
+    Utilities.computeHmacSha256Signature(
+      toSign,
+      relaySecret,
+      Utilities.Charset.UTF_8
+    );
+
+  const signature =
+    signatureBytes
+      .map(function(byte) {
+        return (
+          "0" +
+          (
+            byte & 0xFF
+          ).toString(16)
+        ).slice(-2);
+      })
+      .join("");
+
+  let response;
+
+  try {
+    response =
+      UrlFetchApp.fetch(
+        workerUrl.replace(
+          /\/+$/,
+          ""
+        ) +
+          "/api/repair/bca-qris",
+        {
+          method: "post",
+          contentType:
+            "application/json",
+          payload: rawBody,
+          headers: {
+            "X-Signature":
+              signature,
+            "X-Timestamp":
+              timestamp,
+            "X-Nonce":
+              nonce,
+          },
+          muteHttpExceptions:
+            true,
+        }
+      );
+  } catch (fetchError) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_FETCH_EXCEPTION"
+    );
+  }
+
+  const httpCode =
+    response.getResponseCode();
+
+  let parsed;
+
+  try {
+    parsed =
+      JSON.parse(
+        response.getContentText()
+      );
+  } catch (parseError) {
+    throw new Error(
+      "BCA_QRIS_REPAIR_INVALID_WORKER_JSON"
+    );
+  }
+
+  if (
+    httpCode !== 200 ||
+    !parsed ||
+    parsed.status !== "success"
+  ) {
+    const workerCode =
+      String(
+        parsed &&
+        parsed.code
+          ? parsed.code
+          : "UNKNOWN"
+      )
+        .toUpperCase()
+        .replace(
+          /[^A-Z0-9_]/g,
+          "_"
+        );
+
+    throw new Error(
+      "BCA_QRIS_REPAIR_WORKER_" +
+      workerCode
+    );
+  }
+
+  return parsed;
+}
