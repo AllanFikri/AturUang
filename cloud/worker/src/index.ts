@@ -19,6 +19,7 @@ import {
   reconstructBalance,
   getInsightsSummary,
   parseGmailIntelligence,
+  isCanonicalCorrelationCompatible,
   parseTelegramText,
   evaluateAutoApproval,
 } from "./domain";
@@ -288,6 +289,42 @@ export default {
             ).bind(canonEv.event_id).first<{ id: number }>();
           }
 
+          if (existingCanon) {
+            canonicalStage = "load_existing_canonical_for_guard";
+
+            const existingCanonDetails = await env.DB.prepare(
+              `SELECT
+                 event_kind,
+                 financial_class,
+                 financial_direction,
+                 amount,
+                 merchant_normalized
+               FROM canonical_financial_events
+               WHERE id = ?
+               LIMIT 1`
+            ).bind(existingCanon.id).first<{
+              event_kind: string;
+              financial_class: string;
+              financial_direction: string;
+              amount: number;
+              merchant_normalized: string | null;
+            }>();
+
+            if (!existingCanonDetails) {
+              canonicalStage = "reject_missing_existing_canonical";
+              throw new Error("CANONICAL_CORRELATION_TARGET_MISSING");
+            }
+
+            if (
+              !isCanonicalCorrelationCompatible(
+                canonEv,
+                existingCanonDetails
+              )
+            ) {
+              canonicalStage = "reject_incompatible_existing_canonical";
+              throw new Error("CANONICAL_CORRELATION_CONFLICT");
+            }
+          }
           if (existingCanon) {
             canonDbId = existingCanon.id;
             canonicalStage = "insert_existing_evidence";

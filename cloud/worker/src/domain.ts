@@ -601,6 +601,65 @@ export interface CanonicalFinancialEvent {
   candidate?: ParsedCandidate | null;
 }
 
+export function isCanonicalCorrelationCompatible(
+  incoming: CanonicalFinancialEvent,
+  existing: {
+    event_kind: string;
+    financial_class: string;
+    financial_direction: string;
+    amount: number;
+    merchant_normalized?: string | null;
+  }
+): boolean {
+  // Secondary/lifecycle evidence may legitimately enrich an existing
+  // canonical event. The strict economic-signature guard applies to
+  // independent primary payment evidence.
+  if (incoming.evidence_role !== "PRIMARY_PAYMENT") {
+    return true;
+  }
+
+  if (
+    incoming.event_kind !== existing.event_kind ||
+    incoming.financial_class !== existing.financial_class ||
+    incoming.financial_direction !== existing.financial_direction
+  ) {
+    return false;
+  }
+
+  const incomingAmount = Number(incoming.amount);
+  const existingAmount = Number(existing.amount);
+
+  if (
+    !Number.isFinite(incomingAmount) ||
+    !Number.isFinite(existingAmount) ||
+    Math.abs(round2(incomingAmount) - round2(existingAmount)) >= 0.005
+  ) {
+    return false;
+  }
+
+  const normalizeMerchant = (value?: string | null): string => {
+    const normalized = (value || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+
+    // Generic parser placeholder is not strong enough to reject correlation.
+    return normalized === "qris merchant" ? "" : normalized;
+  };
+
+  const incomingMerchant = normalizeMerchant(incoming.merchant_normalized);
+  const existingMerchant = normalizeMerchant(existing.merchant_normalized);
+
+  if (
+    incomingMerchant &&
+    existingMerchant &&
+    incomingMerchant !== existingMerchant
+  ) {
+    return false;
+  }
+
+  return true;
+}
 export function parseIndonesianAmount(text: string): number | null {
   if (!text) return null;
 
@@ -938,7 +997,7 @@ export function parseGmailIntelligence(
       const pan = panMatch ? panMatch[1].trim() : null;
       const locMatch = bodyText.match(/(?:lokasi|kota)\s*[:]?\s*([a-zA-Z0-9\s]+)/i);
       const location = locMatch ? locMatch[1].trim() : null;
-      const refMatch = bodyText.match(/(?:no\.?\s*referensi|ref(?:erence)?)\s*[:]?\s*([a-zA-Z0-9]+)/i);
+      const refMatch = bodyText.match(/(?:(?:no\.?\s*)?referensi|reference|ref)\b\s*:?\s*([a-zA-Z0-9][a-zA-Z0-9._-]*)/i);
       const refId = refMatch ? refMatch[1] : null;
 
       const category = inferMerchantCategory(merchantName, bodyText);
