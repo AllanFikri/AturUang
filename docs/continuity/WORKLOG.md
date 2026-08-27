@@ -789,3 +789,103 @@ Parallel Pattern work reported separately:
 - not production-wired
 
 Do not merge Pattern as part of this historical-backfill closure.
+
+## BCA collapsed-canonical incident closure - 27 Aug 2026
+
+A canonical-integrity audit after historical Gmail verification found that
+many distinct BCA events had previously collapsed into one incorrect canonical
+event:
+
+- bad event_id: bca_qris_erensi
+- root cause: the old BCA reference extractor could parse the label
+  "Referensi" as the value "erensi";
+- the same malformed reference could therefore correlate unrelated events into
+  one canonical container.
+
+Exact inventory of the affected family established two original parser
+families only:
+
+- MERCHANT_PAYMENT
+- CASH_WITHDRAWAL
+
+Parser and targeted-repair hardening was implemented incrementally, including:
+
+- strict multiline BCA reference extraction;
+- removal of the vulnerable generic reference pattern from Cardless parsing;
+- strict compatibility checks between original minimal-payload family and
+  reparsed family;
+- amount, reference, candidate, applied-state, and evidence guards;
+- fail-closed behavior for incompatible repair targets;
+- bounded Apps Script auto-repair continuation with completion/failure email.
+
+Relevant implementation commits include:
+
+- ec8171b1f0c2f3f043b460223805c6baff5936b8
+- b6d4e650263ca22d41e32be08fcf9793c71d021a
+- c511d280cb0066ebb98849f6c2e497e0dafd6ece
+- 7148fb7b5374a238345674b486cd5e4accf22269
+- 1e757e1a3455b100354edd5edbd0ecb3e55aff8e
+- 7b0ad0687fae6742e394d430801d006ca88b70f3
+
+Final repair execution completed with:
+
+- repaired_total: 1080 after the earlier canary repair;
+- remaining: 0;
+- original repair manifest rows verified: 1081 / 1081.
+
+Final canonical-integrity audit:
+
+- raw_events: 2078
+- ingestion_candidates: 1753
+- canonical_event_evidence: 2075
+- target rows found: 1081 / 1081
+- raw_event_id coverage: 1081 / 1081
+- candidate_id preserved: PASS
+- evidence_id direct manifest match: PASS
+- original MERCHANT_PAYMENT family: 1054
+- original CASH_WITHDRAWAL family: 27
+- final MERCHANT_PAYMENT: 1045
+- final FAILED_ATTEMPT / Ignore: 9
+- final CASH_WITHDRAWAL: 27
+- semantic mismatches: 0
+- amount mismatches: 0
+- canonical multi-amount collisions: 0
+- mixed-family collisions: 0
+- reference-to-multiple-target-canonical collisions: 0
+- repaired target reference "erensi": 0
+- applied candidate mutations: 0
+- orphans: 0
+
+The now-empty bad canonical container was then deleted with an exact guarded
+delete only after evidence count was proven zero.
+
+Authoritative post-cleanup D1 state:
+
+- raw_events: 2078
+- ingestion_candidates: 1753
+- canonical_event_evidence: 2075
+- canonical_financial_events: 2066
+- bca_qris_erensi rows: 0
+- empty canonicals: 0
+- orphans: 0
+
+Production SQLite remained unchanged:
+
+- SHA-256:
+  2b537bbcaa6a22bbd7018630b84152a319ce352624b97f5ace41563c1561945f
+
+Worker remained healthy:
+
+- status: ok
+- MODE: shadow
+- schema: 7
+
+Formal closure:
+
+BCA COLLAPSED-CANONICAL INCIDENT = CLEANED
+
+CANONICAL INTEGRITY = PASS
+
+Pattern Analysis may now resume, but still requires real-data false-positive
+audit, calibration/holdout validation, and release-readiness checks before
+merge or deployment.

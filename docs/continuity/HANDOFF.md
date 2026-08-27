@@ -314,3 +314,100 @@ Separate unresolved work is intentionally outside this gate:
 - Pattern calibration and holdout validation;
 - Pattern release readiness;
 - future production cutover.
+
+## Superseding verified state - 27 Aug 2026 canonical closure
+
+This section supersedes older Git/deployment/canonical-integrity state above
+where they conflict.
+
+Current main implementation HEAD before this continuity-only commit:
+
+7b0ad0687fae6742e394d430801d006ca88b70f3
+
+Latest relevant implementation:
+
+fix(gmail): support collapsed BCA cardless repair
+
+BCA collapsed-canonical recovery is complete.
+
+Final D1 state after guarded cleanup:
+
+- raw_events: 2078
+- ingestion_candidates: 1753
+- canonical_event_evidence: 2075
+- canonical_financial_events: 2066
+- empty canonical events: 0
+- canonical/evidence orphans: 0
+- bca_qris_erensi: removed after exact evidence=0 proof
+
+Final repaired-target verification:
+
+- original target rows: 1081
+- exact target rows found: 1081
+- raw IDs preserved
+- candidate IDs preserved
+- evidence IDs directly matched original manifest
+- amount mismatches: 0
+- semantic mismatches: 0
+- canonical multi-amount collisions: 0
+- mixed-family collisions: 0
+- reference collisions across repaired canonical targets: 0
+- bad "erensi" references among repaired targets: 0
+- applied candidate mutations: 0
+
+Original affected parser-family totals:
+
+- MERCHANT_PAYMENT: 1054
+- CASH_WITHDRAWAL: 27
+
+Final repaired semantic totals:
+
+- MERCHANT_PAYMENT: 1045
+- FAILED_ATTEMPT / Ignore: 9
+- CASH_WITHDRAWAL: 27
+- EXTERNAL_TRANSFER / Pending Review: 0
+
+Production SQLite remains authoritative and unchanged.
+
+Verified SHA-256:
+
+2b537bbcaa6a22bbd7018630b84152a319ce352624b97f5ace41563c1561945f
+
+Worker remains:
+
+- aturuang-api
+- MODE=shadow
+- schema=7
+- health=ok
+
+Formal gates:
+
+HISTORY VERIFIED = YES
+
+CANONICAL INTEGRITY = PASS
+
+BCA COLLAPSED-CANONICAL INCIDENT = CLOSED
+
+Immediate next phase:
+
+Resume Pattern Analysis v1 from its separate local worktree.
+
+Pattern remains:
+
+- not merged into main;
+- not production-wired;
+- not deployed;
+- not yet calibrated against the repaired canonical history.
+
+Before any Pattern merge/deployment:
+
+1. verify Pattern worktree/branch/HEAD;
+2. compare it against current main;
+3. audit eligibility against repaired real canonical data;
+4. perform false-positive review;
+5. keep calibration and holdout separate;
+6. run release-readiness tests;
+7. only then decide whether to merge.
+
+Do not start Prompt 14 cutover merely because canonical integrity passed.
+D1 remains shadow and SQLite remains the financial source of truth.
