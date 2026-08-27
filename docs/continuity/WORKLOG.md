@@ -715,3 +715,77 @@ Validation:
 
 Apps Script source must be manually synchronized before the next
 historical backfill execution.
+
+## Final historical Gmail verification - 27 Aug 2026
+
+Historical Backfill V2 completed through 2026-07 and advanced the
+authoritative checkpoint to 2026-08.
+
+Final read-only verification:
+- historical range: 2025-01-01 through 2026-07-31
+- Gmail raw: 2038
+- Gmail canonical evidence: 2038
+- Gmail candidates: 1720
+- distinct historical canonical events: 964
+- raw without evidence: 0
+- evidence without raw: 0
+- evidence without canonical: 0
+- canonical without evidence: 0
+- candidate orphans: 0
+- unresolved Gmail Pending/Error raw events: 0
+- duplicate raw external IDs: 0
+- duplicate canonical event IDs: 0
+- duplicate canonical/raw evidence pairs: 0
+- non-positive ingestion candidates: 0
+- source_sync_state gmail: OK with no error code
+- privacy invalid JSON: 0
+- persisted body/subject/message-id/from fields: 0
+- maximum minimal payload length: 138
+- unexpected sender count: 0
+- every month Jan 2025 through Jul 2026 contains evidence
+
+A preliminary audit incorrectly failed all non-Ignore zero-amount canonical
+events. That gate was corrected against the actual schema contract:
+ingestion candidates require amount > 0, while canonical events allow
+amount >= 0 because review/evidence/lifecycle facts may legitimately carry
+zero until or unless an economic amount is established.
+
+Historical zero canonical rows were confined to:
+- 38 Pending Review transfer/incoming-transfer events
+- 36 INVOICE_EVIDENCE events
+- 140 NON_TRANSACTION / Ignore events
+
+All classified economic movement categories had zero_count=0.
+
+Production SQLite remained unchanged:
+- transactions: 1150
+- SHA-256:
+  2b537bbcaa6a22bbd7018630b84152a319ce352624b97f5ace41563c1561945f
+
+Final cloud verification:
+- Worker health: ok
+- MODE: shadow
+- D1 schema: 7
+- deployed version evidence:
+  8dd6465b-0432-4414-8626-7b335be9f101
+
+Final Git audit before this docs update:
+- main: 88d6015
+- origin/main: 88d6015
+- working tree: clean
+
+Formal decision:
+HISTORY VERIFIED = YES for historical Gmail ingestion through 31 Jul 2026.
+
+This does not certify August 2026 current-month coverage, Pattern
+false-positive performance, or Pattern calibration.
+
+Parallel Pattern work reported separately:
+- worktree: AturUang-pattern-v1
+- branch: feature/pattern-analysis-v1
+- HEAD: 11fc5043746d54f3ac31fffbdeef6eed47ebeabf
+- not merged
+- not deployed
+- not production-wired
+
+Do not merge Pattern as part of this historical-backfill closure.

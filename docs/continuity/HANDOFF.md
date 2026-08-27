@@ -1,6 +1,6 @@
 # AturUang Current Handoff
 
-Last updated: 2026-08-26
+Last updated: 2026-08-27
 
 Read this file first when continuing the project in another ChatGPT/GPT
 conversation.
@@ -47,18 +47,29 @@ explicit project-level decision.
 
 ## Current Git state
 
-Current implementation HEAD:
-05dadec
+Implementation HEAD before final-history docs update:
+88d6015
 
-Recent commits:
-- 841fc63 chore(gmail): prepare controlled february backfill
-- 1c8aacb fix(gmail): sign relay HMAC with explicit utf-8
-- c2d1055 chore(gmail): add controlled january backfill runner
-- ecc570a fix(gmail): make canonical ingestion retry-safe
-- 6ceb120 migration 0007 metadata/source repair
+Remote main at final historical audit:
+88d6015
 
-Working tree at the post-February audit:
+Working tree at final historical audit:
 clean
+
+Relevant latest implementation commits:
+- 88d6015 chore(gmail): expose canonical failure stage
+- 8489d75 fix(gmail): add canonical correlation fallbacks
+- 1c0e9c2 docs(project): record backfill observability
+- ced919f feat(gmail): add lightweight backfill progress logs
+- ecc570a fix(gmail): make canonical ingestion retry-safe
+
+Pattern Analysis is intentionally separate:
+- worktree: C:\A User Main Storage\Documents\GitHub\AturUang-pattern-v1
+- branch: feature/pattern-analysis-v1
+- reported HEAD: 11fc5043746d54f3ac31fffbdeef6eed47ebeabf
+- not merged to main
+- not deployed
+- not production-wired
 
 ## Current cloud state
 
@@ -68,8 +79,8 @@ aturuang-api
 Worker URL:
 https://aturuang-api.allanfikrimahardika.workers.dev
 
-Known deployed Worker version:
-6c04bb23-6572-47b1-9a2d-e91f00e3c788
+Last verified deployed Worker version:
+8dd6465b-0432-4414-8626-7b335be9f101
 
 MODE:
 shadow
@@ -80,9 +91,15 @@ aturuang-db
 D1 schema:
 7
 
+Final health verification:
+- status: ok
+- mode: shadow
+- schema_version: 7
+
 Important:
-D1 is still shadow/intelligence storage.
-It is not yet the production financial source of truth.
+D1 remains shadow/intelligence storage.
+It is not the production financial source of truth.
+No financial-authority cutover has occurred.
 
 ## Current financial source of truth
 
@@ -101,41 +118,79 @@ Do not mutate production SQLite from tests or Gmail historical ingestion.
 
 ## Post-February D1 state
 
-Exact read-only audit after February 2025:
+This section is superseded by the final historical verification below.
 
-- gmail_raw_total: 215
-- gmail_candidates_total: 179
-- gmail_evidence_total: 215
-- canonical_events_total: 119
-- gmail_raw_orphans: 0
-- candidate_orphans: 0
-- canonical_orphans: 0
-- nonpositive_candidates: 0
-- gmail_error_state: 0
-- raw_privacy_leaks: 0
-- ledger_transactions: 1150
-- schema_version: 7
-- audit rows written: 0
-- D1 size: 1,052,672 bytes
+Final verified historical range:
+2025-01-01 through 2026-07-31
+
+Final historical totals:
+- Gmail raw: 2038
+- Gmail evidence: 2038
+- Gmail candidates: 1720
+- distinct canonical events: 964
+
+Integrity:
+- raw without evidence: 0
+- evidence without raw: 0
+- evidence without canonical: 0
+- canonical without evidence: 0
+- candidate orphan: 0
+- unresolved Gmail Pending/Error raw events: 0
+- duplicate raw external IDs: 0
+- duplicate canonical event IDs: 0
+- duplicate canonical/raw evidence pairs: 0
+- non-positive ingestion candidates: 0
+- source_sync_state Gmail: OK
+- source_sync error_code: empty
+- privacy invalid JSON: 0
+- forbidden persisted Gmail body/subject/message-id/from fields: 0
+- maximum minimal payload length: 138
+- unexpected sender count: 0
+
+Production SQLite remained unchanged:
+- transactions: 1150
+- SHA-256:
+  2b537bbcaa6a22bbd7018630b84152a319ce352624b97f5ace41563c1561945f
+
+Canonical amount contract:
+- ingestion candidates require amount > 0;
+- canonical events may legitimately use amount >= 0 for
+  review/evidence/lifecycle/non-transaction facts;
+- such zero canonical rows are not automatically eligible economic
+  observations.
 
 ## Gmail historical backfill state
 
-Completed and validated operationally:
-- January 2025
-- February 2025
+HISTORY VERIFIED = YES
 
-Current checkpoint:
-2025-05
+Historical Backfill V2 completed through:
+2026-07
 
-January successful retry:
-59 successful relay operations.
+Authoritative next checkpoint:
+2026-08
 
-February execution:
-112 successful relay operations.
+Verified closed historical coverage:
+2025-01-01 through 2026-07-31
 
-The February runner has completed and the checkpoint moved to March.
+Every month January 2025 through July 2026 contains Gmail evidence.
 
-Do not rerun February.
+Final raw/evidence coverage:
+2038 / 2038
+
+Do not reset or rerun Historical Backfill V2 merely to ingest the active
+August 2026 month.
+
+August 2026 is current-month ingestion and must be handled separately.
+
+HISTORY VERIFIED means the historical Gmail coverage, persistence,
+idempotency, privacy, source coverage, and production-isolation gates passed.
+
+It does not mean:
+- August 2026 current-month coverage is complete;
+- Pending Review rows are all economically resolved;
+- Pattern false-positive audit is complete;
+- Pattern calibration is complete;
+- Pattern release readiness passed.
 
 ## HMAC incident status
 
@@ -213,32 +268,24 @@ Asia/Jakarta / WIB.
 
 ## Immediate next action
 
-Historical Backfill v2 is paused normally.
+Historical closed-month backfill is complete.
 
-Completed through:
-2025-05
+Do not continue historical backfill.
 
-Current authoritative resume state:
-- month: 2025-06
-- offset: 25
-- state: BACKFILL_RUNTIME_PAUSE
-- circuit breaker: not implicated
+For Pattern Analysis:
+- HISTORY VERIFIED may now be marked YES;
+- historical canonical data must still pass Pattern eligibility filtering;
+- do not treat Pending Review, INVOICE_EVIDENCE, NON_TRANSACTION, or other
+  non-authoritative zero records as economic calibration observations;
+- perform real-data false-positive audit before calibration;
+- keep calibration and holdout separate;
+- do not merge Pattern from the backfill workflow.
 
-Lightweight progress observability:
-- implementation: ced919f
-- first trusted message is logged.
-- every fifth trusted message is logged.
-- sender is cleaned.
-- subject is truncated to 72 characters.
-- routine body/message-id logging is disabled.
+For current ingestion:
+August 2026 is outside the closed-history verification scope and should be
+handled separately.
 
-Next:
-1. Synchronize repository Code.gs to the Apps Script project and Save.
-2. Run backfillHistoricalClosedMonthsV2().
-3. Confirm start state is checkpoint=2025-06 and offset=25.
-4. BACKFILL_RUNTIME_PAUSE remains normal and resumable.
-5. Any new BACKFILL_* operational error means stop and diagnose.
-
+Do not start Prompt 14 cutover solely because historical verification passed.
 
 ## Do not do
 
@@ -255,8 +302,15 @@ Next:
 
 ## No known blocker
 
-At the end of the February audit, no active ingestion integrity blocker was
-known.
+No historical Gmail ingestion integrity blocker remains for the verified
+range through 31 July 2026.
 
-Next controlled month:
-March 2025.
+Formal state:
+HISTORY VERIFIED = YES
+
+Separate unresolved work is intentionally outside this gate:
+- August 2026 current-month ingestion coverage;
+- Pattern real-data false-positive audit;
+- Pattern calibration and holdout validation;
+- Pattern release readiness;
+- future production cutover.
