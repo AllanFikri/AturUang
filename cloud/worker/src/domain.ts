@@ -818,8 +818,14 @@ export function parseGmailIntelligence(
     // B. BCA Cardless Tarik Tunai
     if (cleanBody.includes("tarik tunai tanpa kartu") || cleanBody.includes("cardless withdrawal") || cleanSubj.includes("tarik tunai")) {
       const amount = parseIndonesianAmount(bodyText) || 0;
-      const refMatch = bodyText.match(/(?:no\.?\s*referensi|ref(?:erence)?)\s*[:]?\s*([a-zA-Z0-9]+)/i);
-      const refId = refMatch ? refMatch[1] : null;
+      const refMatch = bodyText.match(
+        /(?:^|\r?\n)\s*(?:nomor\s+referensi|no\.?\s*referensi|reference|ref)\s*(?::\s*|\r?\n\s*:\s*)([^\r\n]+)/im
+      );
+
+      const refId =
+        refMatch
+          ? refMatch[1].trim()
+          : null;
 
       const cand: ParsedCandidate = {
         tx_type: "Transfer",

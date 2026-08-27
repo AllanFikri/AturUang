@@ -752,6 +752,21 @@ export default {
             .toLowerCase()
             .includes("qris");
 
+        const replayBodyHasCashWithdrawal =
+          canonEv.event_kind ===
+            "CASH_WITHDRAWAL" &&
+          (
+            String(subject || "")
+              .toLowerCase()
+              .includes("tarik tunai") ||
+            String(body || "")
+              .toLowerCase()
+              .includes("cardless - tarik tunai") ||
+            String(body || "")
+              .toLowerCase()
+              .includes("tarik tunai")
+          );
+
         const validAmount =
           Number.isFinite(
             Number(canonEv.amount)
@@ -819,8 +834,36 @@ export default {
             "LIFECYCLE_STATUS" &&
           canonEv.candidate == null;
 
+        const isCashWithdrawalRepair =
+          canonEv.status ===
+            "AutoApproved" &&
+          canonEv.event_kind ===
+            "CASH_WITHDRAWAL" &&
+          canonEv.financial_class ===
+            "Cash Withdrawal" &&
+          canonEv.financial_direction ===
+            "Neutral" &&
+          canonEv.evidence_role ===
+            "PRIMARY_PAYMENT" &&
+          canonEv.candidate?.tx_type ===
+            "Transfer" &&
+          canonEv.candidate?.status ===
+            "AutoApproved" &&
+          canonEv.source_account_alias ===
+            "BCA Main" &&
+          canonEv.destination_account_alias ===
+            "Cash" &&
+          canonEv.destination_owner_type ===
+            "SELF" &&
+          normalizedCounterparty
+            .toLowerCase() ===
+            "self (cash)";
+
         if (
-          !replayBodyHasQris ||
+          (
+            !replayBodyHasQris &&
+            !replayBodyHasCashWithdrawal
+          ) ||
           !validAmount ||
           !validReference ||
           canonEv.event_id ===
@@ -828,7 +871,8 @@ export default {
           (
             !isMerchantPaymentRepair &&
             !isTransferQrisRepair &&
-            !isFailedQrisRepair
+            !isFailedQrisRepair &&
+            !isCashWithdrawalRepair
           )
         ) {
           return new Response(
@@ -837,7 +881,7 @@ export default {
               code:
                 "BCA_QRIS_REPAIR_PARSE_REJECTED",
               message:
-                "Email tidak menghasilkan semantic QRIS yang aman untuk repair.",
+                "Email tidak menghasilkan semantic BCA yang aman untuk targeted repair.",
             }),
             {
               status: 422,
@@ -862,8 +906,10 @@ export default {
                e.candidate_id,
                e.evidence_role AS current_evidence_role,
                r.payload_hash,
+               r.minimal_raw_payload AS original_minimal_raw_payload,
                c.id AS current_canonical_id,
                c.event_id AS current_event_id,
+               ic.tx_type AS candidate_tx_type,
                ic.amount AS candidate_amount,
                ic.status AS candidate_status,
                ic.applied_transaction_id
@@ -888,10 +934,14 @@ export default {
             current_evidence_role:
               string;
             payload_hash: string;
+            original_minimal_raw_payload:
+              string;
             current_canonical_id:
               number;
             current_event_id:
               string;
+            candidate_tx_type:
+              string | null;
             candidate_amount:
               number | null;
             candidate_status:
@@ -924,6 +974,76 @@ export default {
 
         const current =
           evidenceRows[0];
+
+        let originalParserEventKind =
+          "";
+
+        try {
+          const originalMinimal =
+            JSON.parse(
+              String(
+                current
+                  .original_minimal_raw_payload ||
+                  "{}"
+              )
+            );
+
+          originalParserEventKind =
+            String(
+              originalMinimal?.event_kind ||
+                ""
+            );
+        } catch {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_ORIGINAL_PAYLOAD_INVALID",
+              message:
+                "Minimal payload evidence lama tidak dapat diverifikasi.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
+
+        const originalFamilyCompatible =
+          (
+            originalParserEventKind ===
+              "CASH_WITHDRAWAL" &&
+            current.candidate_tx_type ===
+              "Transfer" &&
+            isCashWithdrawalRepair
+          ) ||
+          (
+            originalParserEventKind ===
+              "MERCHANT_PAYMENT" &&
+            current.candidate_tx_type ===
+              "Expense" &&
+            (
+              isMerchantPaymentRepair ||
+              isTransferQrisRepair ||
+              isFailedQrisRepair
+            )
+          );
+
+        if (!originalFamilyCompatible) {
+          return new Response(
+            JSON.stringify({
+              status: "error",
+              code:
+                "BCA_QRIS_REPAIR_ORIGINAL_FAMILY_CONFLICT",
+              message:
+                "Hasil reparse tidak kompatibel dengan keluarga parser evidence lama.",
+            }),
+            {
+              status: 409,
+              headers: getSecurityHeaders(),
+            }
+          );
+        }
 
         if (
           !current.candidate_id ||
@@ -1071,6 +1191,12 @@ export default {
           event_kind: string;
           financial_class: string;
           financial_direction: string;
+          source_account_alias:
+            string | null;
+          destination_account_alias:
+            string | null;
+          destination_owner_type:
+            string | null;
           amount: number;
           merchant_normalized:
             string | null;
@@ -1087,6 +1213,9 @@ export default {
                event_kind,
                financial_class,
                financial_direction,
+               source_account_alias,
+               destination_account_alias,
+               destination_owner_type,
                amount,
                merchant_normalized,
                counterparty_normalized
@@ -1133,6 +1262,9 @@ export default {
                event_kind,
                financial_class,
                financial_direction,
+               source_account_alias,
+               destination_account_alias,
+               destination_owner_type,
                amount,
                merchant_normalized,
                counterparty_normalized
@@ -1313,6 +1445,38 @@ export default {
                 }
               );
             }
+          }
+        }
+
+        if (
+          existingTarget &&
+          isCashWithdrawalRepair
+        ) {
+          if (
+            existingTarget
+              .source_account_alias !==
+                "BCA Main" ||
+            existingTarget
+              .destination_account_alias !==
+                "Cash" ||
+            existingTarget
+              .destination_owner_type !==
+                "SELF"
+          ) {
+            return new Response(
+              JSON.stringify({
+                status: "error",
+                code:
+                  "BCA_QRIS_REPAIR_CANONICAL_CONFLICT",
+                message:
+                  "Canonical cash-withdrawal existing tidak cocok dengan arah BCA ke Cash.",
+              }),
+              {
+                status: 409,
+                headers:
+                  getSecurityHeaders(),
+              }
+            );
           }
         }
 
