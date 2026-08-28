@@ -509,3 +509,49 @@ Before Phase 3 Provider Adapters:
 6. Ambiguous ownership/reimbursement/commerce cases can require user review.
 7. Missing historical evidence may remain `PARTIAL` or `UNVERIFIABLE`.
 8. Financial truth is established through evidence + matching + reconciliation, not by guessing.
+
+---
+
+## Phase 2C-A — Discovery / Preflight Boundary Hardening
+
+### Commit
+`4288473 fix(ingestion): harden discovery and preflight boundaries`
+
+### Why this checkpoint was added
+A forward integration review before adapter orchestration identified four boundary cases that Phase 2A/2B unit scopes did not yet protect.
+
+### Hardened boundaries
+- artifact occurrence now preserves its observed extension
+- same exact bytes with conflicting observed extensions remain one content identity but no longer lose occurrence metadata
+- duplicate normalized ZIP member paths fail closed
+- Unix ZIP symlink members fail closed
+- contradictory claimed source versus exact detected template returns `SOURCE_HINT_CONFLICT` and is not adapter-ready
+
+### Independent review
+- same-extension duplicate behavior preserved
+- cross-extension exact duplicate behavior verified
+- no ledger/DB/network/OCR/cloud scope expansion
+- exact four-file implementation scope
+- 135 Universal Ingestion targeted tests PASS
+- brownfield quick regression PASS
+- production SQLite byte-identical
+
+### Push
+Remote branch synchronized to:
+`4288473f3ed096c0964175df30e39f28b4c8f226`
+
+### Lesson
+Component tests are not sufficient for a foundation layer. Before a later phase depends on an earlier layer, boundary/adversarial integration behavior must be reviewed explicitly.
+
+---
+
+## Phase 2C-B — Forward Design Freeze
+
+Before implementing the adapter interface, the complete forward contract was frozen in:
+
+`docs/ingestion/PHASE2C_B_FORWARD_DESIGN_GATE_2026-08-28.md`
+
+Key design decision:
+the universal adapter boundary carries normalized **evidence**, not canonical transactions. Cash movement, balance snapshot, source summary, account observation, investment trade, and commerce order are distinct typed evidence roles under a common envelope.
+
+Phase 3 remains locked.
