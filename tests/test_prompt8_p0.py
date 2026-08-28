@@ -11,6 +11,7 @@ if str(_REPO_ROOT / "aturuang") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "aturuang"))
 
 import hashlib
+from contextlib import closing
 import os
 import shutil
 import sqlite3
@@ -43,13 +44,13 @@ class TestPrompt8bP0(unittest.TestCase):
 
     def test_01_old_schema_migrated_and_second_run_is_noop(self):
         """Test 1-3: Old schema with restrictive CHECK constraint migrates to allow Third-party & Adjustment; rerun is noop."""
-        with db.db_connect(self.test_db_path) as con:
+        with closing(db.db_connect(self.test_db_path)) as con, con:
             pre_cnt = con.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
 
         # 1. Run init_db to apply migration
         db.init_db(self.test_db_path)
         
-        with db.db_connect(self.test_db_path) as con:
+        with closing(db.db_connect(self.test_db_path)) as con, con:
             sql = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'").fetchone()[0]
             self.assertIn("'Third-party'", sql)
             self.assertIn("'Adjustment'", sql)
@@ -66,7 +67,7 @@ class TestPrompt8bP0(unittest.TestCase):
             
         # 2. Second init_db run (idempotent no-op)
         db.init_db(self.test_db_path)
-        with db.db_connect(self.test_db_path) as con:
+        with closing(db.db_connect(self.test_db_path)) as con, con:
             cnt2 = con.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
             self.assertEqual(cnt2, pre_cnt)
 
