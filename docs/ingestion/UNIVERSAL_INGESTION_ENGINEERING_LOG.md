@@ -555,3 +555,47 @@ Key design decision:
 the universal adapter boundary carries normalized **evidence**, not canonical transactions. Cash movement, balance snapshot, source summary, account observation, investment trade, and commerce order are distinct typed evidence roles under a common envelope.
 
 Phase 3 remains locked.
+
+---
+
+## Phase 2C-B — Universal Adapter Contracts
+
+### Commit
+580c961 feat(ingestion): add universal adapter contracts
+
+### Result
+- universal adapter interface added
+- normalized evidence envelope added
+- six evidence roles represented
+- six source channels represented
+- Decimal amount boundary preserved
+- occurred_at, posted_at, and settlement_date remain distinct
+- source statuses preserve pending, failed, reversed, refunded, and cancelled states
+- private adapter payload, provenance, and raw reference representation hardened
+- no DB, ledger, network, OCR, cloud, ownership, matching, semantics, or reconciliation authority added
+- 26 new adapter tests added
+- 161 targeted Universal Ingestion tests PASS
+- brownfield quick regression PASS
+- production SQLite byte-identical
+
+### Push
+Remote branch synchronized to:
+580c9617c5c1b81d20a9a6f54657fb3fdbeb8a16
+
+### Boundary
+Phase 2C-B carries normalized source evidence only. Provider parsing remains Phase 3 and financial meaning remains downstream.
+
+---
+
+## Phase 2C-C — Forward Design Freeze
+
+The dry-run orchestration and semantic-document identity design is frozen in:
+
+docs/ingestion/PHASE2C_C_FORWARD_DESIGN_GATE_2026-08-29.md
+
+The phase is internally split into:
+- 2C-C1 safe artifact payload access
+- 2C-C2 read-only dry-run orchestration
+- 2C-C3 semantic document identity and final dry-run result
+
+Phase 3 remains locked until the complete Phase 2 gate passes.
