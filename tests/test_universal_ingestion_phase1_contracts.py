@@ -29,6 +29,7 @@ from aturuang.ingestion_contracts import (
     SourceProvenanceContract,
     SourceRegistryContract,
     SourceTemplateContract,
+    TemplateMatchStatus,
     capability_index,
     classify_document_identity,
     match_template_fail_closed,
@@ -59,6 +60,7 @@ def document(
         parser_version="not-implemented",
         source_registry_id=source_registry_id,
         import_batch_id="batch-001",
+        template_match_status=TemplateMatchStatus.KNOWN,
         period_status=period_status,
         semantic_sha256=semantic_sha,
     )
@@ -175,12 +177,17 @@ class TestUniversalIngestionPhase1Contracts(unittest.TestCase):
             ownership_state=OwnershipState.OWNED,
             lifecycle_state=LifecycleState.NEW,
             lifecycle_evidence="Observed in portfolio hierarchy",
+            parent_observed_account_key="blu-main-observed",
             parent_account_id="acct_blu_main",
         )
 
         self.assertEqual(
             observation.source_document_id,
             "doc-blu-portfolio-2026-07",
+        )
+        self.assertEqual(
+            observation.parent_observed_account_key,
+            "blu-main-observed",
         )
         self.assertEqual(observation.lifecycle_state, LifecycleState.NEW)
 
@@ -322,7 +329,26 @@ class TestUniversalIngestionPhase1Contracts(unittest.TestCase):
         )
         self.assertIsNone(unknown)
 
-    def test_09_document_identity_exact_semantic_revision_and_ambiguous(self):
+    def test_09_unknown_template_status_is_explicit_on_source_document(self):
+        doc = SourceDocumentIdentity(
+            source_document_id="doc-unknown",
+            content_sha256=sha("a"),
+            natural_document_key="bca:unknown:2026-08",
+            template_id="UNKNOWN",
+            template_fingerprint="unrecognized-layout",
+            parser_version="not-run",
+            source_registry_id="bca_statement",
+            import_batch_id="batch-001",
+            template_match_status=TemplateMatchStatus.UNKNOWN_TEMPLATE,
+            period_status=PeriodStatus.OPEN,
+        )
+
+        self.assertEqual(
+            doc.template_match_status,
+            TemplateMatchStatus.UNKNOWN_TEMPLATE,
+        )
+
+    def test_10_document_identity_exact_semantic_revision_and_ambiguous(self):
         existing = document(
             document_id="doc-jago-apr-a",
             content_sha=sha("a"),
@@ -412,6 +438,7 @@ class TestUniversalIngestionPhase1Contracts(unittest.TestCase):
             parser_version="not-implemented",
             source_registry_id="jago_statement",
             import_batch_id="batch-001",
+            template_match_status=TemplateMatchStatus.KNOWN,
             period_status=PeriodStatus.CLOSED,
             semantic_sha256=sha("c"),
             archive_lineage=(lineage,),

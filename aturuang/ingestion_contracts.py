@@ -259,6 +259,7 @@ class AccountObservationContract:
     ownership_state: OwnershipState
     lifecycle_state: LifecycleState
     lifecycle_evidence: str
+    parent_observed_account_key: str | None = None
     parent_account_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -273,6 +274,15 @@ class AccountObservationContract:
                 self,
                 field_name,
                 _require_text(getattr(self, field_name), field_name),
+            )
+        if self.parent_observed_account_key is not None:
+            object.__setattr__(
+                self,
+                "parent_observed_account_key",
+                _require_text(
+                    self.parent_observed_account_key,
+                    "parent_observed_account_key",
+                ),
             )
         if self.parent_account_id is not None:
             object.__setattr__(
@@ -409,6 +419,7 @@ class SourceDocumentIdentity:
     parser_version: str
     source_registry_id: str
     import_batch_id: str
+    template_match_status: TemplateMatchStatus
     period_status: PeriodStatus
     semantic_sha256: str | None = None
     period_start: str | None = None
