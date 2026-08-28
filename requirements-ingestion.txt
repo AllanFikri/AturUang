@@ -1,0 +1,5 @@
+# AturUang Universal Ingestion V1
+# Frozen from complete private PDF corpus benchmark.
+# Install only for local/universal document ingestion.
+
+pypdf[crypto]==6.16.2

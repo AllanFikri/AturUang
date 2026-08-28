@@ -1,0 +1,10 @@
+﻿provider,document_kind,media,coverage_start,coverage_end,audited_documents,role,period_state,known_gap_or_edge,template_id
+BCA,monthly_statement,PDF,Jan 2025,Jul 2026,19,cash movement; balance reconciliation; subaccount lifecycle,CLOSED through Jul 2026,Aug official statement not in audited corpus; current Gmail evidence is separate,bca_monthly_statement_v1
+Bank Jago,monthly_statement,PDF,Oct 2025,Jul 2026,11 files / 10 periods,cash movement; balance reconciliation; account hierarchy,CLOSED through Jul 2026,one Apr 2026 semantic duplicate with different bytes,jago_monthly_statement_v1
+SeaBank,e_statement,PDF,Jan 2025,Jul 2026,19,cash movement; balance reconciliation,CLOSED through Jul 2026,zero-transaction text can be section-scoped,seabank_estatement_v1
+blu,account_mutation,PDF,Aug 2024,Aug 2026,25,cash movement; running balance,includes Aug 2026 corpus,must remain separate from blu portfolio,blu_account_mutation_v1
+blu,portfolio,PDF,Aug 2024,Aug 2026,25,account/subaccount snapshot; discovery; reconciliation evidence,includes Aug 2026 corpus,snapshot evidence; must not create transaction duplicates,blu_portfolio_v1
+GoPay,e_statement,PDF,Jan 2026,Jul 2026,7,wallet cash movement,CLOSED through Jul 2026,true zero-transaction months exist,gopay_estatement_v1
+ShopeePay,transaction_history,IMAGE,Aug 2025,Aug 2026,13,wallet cash movement evidence,includes Aug 2026 corpus,image-only; variable resolution; confidence gate required,shopeepay_history_image_v1
+Stockbit,statement_of_account,PDF,Oct 2025,Jul 2026,10,cash ledger; investment/trade evidence; optional portfolio,CLOSED through Jul 2026,trade date and due date must remain distinct,stockbit_soa_v1
+Shopee,order_receipt,PDF,Dec 2024,Aug 2026,112,commerce enrichment: seller/items/category/payment metadata,includes Aug 2026 corpus,order ownership does not prove payer/economic owner; titip CO supported,shopee_order_receipt_v1

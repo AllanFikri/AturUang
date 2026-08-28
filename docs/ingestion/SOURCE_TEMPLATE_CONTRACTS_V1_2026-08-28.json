@@ -1,0 +1,277 @@
+{
+  "version": "1.0",
+  "date": "2026-08-28",
+  "purpose": "Sanitized source/template contracts derived from the private AturUang source corpus. Raw private documents are evidence only and must not be committed to Git.",
+  "global_contracts": {
+    "document_identity": {
+      "required": [
+        "source_document_id",
+        "content_sha256",
+        "natural_document_key",
+        "template_id",
+        "template_fingerprint",
+        "parser_version",
+        "source_registry_id",
+        "import_batch_id"
+      ],
+      "rules": [
+        "SHA-256 is necessary but not sufficient for idempotency.",
+        "Use a provider-native/natural document key when available (for example provider + document kind + account identity + statement period, or provider order id).",
+        "A same-period semantically identical document can have different bytes; detect semantic duplicates separately.",
+        "Preserve archive lineage: parent archive hash, archive depth, and member path in private runtime metadata.",
+        "Never use display name alone as account identity."
+      ]
+    },
+    "document_preflight": {
+      "required": [
+        "media_type",
+        "mime_type",
+        "page_count_or_image_dimensions",
+        "text_layer_available",
+        "pdf_encryption_state",
+        "period_status",
+        "template_match_status",
+        "quality_status"
+      ],
+      "template_match_status": ["KNOWN", "UNKNOWN_TEMPLATE", "TEMPLATE_DRIFT"],
+      "period_status": ["CLOSED", "OPEN", "PARTIAL", "UNKNOWN"]
+    },
+    "normalized_financial_event": {
+      "required_or_nullable_fields": [
+        "source_event_id",
+        "source_document_id",
+        "event_role",
+        "account_id",
+        "subaccount_id",
+        "occurred_at",
+        "posted_at",
+        "settlement_date",
+        "amount",
+        "currency",
+        "direction",
+        "status",
+        "counterparty_raw",
+        "description_raw",
+        "provider_transaction_id_raw",
+        "reference_raw",
+        "reference_normalized",
+        "balance_after",
+        "raw_locator",
+        "parse_confidence"
+      ],
+      "rules": [
+        "Do not collapse occurred_at, posted_at, and settlement_date into one date.",
+        "Never overwrite raw reference or raw provider transaction id with a normalized value.",
+        "Reference is matching evidence, not sole event identity.",
+        "A missing running balance is allowed when the source does not print one on every row.",
+        "No provider adapter writes directly to the canonical ledger."
+      ]
+    },
+    "account_observation": {
+      "required": [
+        "institution_id",
+        "account_id_or_observed_key",
+        "parent_account_id",
+        "display_name_raw",
+        "ownership_state",
+        "lifecycle_evidence",
+        "source_document_id"
+      ],
+      "ownership_state": ["OWNED", "THIRD_PARTY", "UNKNOWN"],
+      "lifecycle_state": ["NEW", "RENAMED", "CLOSED", "REUSED", "UNCHANGED", "UNVERIFIED"]
+    },
+    "commerce_order": {
+      "required": [
+        "source_document_id",
+        "order_native_id_raw",
+        "order_date",
+        "seller_raw",
+        "payment_method_raw",
+        "shipping_service_raw",
+        "order_total",
+        "line_items",
+        "buyer_or_recipient_raw",
+        "payment_match_status",
+        "economic_owner",
+        "payer_responsibility",
+        "personal_spending_effect"
+      ],
+      "economic_owner": ["SELF", "THIRD_PARTY", "MIXED", "UNKNOWN"],
+      "payer_responsibility": ["SELF", "THIRD_PARTY_DIRECT", "SELF_REIMBURSABLE", "UNKNOWN"],
+      "payment_match_status": ["MATCHED", "AMBIGUOUS", "UNMATCHED", "NOT_APPLICABLE"],
+      "rules": [
+        "A Shopee order is commerce evidence, not proof that the account owner paid.",
+        "THIRD_PARTY_DIRECT orders do not create personal expense.",
+        "SELF_REIMBURSABLE payments use pass-through/receivable semantics rather than ordinary personal expense.",
+        "Category enrichment is applied after payment matching and ownership resolution.",
+        "Multi-item orders may allocate shared shipping/fees/discounts using an explicit allocation policy."
+      ]
+    },
+    "archive_safety": {
+      "required": [
+        "zip_slip_path_validation",
+        "archive_depth_limit",
+        "file_count_limit",
+        "uncompressed_size_limit",
+        "compression_ratio_guard",
+        "duplicate_hash_short_circuit"
+      ]
+    },
+    "private_fixture_policy": {
+      "rules": [
+        "Raw financial source files stay outside Git.",
+        "Private corpus replay may use a local ignored corpus directory.",
+        "Committed tests use sanitized or synthetic fixtures preserving layout/field structure without private values.",
+        "Every parser requires both golden fixture tests and private full-corpus replay before release."
+      ]
+    }
+  },
+  "source_families": [
+    {
+      "template_id": "bca_monthly_statement_v1",
+      "provider": "BCA",
+      "role": ["cash_movement", "balance_reconciliation", "subaccount_lifecycle_evidence"],
+      "media": "PDF",
+      "fingerprint_markers": ["REKENING TAHAPAN XPRESI", "NO. REKENING", "PERIODE", "TANGGAL KETERANGAN CBG MUTASI SALDO"],
+      "corpus": {"documents": 19, "coverage": "2025-01..2026-07", "page_range": "4..23", "text_layer": true, "encrypted_but_readable": true},
+      "must_extract": ["statement_period", "opening_balance", "transaction_posting_date", "effective_or_transaction_date_when_present", "description_raw", "direction_evidence", "amount", "reference_raw", "counterparty_raw", "running_balance_when_printed", "poket_lifecycle_evidence"],
+      "edge_cases": [
+        "posting date can differ from an effective/transaction date embedded in the description",
+        "multiline descriptions and references",
+        "running balance is not printed on every transaction row",
+        "DB/CR semantics are expressed through a mix of row markers and description tokens",
+        "Poket lifecycle phrases include initial funding, top-up, move, and scheduled transfer variants",
+        "separate fee rows can accompany transfers",
+        "PDFs are encrypted but readable without user-entered password in the audited corpus"
+      ]
+    },
+    {
+      "template_id": "jago_monthly_statement_v1",
+      "provider": "Bank Jago",
+      "role": ["cash_movement", "balance_reconciliation", "account_hierarchy", "subaccount_lifecycle_evidence"],
+      "media": "PDF",
+      "fingerprint_markers": ["Laporan Keuangan Bulanan", "RINGKASAN SALDO DALAM RUPIAH", "KANTONG PERSONAL", "Tanggal & Waktu"],
+      "corpus": {"documents_sha_unique": 11, "statement_periods": 10, "coverage": "2025-10..2026-07", "page_range": "3..6", "text_layer": true},
+      "must_extract": ["statement_period", "pocket_id", "pocket_display_name_raw", "pocket_status_and_start_date", "opening_balance", "income_total", "expense_total", "ending_balance", "transaction_timestamp", "source_destination_raw", "transaction_type_raw", "transaction_id_raw", "note_raw", "amount", "running_balance"],
+      "edge_cases": [
+        "one April 2026 statement appears semantically identical despite different file bytes",
+        "pockets appear/disappear over time and require lifecycle handling",
+        "internal pocket-to-pocket moves are owned-to-owned transfers",
+        "a pocket display name can collide with another provider name; display name must never be global identity",
+        "text extraction contains tabs and wrapped counterparty fields"
+      ]
+    },
+    {
+      "template_id": "seabank_estatement_v1",
+      "provider": "SeaBank",
+      "role": ["cash_movement", "balance_reconciliation", "interest_tax_evidence"],
+      "media": "PDF",
+      "fingerprint_markers": ["REKENING KORAN", "RINGKASAN REKENING", "TABUNGAN - RINCIAN TRANSAKSI"],
+      "corpus": {"documents": 19, "coverage": "2025-01..2026-07", "page_range": "1..6", "text_layer": true},
+      "must_extract": ["statement_period", "statement_serial_raw", "opening_balance", "outgoing_total", "incoming_total", "ending_balance", "transaction_date", "description_raw", "transaction_type_raw", "outgoing_amount", "incoming_amount", "interest_tax_sections"],
+      "edge_cases": [
+        "the phrase TIDAK ADA TRANSAKSI can belong to a deposit section while the main savings section has transactions",
+        "zero-transaction detection must be section-scoped",
+        "statement generation date is different from transaction coverage period",
+        "transaction description and type can occupy separate lines",
+        "interest/tax detail pages must not be double-counted as new cash transactions"
+      ]
+    },
+    {
+      "template_id": "blu_account_mutation_v1",
+      "provider": "blu by BCA Digital",
+      "role": ["cash_movement", "running_balance", "subaccount_transfer_evidence"],
+      "media": "PDF",
+      "fingerprint_markers": ["bluAccount", "Periode / Period", "Keterangan / Remarks", "Nominal", "Sisa Saldo"],
+      "corpus": {"documents": 25, "coverage": "2024-08..2026-08", "page_range": "1..3", "text_layer": true},
+      "must_extract": ["statement_period", "account_type", "transaction_datetime", "remarks_raw", "transaction_details_raw", "reference_raw", "amount", "remaining_balance", "subaccount_name_raw"],
+      "edge_cases": [
+        "current August 2026 document is partial/open period",
+        "transfers between bluAccount and bluSaving/bluGether are internal",
+        "period language/format changes across historical documents",
+        "subaccount names require lifecycle tracking"
+      ]
+    },
+    {
+      "template_id": "blu_portfolio_v1",
+      "provider": "blu by BCA Digital",
+      "role": ["account_discovery", "subaccount_balance_snapshot", "reconciliation_snapshot"],
+      "media": "PDF",
+      "fingerprint_markers": ["Laporan Portofolio", "Ringkasan / Summary", "bluSaving/bluGether"],
+      "corpus": {"documents": 25, "coverage": "2024-08..2026-08", "page_range": "1..1", "text_layer": true},
+      "must_extract": ["statement_period", "product_or_subaccount_name_raw", "opening_balance", "income_total", "expense_total", "ending_balance"],
+      "edge_cases": [
+        "portfolio rows are snapshots and must not be imported as transaction rows",
+        "same-period mutation and portfolio documents are complementary evidence, not duplicates",
+        "use portfolio documents to discover/close/verify subaccounts and reconcile totals"
+      ]
+    },
+    {
+      "template_id": "gopay_estatement_v1",
+      "provider": "GoPay",
+      "role": ["wallet_cash_movement", "monthly_summary"],
+      "media": "PDF",
+      "fingerprint_markers": ["E-statement", "Periode transaksi", "Tanggal Transaksi", "ID transaksi", "Metode pembayaran", "Jumlah"],
+      "corpus": {"documents": 7, "coverage": "2026-01..2026-07", "page_range": "1..1", "text_layer": true},
+      "must_extract": ["statement_period", "summary_income", "summary_expense", "transaction_datetime", "description_raw", "transaction_id_raw", "payment_method_components", "amount"],
+      "edge_cases": [
+        "true zero-transaction monthly statements exist",
+        "transaction IDs and descriptions wrap across text lines",
+        "a transaction can show more than one payment component such as balance and coins",
+        "positive top-up and negative payment/transfer semantics must be preserved raw before classification"
+      ]
+    },
+    {
+      "template_id": "shopeepay_history_screenshot_v1",
+      "provider": "ShopeePay",
+      "role": ["wallet_cash_movement", "refund_status_evidence"],
+      "media": "IMAGE",
+      "fingerprint_markers_visual": ["Transaction History", "month section", "transaction type icon", "signed amount", "date"],
+      "corpus": {"documents": 13, "coverage": "2025-08..2026-08", "width_px_range": "118..1220", "height_px_range": "1036..13017", "text_layer": false},
+      "must_extract": ["period_or_month", "transaction_type_raw", "counterparty_or_source_raw", "transaction_date", "signed_amount", "status_raw", "reward_or_failure_annotation_when_present"],
+      "edge_cases": [
+        "image resolution varies dramatically; fixed pixel coordinates are unsafe",
+        "long vertical screenshots contain many entries without page boundaries",
+        "failed payments must not become successful expense events",
+        "refunds must be preserved as refund evidence",
+        "image adapter requires quality scoring and fail-closed behavior when extraction confidence is low"
+      ]
+    },
+    {
+      "template_id": "stockbit_soa_v1",
+      "provider": "Stockbit",
+      "role": ["rdn_cash_ledger", "investment_trade_evidence", "portfolio_snapshot"],
+      "media": "PDF",
+      "fingerprint_markers": ["Statement of Account", "Tr. Date", "Due Date", "Reference", "Db Amount", "Cr Amount", "Ending Balance"],
+      "corpus": {"documents": 10, "coverage": "2025-10..2026-07", "page_range": "1..4", "text_layer": true},
+      "must_extract": ["statement_period", "trade_date", "due_date", "reference_type_and_id_raw", "description_raw", "debit_amount", "credit_amount", "ending_balance", "nested_trade_lines", "portfolio_snapshot_when_present"],
+      "edge_cases": [
+        "trade date and due/settlement date are distinct",
+        "invoice rows contain nested buy/sell trade details",
+        "receipt/payment cash rows must not be double-counted with trade details",
+        "negative balances can be shown in parentheses",
+        "portfolio section is optional and absent in at least one audited month",
+        "fees and estimated interest have distinct reference semantics"
+      ]
+    },
+    {
+      "template_id": "shopee_order_receipt_v1",
+      "provider": "Shopee Orders",
+      "role": ["commerce_enrichment", "item_category_evidence", "payment_method_evidence"],
+      "media": "PDF",
+      "fingerprint_markers": ["Nama Penjual", "No. Pesanan", "Tanggal Transaksi", "Metode Pembayaran", "Rincian Pesanan", "Total Pembayaran"],
+      "corpus": {"documents": 112, "coverage": "2024-12-12..2026-08-20", "pages": "111 one-page; 1 two-page", "text_layer": true, "multi_product_documents": 32, "maximum_reported_total_quantity": 150},
+      "observed_payment_method_counts": {"Saldo ShopeePay": 59, "SeaBank Bayar Instan": 33, "QRIS": 7, "Bank BCA": 7, "ShopeePay": 4, "Bank Mandiri": 2},
+      "must_extract": ["order_id_raw", "order_date", "seller_raw", "payment_method_raw", "shipping_service_raw", "subtotal", "shipping", "service_fees", "discounts_when_present", "total_payment", "buyer_or_recipient_raw", "line_items", "quantity", "variation_raw", "line_subtotal"],
+      "edge_cases": [
+        "order existence does not prove the account owner paid",
+        "the corpus contains multiple recipient/buyer labels and repeated checkout-for-others indicators",
+        "24 audited receipts contain a CO Buku line-item label; treat this only as a candidate signal for third-party checkout, never an automatic financial classification",
+        "QRIS/payment-method labels are evidence but do not uniquely identify the funding account",
+        "same provider label can appear in more than one raw payment-method spelling; preserve raw value before normalization",
+        "multi-item and multi-page receipts require line-item parsing",
+        "shared shipping, fees, and discounts require explicit allocation if item-level spending categories are reported"
+      ]
+    }
+  ]
+}
