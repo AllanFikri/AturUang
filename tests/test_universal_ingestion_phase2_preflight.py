@@ -448,6 +448,53 @@ class TestUniversalIngestionPhase2Preflight(unittest.TestCase):
         )
         self.assertNotIn(secret, repr(result))
 
+    def test_34_consistent_source_hint_preserves_known_template(self):
+        text = (
+            "REKENING TAHAPAN XPRESI NO. REKENING PERIODE "
+            "TANGGAL KETERANGAN CBG MUTASI SALDO"
+        )
+        result = detect_template(
+            text,
+            media_type="PDF",
+            source_hint="bca_statement",
+        )
+        self.assertEqual(result.status, TemplateMatchStatus.KNOWN)
+        self.assertEqual(result.source_registry_id, "bca_statement")
+        self.assertEqual(result.reason_code, "EXACT_REQUIRED_MARKERS")
+
+    def test_35_conflicting_source_hint_fails_closed(self):
+        text = (
+            "REKENING TAHAPAN XPRESI NO. REKENING PERIODE "
+            "TANGGAL KETERANGAN CBG MUTASI SALDO"
+        )
+        result = detect_template(
+            text,
+            media_type="PDF",
+            source_hint="jago_statement",
+        )
+        self.assertEqual(
+            result.status,
+            TemplateMatchStatus.UNKNOWN_TEMPLATE,
+        )
+        self.assertEqual(result.reason_code, "SOURCE_HINT_CONFLICT")
+        self.assertIsNone(result.source_registry_id)
+        self.assertIsNone(result.template_id)
+        self.assertIsNone(result.template_fingerprint)
+
+    def test_36_conflicting_source_hint_is_not_adapter_ready(self):
+        result = preflight_bytes(
+            make_text_pdf(
+                "REKENING TAHAPAN XPRESI NO. REKENING PERIODE "
+                "TANGGAL KETERANGAN CBG MUTASI SALDO"
+            ),
+            extension=".pdf",
+            source_hint="jago_statement",
+        )
+        self.assertEqual(
+            result.template_detection.reason_code,
+            "SOURCE_HINT_CONFLICT",
+        )
+        self.assertFalse(result.adapter_ready)
 
 if __name__ == "__main__":
     unittest.main()

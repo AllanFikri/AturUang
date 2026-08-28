@@ -283,6 +283,19 @@ def detect_template(
 
     if len(candidates) == 1:
         signature, matched = candidates[0]
+
+        if source_hint and source_hint != signature.source_registry_id:
+            return TemplateDetection(
+                status=TemplateMatchStatus.UNKNOWN_TEMPLATE,
+                source_registry_id=None,
+                template_id=None,
+                template_fingerprint=None,
+                method=DetectionMethod.TEXT_MARKERS,
+                required_marker_matches=matched,
+                required_marker_total=len(signature.required_markers),
+                reason_code="SOURCE_HINT_CONFLICT",
+            )
+
         return TemplateDetection(
             status=TemplateMatchStatus.KNOWN,
             source_registry_id=signature.source_registry_id,

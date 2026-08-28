@@ -1,6 +1,7 @@
 import hashlib
 from io import BytesIO
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 import zipfile
@@ -380,6 +381,54 @@ class TestUniversalIngestionPhase2SafeDiscovery(unittest.TestCase):
             0,
         )
 
+    def test_25_same_bytes_different_extensions_preserve_occurrence_extensions(self):
+        data = b"same bytes with conflicting observed extensions"
+        (self.root / "a.pdf").write_bytes(data)
+        (self.root / "b.jpg").write_bytes(data)
+
+        result = discover_files(self.root)
+
+        self.assertEqual(result.unique_artifact_count, 1)
+        artifact = result.artifacts[0]
+        self.assertEqual(artifact.extension, "")
+        self.assertEqual(artifact.observed_extensions, (".jpg", ".pdf"))
+        by_locator = {
+            occurrence.source_locator: occurrence.extension
+            for occurrence in artifact.occurrences
+        }
+        self.assertEqual(by_locator, {"a.pdf": ".pdf", "b.jpg": ".jpg"})
+
+    def test_26_duplicate_normalized_zip_member_path_fails_closed(self):
+        buffer = BytesIO()
+        with zipfile.ZipFile(
+            buffer,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr("folder/doc.pdf", b"one")
+            archive.writestr("folder\\doc.pdf", b"two")
+
+        (self.root / "duplicate-path.zip").write_bytes(buffer.getvalue())
+
+        with self.assertRaises(ArchiveSafetyError):
+            discover_files(self.root)
+
+    def test_27_zip_symlink_member_fails_closed(self):
+        buffer = BytesIO()
+        with zipfile.ZipFile(
+            buffer,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            info = zipfile.ZipInfo("linked.pdf")
+            info.create_system = 3
+            info.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(info, b"target.pdf")
+
+        (self.root / "symlink.zip").write_bytes(buffer.getvalue())
+
+        with self.assertRaises(ArchiveSafetyError):
+            discover_files(self.root)
 
 if __name__ == "__main__":
     unittest.main()

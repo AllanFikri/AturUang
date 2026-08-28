@@ -5,6 +5,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 import re
+import stat
 from typing import Iterable
 import zipfile
 
@@ -65,6 +66,7 @@ class ArchiveHop:
 @dataclass(frozen=True)
 class ArtifactOccurrence:
     source_locator: str
+    extension: str
     archive_lineage: tuple[ArchiveHop, ...] = field(default_factory=tuple)
 
 
@@ -74,6 +76,10 @@ class DiscoveredArtifact:
     size_bytes: int
     extension: str
     occurrences: tuple[ArtifactOccurrence, ...]
+
+    @property
+    def observed_extensions(self) -> tuple[str, ...]:
+        return tuple(sorted({item.extension for item in self.occurrences}))
 
 
 @dataclass(frozen=True)
@@ -99,7 +105,6 @@ class DiscoveryResult:
 @dataclass
 class _ArtifactAccumulator:
     size_bytes: int
-    extension: str
     occurrences: list[ArtifactOccurrence]
 
 
@@ -213,7 +218,6 @@ def _record_artifact(
     *,
     content_sha256: str,
     size_bytes: int,
-    extension: str,
     occurrence: ArtifactOccurrence,
 ) -> None:
     state.supported_occurrences += 1
@@ -222,7 +226,6 @@ def _record_artifact(
     if existing is None:
         state.artifacts[content_sha256] = _ArtifactAccumulator(
             size_bytes=size_bytes,
-            extension=extension,
             occurrences=[occurrence],
         )
         return
@@ -233,6 +236,15 @@ def _record_artifact(
         )
 
     existing.occurrences.append(occurrence)
+
+
+def _common_artifact_extension(
+    occurrences: Iterable[ArtifactOccurrence],
+) -> str:
+    observed = {item.extension for item in occurrences}
+    if len(observed) == 1:
+        return next(iter(observed))
+    return ""
 
 
 def _archive_ratio(info: zipfile.ZipInfo) -> float:
@@ -262,6 +274,7 @@ def _process_archive_bytes(
     try:
         with zipfile.ZipFile(BytesIO(data), "r") as archive:
             infos = sorted(archive.infolist(), key=lambda item: item.filename)
+            seen_member_paths: set[str] = set()
 
             for info in infos:
                 if info.is_dir():
@@ -269,6 +282,20 @@ def _process_archive_bytes(
 
                 member_path = _safe_member_name(info.filename)
                 member_locator = f"{locator}!/{member_path}"
+
+                if member_path in seen_member_paths:
+                    raise ArchiveSafetyError(
+                        f"duplicate archive member path at token="
+                        f"{_locator_token(member_locator)}"
+                    )
+                seen_member_paths.add(member_path)
+
+                unix_mode = info.external_attr >> 16
+                if info.create_system == 3 and stat.S_ISLNK(unix_mode):
+                    raise ArchiveSafetyError(
+                        f"archive symlink member unsupported at token="
+                        f"{_locator_token(member_locator)}"
+                    )
 
                 if info.flag_bits & 0x1:
                     raise ArchiveSafetyError(
@@ -336,9 +363,9 @@ def _process_archive_bytes(
                     state,
                     content_sha256=_sha256_bytes(member_bytes),
                     size_bytes=len(member_bytes),
-                    extension=extension,
                     occurrence=ArtifactOccurrence(
                         source_locator=member_locator,
+                        extension=extension,
                         archive_lineage=member_lineage,
                     ),
                 )
@@ -417,9 +444,9 @@ def _process_regular_file(
         state,
         content_sha256=digest,
         size_bytes=size_bytes,
-        extension=extension,
         occurrence=ArtifactOccurrence(
             source_locator=locator,
+            extension=extension,
             archive_lineage=(),
         ),
     )
@@ -475,7 +502,7 @@ def discover_files(
         DiscoveredArtifact(
             content_sha256=digest,
             size_bytes=acc.size_bytes,
-            extension=acc.extension,
+            extension=_common_artifact_extension(acc.occurrences),
             occurrences=tuple(
                 sorted(
                     acc.occurrences,
