@@ -459,14 +459,14 @@ class SourceDocumentIdentity:
 @dataclass(frozen=True)
 class SourceProvenanceContract:
     source_document_id: str
-    raw_locator: str
+    raw_locator: str = field(repr=False)
     page_number: int | None = None
     image_index: int | None = None
     row_index: int | None = None
     block_id: str | None = None
-    raw_text: str = ""
-    raw_reference: str = ""
-    raw_description: str = ""
+    raw_text: str = field(default="", repr=False)
+    raw_reference: str = field(default="", repr=False)
+    raw_description: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -487,9 +487,12 @@ class SourceProvenanceContract:
 
 @dataclass(frozen=True)
 class ReferenceEvidenceContract:
-    raw_reference: str
-    normalized_reference: str | None = None
-    provider_transaction_id_raw: str | None = None
+    raw_reference: str = field(repr=False)
+    normalized_reference: str | None = field(default=None, repr=False)
+    provider_transaction_id_raw: str | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "raw_reference", str(self.raw_reference))
