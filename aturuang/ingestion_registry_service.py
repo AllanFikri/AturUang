@@ -44,6 +44,15 @@ class DocumentRegistrationResult:
 
 
 @dataclass(frozen=True)
+class SourceDocumentReadRecord:
+    source_document_id: str
+    source_registry_id: str
+    content_sha256: str
+    natural_document_key: str
+    semantic_sha256: str | None
+
+
+@dataclass(frozen=True)
 class AccountResolutionResult:
     status: str
     account_id: str | None = None
@@ -205,6 +214,44 @@ def resolve_template(
 
     return TemplateResolution(
         status=TemplateMatchStatus.UNKNOWN_TEMPLATE,
+    )
+
+
+def lookup_source_documents_by_content_sha(
+    con: sqlite3.Connection,
+    *,
+    content_sha256: str,
+) -> tuple[SourceDocumentReadRecord, ...]:
+    """Returns existing document identity rows by exact SHA without writes."""
+    _require_registry_schema(con)
+
+    rows = con.execute(
+        """
+        SELECT source_document_id,
+               source_registry_id,
+               content_sha256,
+               natural_document_key,
+               semantic_sha256
+        FROM registry_source_documents
+        WHERE content_sha256=?
+        ORDER BY source_document_id
+        """,
+        (content_sha256,),
+    ).fetchall()
+
+    return tuple(
+        SourceDocumentReadRecord(
+            source_document_id=str(row["source_document_id"]),
+            source_registry_id=str(row["source_registry_id"]),
+            content_sha256=str(row["content_sha256"]),
+            natural_document_key=str(row["natural_document_key"]),
+            semantic_sha256=(
+                str(row["semantic_sha256"])
+                if row["semantic_sha256"]
+                else None
+            ),
+        )
+        for row in rows
     )
 
 
