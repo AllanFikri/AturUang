@@ -97,7 +97,7 @@ _DATE_RE = re.compile(
     r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b",
 )
 _DATE_FILTER_RE = re.compile(
-    r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s*[-–—\s]+\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
+    r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\s*[-–—]\s*(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})",
 )
 _MONTH_HEADER_RE = re.compile(
     r"\b([A-Za-z]+)\s+(\d{4})\b",
@@ -321,44 +321,49 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
         period_status = PeriodStatus.UNKNOWN
         natural_key: str | None = None
 
-        date_filter_match = _DATE_FILTER_RE.search(full_text) or _DATE_FILTER_RE.search(ocr_result.text)
+        header_filter_lines = [
+            l.text for l in sorted_lines
+            if l.y < 600 and l.x < 500
+        ]
+        header_filter_text = " ".join(header_filter_lines)
+
+        date_filter_match = (
+            _DATE_FILTER_RE.search(header_filter_text)
+            or _DATE_FILTER_RE.search(full_text)
+            or _DATE_FILTER_RE.search(ocr_result.text)
+        )
         if date_filter_match:
             d1, m1_str, y1, d2, m2_str, y2 = date_filter_match.groups()
             m1 = _MONTH_NAME_TO_INT.get(m1_str.lower())
             m2 = _MONTH_NAME_TO_INT.get(m2_str.lower())
             if m1 and m2:
-                y1_int, y2_int = int(y1), int(y2)
-                d1_int, d2_int = int(d1), int(d2)
-                period_start_str = f"{y1_int:04d}-{m1:02d}-{d1_int:02d}"
-                period_end_str = f"{y2_int:04d}-{m2:02d}-{d2_int:02d}"
-                natural_key = f"shopeepay_mutation:unidentified_wallet:{y1_int:04d}-{m1:02d}"
-
-                last_day_of_month = calendar.monthrange(y2_int, m2)[1]
-                if d1_int == 1 and d2_int == last_day_of_month and m1 == m2 and y1_int == y2_int:
-                    period_status = PeriodStatus.CLOSED
-                else:
-                    period_status = PeriodStatus.OPEN
-        else:
-            # Check if header lines have 2 explicit dates representing a range
-            header_lines = [l.text for l in sorted_lines if l.y < 700]
-            header_text = " ".join(header_lines)
-            all_dates = _DATE_RE.findall(header_text)
-            if len(all_dates) >= 2:
-                d1, m1_str, y1 = all_dates[0]
-                d2, m2_str, y2 = all_dates[1]
-                m1 = _MONTH_NAME_TO_INT.get(m1_str.lower())
-                m2 = _MONTH_NAME_TO_INT.get(m2_str.lower())
-                if m1 and m2:
+                try:
                     y1_int, y2_int = int(y1), int(y2)
                     d1_int, d2_int = int(d1), int(d2)
-                    period_start_str = f"{y1_int:04d}-{m1:02d}-{d1_int:02d}"
-                    period_end_str = f"{y2_int:04d}-{m2:02d}-{d2_int:02d}"
-                    natural_key = f"shopeepay_mutation:unidentified_wallet:{y1_int:04d}-{m1:02d}"
-                    last_day_of_month = calendar.monthrange(y2_int, m2)[1]
-                    if d1_int == 1 and d2_int == last_day_of_month and m1 == m2 and y1_int == y2_int:
-                        period_status = PeriodStatus.CLOSED
-                    else:
-                        period_status = PeriodStatus.OPEN
+                except ValueError:
+                    y1_int = y2_int = d1_int = d2_int = 0
+
+                # Strictly validate monthly period authority:
+                # - start year == end year
+                # - start month == end month
+                # - start day == 1
+                # - end day valid for that calendar month (1 <= d2 <= last_day)
+                if (
+                    y1_int > 0
+                    and y1_int == y2_int
+                    and m1 == m2
+                    and d1_int == 1
+                ):
+                    last_day_of_month = calendar.monthrange(y1_int, m1)[1]
+                    if 1 <= d2_int <= last_day_of_month:
+                        period_start_str = f"{y1_int:04d}-{m1:02d}-{d1_int:02d}"
+                        period_end_str = f"{y2_int:04d}-{m2:02d}-{d2_int:02d}"
+                        natural_key = f"shopeepay_mutation:unidentified_wallet:{y1_int:04d}-{m1:02d}"
+
+                        if d2_int == last_day_of_month:
+                            period_status = PeriodStatus.CLOSED
+                        else:
+                            period_status = PeriodStatus.OPEN
 
         # 6. Card Parsing
         parsed_cards = self._parse_transaction_cards(sorted_lines)

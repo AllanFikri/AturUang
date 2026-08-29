@@ -246,47 +246,103 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
 
     # 10. Adapter period authority: CLOSED
     def test_10_adapter_period_authority_closed(self) -> None:
-        # C. Explicit complete month range creates CLOSED period
         img_bytes = _make_synthetic_image(1220, 4000)
         inp = self._make_adapter_input(img_bytes)
-        adapter = ShopeePayTransactionHistoryImageAdapter(
-            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
-        )
-        res = adapter.parse(inp)
-        self.assertEqual(res.period_status, PeriodStatus.CLOSED)
-        self.assertEqual(res.period_start, "2025-11-01")
-        self.assertEqual(res.period_end, "2025-11-30")
 
-        # A. Standalone month heading "November 2099" does NOT create CLOSED period
-        standalone_month_ocr = ImageOcrResult(
-            lines=(
-                ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
-                ImageOcrLine(text="Payment Method", x=50, y=150, width=200, height=30),
-                ImageOcrLine(text="Top Up", x=50, y=200, width=100, height=30),
-                ImageOcrLine(text="November 2099", x=50, y=250, width=150, height=30),
-                ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
-                ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
-                ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
-                ImageOcrLine(text="15 November 2099", x=50, y=500, width=200, height=30),
-            ),
-            image_width=1220,
-            image_height=2000,
+        # A. Explicit dash creates CLOSED period
+        adapter_dash = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: ImageOcrResult(
+                lines=(
+                    ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                    ImageOcrLine(text="01 November 2099 - 30 November 2099", x=50, y=150, width=300, height=30),
+                    ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
+                    ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
+                    ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                    ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
+                    ImageOcrLine(text="15 November 2099", x=50, y=500, width=200, height=30),
+                ),
+                image_width=1220,
+                image_height=2000,
+            )
         )
-        adapter_standalone = ShopeePayTransactionHistoryImageAdapter(
-            ocr_extractor=lambda b: standalone_month_ocr
-        )
-        res_standalone = adapter_standalone.parse(inp)
-        self.assertEqual(res_standalone.period_status, PeriodStatus.UNKNOWN)
-        self.assertIsNone(res_standalone.period_start)
-        self.assertIsNone(res_standalone.period_end)
-        self.assertIsNone(res_standalone.natural_document_key_candidate)
+        res_dash = adapter_dash.parse(inp)
+        self.assertEqual(res_dash.period_status, PeriodStatus.CLOSED)
+        self.assertEqual(res_dash.period_start, "2099-11-01")
+        self.assertEqual(res_dash.period_end, "2099-11-30")
+        self.assertEqual(res_dash.natural_document_key_candidate, "shopeepay_mutation:unidentified_wallet:2099-11")
 
-        # B. Transaction date "25 November 2099" does NOT create CLOSED period
-        tx_date_only_ocr = ImageOcrResult(
+        # B. En dash creates CLOSED period
+        adapter_en = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: ImageOcrResult(
+                lines=(
+                    ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                    ImageOcrLine(text="01 November 2099 – 30 November 2099", x=50, y=150, width=300, height=30),
+                    ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
+                    ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
+                    ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                    ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
+                    ImageOcrLine(text="15 November 2099", x=50, y=500, width=200, height=30),
+                ),
+                image_width=1220,
+                image_height=2000,
+            )
+        )
+        res_en = adapter_en.parse(inp)
+        self.assertEqual(res_en.period_status, PeriodStatus.CLOSED)
+
+        # C. Em dash creates CLOSED period
+        adapter_em = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: ImageOcrResult(
+                lines=(
+                    ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                    ImageOcrLine(text="01 November 2099 — 30 November 2099", x=50, y=150, width=300, height=30),
+                    ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
+                    ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
+                    ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                    ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
+                    ImageOcrLine(text="15 November 2099", x=50, y=500, width=200, height=30),
+                ),
+                image_width=1220,
+                image_height=2000,
+            )
+        )
+        res_em = adapter_em.parse(inp)
+        self.assertEqual(res_em.period_status, PeriodStatus.CLOSED)
+
+        # D. Whitespace-only between dates is rejected -> UNKNOWN
+        adapter_ws = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: ImageOcrResult(
+                lines=(
+                    ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                    ImageOcrLine(text="01 November 2099 30 November 2099", x=50, y=150, width=300, height=30),
+                    ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
+                    ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
+                    ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                    ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
+                    ImageOcrLine(text="15 November 2099", x=50, y=500, width=200, height=30),
+                ),
+                image_width=1220,
+                image_height=2000,
+            )
+        )
+        res_ws = adapter_ws.parse(inp)
+        self.assertEqual(res_ws.period_status, PeriodStatus.UNKNOWN)
+        self.assertIsNone(res_ws.period_start)
+        self.assertIsNone(res_ws.period_end)
+        self.assertIsNone(res_ws.natural_document_key_candidate)
+
+        # E. Two separate transaction dates with no delimiter -> UNKNOWN
+        tx_dates_ocr = ImageOcrResult(
             lines=(
                 ImageOcrLine(text="Riwayat Transaksi", x=50, y=100, width=300, height=30),
                 ImageOcrLine(text="Semua", x=50, y=150, width=100, height=30),
                 ImageOcrLine(text="Top Up", x=50, y=200, width=100, height=30),
+                ImageOcrLine(text="01 November 2099", x=50, y=250, width=150, height=30),
+                ImageOcrLine(text="30 November 2099", x=50, y=300, width=150, height=30),
                 ImageOcrLine(text="+Rp50.000", x=800, y=400, width=150, height=30),
                 ImageOcrLine(text="Isi Saldo", x=50, y=450, width=200, height=30),
                 ImageOcrLine(text="25 November 2099", x=50, y=500, width=200, height=30),
@@ -295,7 +351,7 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
             image_height=2000,
         )
         adapter_tx = ShopeePayTransactionHistoryImageAdapter(
-            ocr_extractor=lambda b: tx_date_only_ocr
+            ocr_extractor=lambda b: tx_dates_ocr
         )
         res_tx = adapter_tx.parse(inp)
         self.assertEqual(res_tx.period_status, PeriodStatus.UNKNOWN)
@@ -305,17 +361,77 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
 
     # 11. Adapter period authority: OPEN
     def test_11_adapter_period_authority_open(self) -> None:
-        # D. Explicit partial range creates OPEN period
         img_bytes = _make_synthetic_image(1220, 2000)
         inp = self._make_adapter_input(img_bytes)
-        adapter = ShopeePayTransactionHistoryImageAdapter(
-            ocr_extractor=lambda b: self._get_mock_ocr("valid_partial_august")
+
+        # F. Explicit same-month partial creates OPEN period
+        adapter_partial = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: ImageOcrResult(
+                lines=(
+                    ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                    ImageOcrLine(text="01 August 2099 - 21 August 2099", x=50, y=150, width=300, height=30),
+                    ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
+                    ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
+                    ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                    ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
+                    ImageOcrLine(text="15 August 2099", x=50, y=500, width=200, height=30),
+                ),
+                image_width=1220,
+                image_height=2000,
+            )
         )
-        res = adapter.parse(inp)
-        self.assertEqual(res.period_status, PeriodStatus.OPEN)
-        self.assertEqual(res.period_start, "2026-08-01")
-        self.assertEqual(res.period_end, "2026-08-21")
-        self.assertEqual(res.natural_document_key_candidate, "shopeepay_mutation:unidentified_wallet:2026-08")
+        res_partial = adapter_partial.parse(inp)
+        self.assertEqual(res_partial.period_status, PeriodStatus.OPEN)
+        self.assertEqual(res_partial.period_start, "2099-08-01")
+        self.assertEqual(res_partial.period_end, "2099-08-21")
+        self.assertEqual(res_partial.natural_document_key_candidate, "shopeepay_mutation:unidentified_wallet:2099-08")
+
+        # G. Explicit cross-month range rejected -> UNKNOWN
+        adapter_cross = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: ImageOcrResult(
+                lines=(
+                    ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                    ImageOcrLine(text="25 October 2099 - 05 November 2099", x=50, y=150, width=300, height=30),
+                    ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
+                    ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
+                    ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                    ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
+                    ImageOcrLine(text="02 November 2099", x=50, y=500, width=200, height=30),
+                ),
+                image_width=1220,
+                image_height=2000,
+            )
+        )
+        res_cross = adapter_cross.parse(inp)
+        self.assertEqual(res_cross.period_status, PeriodStatus.UNKNOWN)
+        self.assertIsNone(res_cross.period_start)
+        self.assertIsNone(res_cross.period_end)
+        self.assertIsNone(res_cross.natural_document_key_candidate)
+
+        # H. Same month but start day != 1 rejected -> UNKNOWN
+        adapter_non_first = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: ImageOcrResult(
+                lines=(
+                    ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                    ImageOcrLine(text="05 November 2099 - 30 November 2099", x=50, y=150, width=300, height=30),
+                    ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
+                    ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
+                    ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                    ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
+                    ImageOcrLine(text="15 November 2099", x=50, y=500, width=200, height=30),
+                ),
+                image_width=1220,
+                image_height=2000,
+            )
+        )
+        res_non_first = adapter_non_first.parse(inp)
+        self.assertEqual(res_non_first.period_status, PeriodStatus.UNKNOWN)
+        self.assertIsNone(res_non_first.period_start)
+        self.assertIsNone(res_non_first.period_end)
+        self.assertIsNone(res_non_first.natural_document_key_candidate)
 
     # 12. Valid high-res JPEG extraction
     def test_12_valid_high_res_jpeg_extraction(self) -> None:
