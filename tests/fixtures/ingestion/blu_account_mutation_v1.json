@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "privacy": "synthetic-sanitized-only",
+  "cases": {
+    "single_page_statement": {
+      "pages": [
+        "Nama / Name\nSYNTHETIC USER\nRekening / Account\nbluAccount\n \n \nPeriode / Period\nAugust 2024\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n0,00\nSaldo Akhir / Ending Balance\n25.000,00\n75.000,00\n50.000,00\nRp\nRp\nRp\nRp\nbluAccount\nHalaman 1 dari 1 / Page 1 of 1\nKeterangan / Remarks\nDetail Transaksi | Ref / Transaction Details | Ref\nNominal Sisa SaldoTanggal & Jam\nDate & Time Amount Remaining Balance\nbluAccount - 0060 9999 8888\n03 Aug 2024\n10:00 Bank Transfer In\nDana Masuk dari SENDER 75.000,00 75.000,00\n03 Aug 2024\n12:00 Payment QR | REF123456789\nPembayaran QR - 50.000,00 25.000,00\nDisclaimer\nBCA Digital berizin dan diawasi oleh OJK\nblubybcadigital.id \t haloblu 1500668"
+      ]
+    },
+    "multipage_statement": {
+      "pages": [
+        "Nama / Name\nSYNTHETIC USER\nRekening / Account\nbluAccount\n \n \nPeriode / Period\nAugust 2025\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n100.000,00\nSaldo Akhir / Ending Balance\n120.000,00\n50.000,00\n30.000,00\nRp\nRp\nRp\nRp\nbluAccount\nHalaman 1 dari 2 / Page 1 of 2\nKeterangan / Remarks\nDetail Transaksi | Ref / Transaction Details | Ref\nNominal Sisa SaldoTanggal & Jam\nDate & Time Amount Remaining Balance\nbluAccount - 0060 9999 8888\n05 Aug 2025\n09:00 Deposit Inflow\nDana Masuk 50.000,00 150.000,00\nBCA Digital berizin",
+        "bluAccount\nHalaman 2 dari 2 / Page 2 of 2\n06 Aug 2025\n14:00 Transfer Out | TRF99887766\nTransfer ke RECEIVER - 30.000,00 120.000,00\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n120.000,00\n100.000,00\nSaldo Akhir / Ending Balance\n-30.000,00\n50.000,00\nDisclaimer"
+      ]
+    },
+    "zero_activity_statement": {
+      "pages": [
+        "Halaman 1 dari 1 / Page 1 of 1\nNama / Name\nSYNTHETIC USER\nRekening / Account\n \n \nPeriode / Period\nFebruary 2025\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n138,51\nSaldo Akhir / Ending Balance\n138,51\nRp\nRp\nRp\nRp\n0,00\n0,00\nbluAccount\nbluAccount\nKeterangan / Remarks\nDetail Transaksi | Ref / Transaction Details | Ref\nNominal Sisa SaldoTanggal & Jam\nDate & Time Amount Remaining Balance\nTidak ada transaksi pada periode ini\n \nNo transactions were recorded during this period\nDisclaimer"
+      ]
+    },
+    "open_period_statement": {
+      "pages": [
+        "Nama / Name\nSYNTHETIC USER\nRekening / Account\nbluAccount\n \n \nPeriode / Period\n01 - 28 Agu 2026 09:37\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n10.000,00\nSaldo Akhir / Ending Balance\n15.000,00\n5.000,00\n0,00\nRp\nRp\nRp\nRp\nbluAccount\nHalaman 1 dari 1 / Page 1 of 1\nKeterangan / Remarks\nDetail Transaksi | Ref / Transaction Details | Ref\nNominal Sisa SaldoTanggal & Jam\nDate & Time Amount Remaining Balance\nbluAccount - 0060 9999 8888\n10 Agu 2026\n08:30 Bonus Cashback\nCashback 5.000,00 15.000,00\nDisclaimer"
+      ]
+    },
+    "summary_mismatch_statement": {
+      "pages": [
+        "Nama / Name\nSYNTHETIC USER\nRekening / Account\nbluAccount\n \n \nPeriode / Period\nAugust 2024\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n0,00\nSaldo Akhir / Ending Balance\n999.999,00\n75.000,00\n50.000,00\nRp\nRp\nRp\nRp\nbluAccount\nHalaman 1 dari 1 / Page 1 of 1\nKeterangan / Remarks\nDetail Transaksi | Ref / Transaction Details | Ref\nNominal Sisa SaldoTanggal & Jam\nDate & Time Amount Remaining Balance\nbluAccount - 0060 9999 8888\n03 Aug 2024\n10:00 Bank Transfer In\nDana Masuk dari SENDER 75.000,00 75.000,00\nDisclaimer"
+      ]
+    },
+    "running_balance_inconsistent_statement": {
+      "pages": [
+        "Nama / Name\nSYNTHETIC USER\nRekening / Account\nbluAccount\n \n \nPeriode / Period\nAugust 2024\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n0,00\nSaldo Akhir / Ending Balance\n25.000,00\n75.000,00\n50.000,00\nRp\nRp\nRp\nRp\nbluAccount\nHalaman 1 dari 1 / Page 1 of 1\nKeterangan / Remarks\nDetail Transaksi | Ref / Transaction Details | Ref\nNominal Sisa SaldoTanggal & Jam\nDate & Time Amount Remaining Balance\nbluAccount - 0060 9999 8888\n03 Aug 2024\n10:00 Bank Transfer In\nDana Masuk dari SENDER 75.000,00 75.000,00\n03 Aug 2024\n12:00 Payment QR | REF123456789\nPembayaran QR - 50.000,00 999.000,00\nDisclaimer"
+      ]
+    },
+    "missing_period_statement": {
+      "pages": [
+        "Nama / Name\nSYNTHETIC USER\nRekening / Account\nbluAccount\n \n \nPeriode / Period\nINVALID PERIOD STRING\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n0,00\nSaldo Akhir / Ending Balance\n0,00\n0,00\n0,00\nRp\nRp\nRp\nRp\nbluAccount\nDisclaimer"
+      ]
+    },
+    "decoy_identity_statement": {
+      "pages": [
+        "Nama / Name\nSYNTHETIC USER\nRekening / Account\nbluAccount\n \n \nPeriode / Period\nAugust 2024\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n0,00\nSaldo Akhir / Ending Balance\n0,00\n0,00\n0,00\nRp\nRp\nRp\nRp\nbluAccount\nCall Center 1500 668\nDisclaimer"
+      ]
+    },
+    "conflicting_identity_statement": {
+      "pages": [
+        "Nama / Name\nSYNTHETIC USER\nRekening / Account\nbluAccount\n \n \nPeriode / Period\nAugust 2024\nMata Uang / Currency\nIDR (Rp)\nTotal Pemasukan / Total Income\nTotal Pengeluaran / Total Expense\nSaldo Awal / Initial Balance\n0,00\nSaldo Akhir / Ending Balance\n25.000,00\n75.000,00\n50.000,00\nRp\nRp\nRp\nRp\nbluAccount\nHalaman 1 dari 1 / Page 1 of 1\nKeterangan / Remarks\nDetail Transaksi | Ref / Transaction Details | Ref\nNominal Sisa SaldoTanggal & Jam\nDate & Time Amount Remaining Balance\nbluAccount - 0060 9999 8888\nbluAccount - 0060 1111 2222\n03 Aug 2024\n10:00 Bank Transfer In\nDana Masuk dari SENDER 75.000,00 75.000,00\n03 Aug 2024\n12:00 Payment QR | REF123456789\nPembayaran QR - 50.000,00 25.000,00\nDisclaimer"
+      ]
+    }
+  }
+}
