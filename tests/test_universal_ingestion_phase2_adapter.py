@@ -1,7 +1,9 @@
-import unittest
+from dataclasses import fields
 from decimal import Decimal
+import unittest
 
 from aturuang.ingestion_adapter import (
+    AccountPeriodSummaryEvidence,
     AdapterContractError,
     AdapterDescriptor,
     AdapterInput,
@@ -522,6 +524,130 @@ class TestUniversalIngestionPhase2Adapter(unittest.TestCase):
         self.assertNotIn("SECRET-RAW-REFERENCE", rendered)
         self.assertNotIn("SECRETNORMALIZED", rendered)
         self.assertNotIn("SECRET-TX-ID", rendered)
+
+    def test_27_account_period_summary_evidence_contract(self):
+        summary = AccountPeriodSummaryEvidence(
+            observed_provider_account_key="POCKET-SECRET-991122",
+            currency="IDR",
+            period_start="2026-07-01",
+            period_end="2026-07-31",
+            opening_balance=Decimal("1000000.00"),
+            incoming_total=Decimal("500000.00"),
+            outgoing_total=Decimal("200000.00"),
+            closing_balance=Decimal("1300000.00"),
+        )
+
+        self.assertEqual(
+            summary.observed_provider_account_key,
+            "POCKET-SECRET-991122",
+        )
+        self.assertEqual(summary.currency, "IDR")
+        self.assertEqual(summary.period_start, "2026-07-01")
+        self.assertEqual(summary.period_end, "2026-07-31")
+        self.assertEqual(summary.opening_balance, Decimal("1000000.00"))
+        self.assertEqual(summary.incoming_total, Decimal("500000.00"))
+        self.assertEqual(summary.outgoing_total, Decimal("200000.00"))
+        self.assertEqual(summary.closing_balance, Decimal("1300000.00"))
+
+        rendered = repr(summary)
+        self.assertNotIn("POCKET-SECRET-991122", rendered)
+
+        with self.assertRaises(AdapterContractError):
+            AccountPeriodSummaryEvidence(
+                observed_provider_account_key="",
+                currency="IDR",
+            )
+
+        envelope = NormalizedEventEnvelope(
+            source_document_id="doc-synthetic-01",
+            source_registry_id="jago_statement",
+            template_id="jago_monthly_statement_v1",
+            parser_version="parser-v1",
+            source_channel=SourceChannel.PDF,
+            event_role=EventRole.ACCOUNT_PERIOD_SUMMARY,
+            source_event_id=None,
+            row_fingerprint=sha("a"),
+            evidence_quality=ConfidenceLevel.HIGH,
+            parse_confidence=ConfidenceLevel.HIGH,
+            provenance=SourceProvenanceContract(
+                source_document_id="doc-synthetic-01",
+                raw_locator="jago:pocket:1",
+                raw_text="POCKET SUMMARY SYNTHETIC",
+            ),
+            payload=summary,
+        )
+        self.assertIs(
+            envelope.event_role,
+            EventRole.ACCOUNT_PERIOD_SUMMARY,
+        )
+        self.assertIsInstance(
+            envelope.payload,
+            AccountPeriodSummaryEvidence,
+        )
+
+    def test_28_source_summary_boundary_and_account_period_summary_type_role_validation(self):
+        source_summary_field_names = tuple(
+            f.name for f in fields(SourceSummaryEvidence)
+        )
+        expected_fields = (
+            "currency",
+            "period_start",
+            "period_end",
+            "opening_balance",
+            "incoming_total",
+            "outgoing_total",
+            "closing_balance",
+        )
+        self.assertEqual(source_summary_field_names, expected_fields)
+
+        account_summary = AccountPeriodSummaryEvidence(
+            observed_provider_account_key="POCKET-01",
+            currency="IDR",
+            opening_balance=Decimal("100.00"),
+            closing_balance=Decimal("200.00"),
+        )
+        source_summary = SourceSummaryEvidence(
+            currency="IDR",
+            opening_balance=Decimal("100.00"),
+            closing_balance=Decimal("200.00"),
+        )
+        prov = SourceProvenanceContract(
+            source_document_id="doc-synthetic-01",
+            raw_locator="loc:1",
+            raw_text="SYNTHETIC",
+        )
+
+        with self.assertRaises(AdapterContractError):
+            NormalizedEventEnvelope(
+                source_document_id="doc-synthetic-01",
+                source_registry_id="jago_statement",
+                template_id="jago_monthly_statement_v1",
+                parser_version="parser-v1",
+                source_channel=SourceChannel.PDF,
+                event_role=EventRole.ACCOUNT_PERIOD_SUMMARY,
+                source_event_id=None,
+                row_fingerprint=sha("a"),
+                evidence_quality=ConfidenceLevel.HIGH,
+                parse_confidence=ConfidenceLevel.HIGH,
+                provenance=prov,
+                payload=source_summary,
+            )
+
+        with self.assertRaises(AdapterContractError):
+            NormalizedEventEnvelope(
+                source_document_id="doc-synthetic-01",
+                source_registry_id="jago_statement",
+                template_id="jago_monthly_statement_v1",
+                parser_version="parser-v1",
+                source_channel=SourceChannel.PDF,
+                event_role=EventRole.SOURCE_SUMMARY,
+                source_event_id=None,
+                row_fingerprint=sha("b"),
+                evidence_quality=ConfidenceLevel.HIGH,
+                parse_confidence=ConfidenceLevel.HIGH,
+                provenance=prov,
+                payload=account_summary,
+            )
 
 
 if __name__ == "__main__":

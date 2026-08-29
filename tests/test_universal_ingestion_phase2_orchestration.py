@@ -5,6 +5,7 @@ import unittest
 from hashlib import sha256
 
 from aturuang.ingestion_adapter import (
+    AccountPeriodSummaryEvidence,
     AdapterDescriptor,
     AdapterParseStatus,
     AdapterResult,
@@ -1266,6 +1267,195 @@ class TestUniversalIngestionPhase2Orchestration(unittest.TestCase):
             batch.overall_status,
             DryRunBatchStatus.FAILED,
         )
+
+    def test_49_source_summary_semantic_canonical_form_locked(self):
+        desc = AdapterDescriptor(
+            adapter_id="synthetic-summary-adapter",
+            source_registry_id="synthetic_statement",
+            template_id="synthetic_template_v1",
+            parser_version="parser-v1",
+            source_channel=SourceChannel.PDF,
+        )
+        prov = SourceProvenanceContract(
+            source_document_id="doc-synthetic-001",
+            raw_locator="synthetic:summary:1",
+            page_number=1,
+            row_index=1,
+            raw_text="SYNTHETIC SUMMARY TEXT",
+        )
+        summary_payload = SourceSummaryEvidence(
+            currency="IDR",
+            period_start="2026-07-01",
+            period_end="2026-07-31",
+            opening_balance=Decimal("1000000.00"),
+            incoming_total=Decimal("250000.00"),
+            outgoing_total=Decimal("100000.00"),
+            closing_balance=Decimal("1150000.00"),
+        )
+        envelope = NormalizedEventEnvelope(
+            source_document_id="doc-synthetic-001",
+            source_registry_id="synthetic_statement",
+            template_id="synthetic_template_v1",
+            parser_version="parser-v1",
+            source_channel=SourceChannel.PDF,
+            event_role=EventRole.SOURCE_SUMMARY,
+            source_event_id=None,
+            row_fingerprint="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            evidence_quality=ConfidenceLevel.HIGH,
+            parse_confidence=ConfidenceLevel.HIGH,
+            provenance=prov,
+            payload=summary_payload,
+        )
+        result = AdapterResult(
+            descriptor=desc,
+            source_document_id="doc-synthetic-001",
+            parse_status=AdapterParseStatus.COMPLETED,
+            period_status=PeriodStatus.CLOSED,
+            events=(envelope,),
+            period_start="2026-07-01",
+            period_end="2026-07-31",
+            natural_document_key_candidate="synthetic_statement:account-001:2026-07",
+        )
+        canonical_json = semantic_document_canonical_json(
+            "synthetic_statement",
+            result.natural_document_key_candidate,
+            result,
+        )
+        canonical_sha = sha256(canonical_json.encode("utf-8")).hexdigest()
+        semantic_sha = semantic_document_sha256(
+            "synthetic_statement",
+            result.natural_document_key_candidate,
+            result,
+        )
+        self.assertEqual(
+            canonical_sha,
+            "47757b3a51ecaab5b947abaf821a40d0517d5b28ea87b24b57778a5bb1468e24",
+        )
+        self.assertEqual(
+            semantic_sha,
+            "47757b3a51ecaab5b947abaf821a40d0517d5b28ea87b24b57778a5bb1468e24",
+        )
+
+    def test_50_account_period_summary_scoped_semantic_identity(self):
+        desc = AdapterDescriptor(
+            adapter_id="synthetic-scoped-adapter",
+            source_registry_id="jago_statement",
+            template_id="jago_monthly_statement_v1",
+            parser_version="parser-v1",
+            source_channel=SourceChannel.PDF,
+        )
+
+        def make_result(pocket_key: str, locator: str) -> AdapterResult:
+            prov = SourceProvenanceContract(
+                source_document_id="doc-jago-01",
+                raw_locator=locator,
+                raw_text="POCKET SUMMARY EVIDENCE",
+            )
+            payload = AccountPeriodSummaryEvidence(
+                observed_provider_account_key=pocket_key,
+                currency="IDR",
+                period_start="2026-07-01",
+                period_end="2026-07-31",
+                opening_balance=Decimal("100000.00"),
+                incoming_total=Decimal("50000.00"),
+                outgoing_total=Decimal("20000.00"),
+                closing_balance=Decimal("130000.00"),
+            )
+            envelope = NormalizedEventEnvelope(
+                source_document_id="doc-jago-01",
+                source_registry_id="jago_statement",
+                template_id="jago_monthly_statement_v1",
+                parser_version="parser-v1",
+                source_channel=SourceChannel.PDF,
+                event_role=EventRole.ACCOUNT_PERIOD_SUMMARY,
+                source_event_id=None,
+                row_fingerprint="f" * 64,
+                evidence_quality=ConfidenceLevel.HIGH,
+                parse_confidence=ConfidenceLevel.HIGH,
+                provenance=prov,
+                payload=payload,
+            )
+            return AdapterResult(
+                descriptor=desc,
+                source_document_id="doc-jago-01",
+                parse_status=AdapterParseStatus.COMPLETED,
+                period_status=PeriodStatus.CLOSED,
+                events=(envelope,),
+                period_start="2026-07-01",
+                period_end="2026-07-31",
+                natural_document_key_candidate="jago_statement:cust-001:2026-07",
+            )
+
+        res_a1 = make_result("POCKET-A", "loc:page1:1")
+        res_a2 = make_result("POCKET-A", "loc:different_page:99")
+        res_b = make_result("POCKET-B", "loc:page1:1")
+
+        sha_a1 = semantic_document_sha256(
+            "jago_statement",
+            res_a1.natural_document_key_candidate,
+            res_a1,
+        )
+        sha_a2 = semantic_document_sha256(
+            "jago_statement",
+            res_a2.natural_document_key_candidate,
+            res_a2,
+        )
+        sha_b = semantic_document_sha256(
+            "jago_statement",
+            res_b.natural_document_key_candidate,
+            res_b,
+        )
+
+        # Same pocket key with different locator -> same semantic sha
+        self.assertEqual(sha_a1, sha_a2)
+
+        # Different pocket key -> different semantic sha
+        self.assertNotEqual(sha_a1, sha_b)
+
+        # Distinct from unscoped SOURCE_SUMMARY
+        unscoped_payload = SourceSummaryEvidence(
+            currency="IDR",
+            period_start="2026-07-01",
+            period_end="2026-07-31",
+            opening_balance=Decimal("100000.00"),
+            incoming_total=Decimal("50000.00"),
+            outgoing_total=Decimal("20000.00"),
+            closing_balance=Decimal("130000.00"),
+        )
+        unscoped_envelope = NormalizedEventEnvelope(
+            source_document_id="doc-jago-01",
+            source_registry_id="jago_statement",
+            template_id="jago_monthly_statement_v1",
+            parser_version="parser-v1",
+            source_channel=SourceChannel.PDF,
+            event_role=EventRole.SOURCE_SUMMARY,
+            source_event_id=None,
+            row_fingerprint="f" * 64,
+            evidence_quality=ConfidenceLevel.HIGH,
+            parse_confidence=ConfidenceLevel.HIGH,
+            provenance=SourceProvenanceContract(
+                source_document_id="doc-jago-01",
+                raw_locator="loc:page1:1",
+                raw_text="POCKET SUMMARY EVIDENCE",
+            ),
+            payload=unscoped_payload,
+        )
+        unscoped_res = AdapterResult(
+            descriptor=desc,
+            source_document_id="doc-jago-01",
+            parse_status=AdapterParseStatus.COMPLETED,
+            period_status=PeriodStatus.CLOSED,
+            events=(unscoped_envelope,),
+            period_start="2026-07-01",
+            period_end="2026-07-31",
+            natural_document_key_candidate="jago_statement:cust-001:2026-07",
+        )
+        sha_unscoped = semantic_document_sha256(
+            "jago_statement",
+            unscoped_res.natural_document_key_candidate,
+            unscoped_res,
+        )
+        self.assertNotEqual(sha_a1, sha_unscoped)
 
 
 if __name__ == "__main__":

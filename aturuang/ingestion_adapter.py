@@ -38,6 +38,7 @@ class EventRole(str, Enum):
     CASH_MOVEMENT = "CASH_MOVEMENT"
     BALANCE_SNAPSHOT = "BALANCE_SNAPSHOT"
     SOURCE_SUMMARY = "SOURCE_SUMMARY"
+    ACCOUNT_PERIOD_SUMMARY = "ACCOUNT_PERIOD_SUMMARY"
     ACCOUNT_OBSERVATION = "ACCOUNT_OBSERVATION"
     INVESTMENT_TRADE = "INVESTMENT_TRADE"
     COMMERCE_ORDER = "COMMERCE_ORDER"
@@ -548,6 +549,48 @@ class SourceSummaryEvidence:
 
 
 @dataclass(frozen=True)
+class AccountPeriodSummaryEvidence:
+    observed_provider_account_key: str = field(repr=False)
+    currency: str
+    period_start: str | None = None
+    period_end: str | None = None
+    opening_balance: Decimal | None = None
+    incoming_total: Decimal | None = None
+    outgoing_total: Decimal | None = None
+    closing_balance: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "observed_provider_account_key",
+            _require_text(
+                self.observed_provider_account_key,
+                "observed_provider_account_key",
+            ),
+        )
+        object.__setattr__(self, "currency", _currency(self.currency))
+
+        for name in ("period_start", "period_end"):
+            object.__setattr__(
+                self,
+                name,
+                _optional_text(getattr(self, name), name),
+            )
+
+        for name in (
+            "opening_balance",
+            "incoming_total",
+            "outgoing_total",
+            "closing_balance",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _optional_decimal(getattr(self, name), name),
+            )
+
+
+@dataclass(frozen=True)
 class ObservedAccountEvidence:
     observed_provider_account_key: str = field(repr=False)
     display_name_raw: str = field(repr=False)
@@ -773,6 +816,7 @@ EvidencePayload = (
     CashMovementEvidence
     | BalanceSnapshotEvidence
     | SourceSummaryEvidence
+    | AccountPeriodSummaryEvidence
     | ObservedAccountEvidence
     | InvestmentTradeEvidence
     | CommerceOrderEvidence
@@ -783,6 +827,7 @@ _ROLE_PAYLOAD_TYPES: dict[EventRole, type[object]] = {
     EventRole.CASH_MOVEMENT: CashMovementEvidence,
     EventRole.BALANCE_SNAPSHOT: BalanceSnapshotEvidence,
     EventRole.SOURCE_SUMMARY: SourceSummaryEvidence,
+    EventRole.ACCOUNT_PERIOD_SUMMARY: AccountPeriodSummaryEvidence,
     EventRole.ACCOUNT_OBSERVATION: ObservedAccountEvidence,
     EventRole.INVESTMENT_TRADE: InvestmentTradeEvidence,
     EventRole.COMMERCE_ORDER: CommerceOrderEvidence,
@@ -998,6 +1043,7 @@ class UniversalSourceAdapter(Protocol):
 
 
 __all__ = [
+    "AccountPeriodSummaryEvidence",
     "AdapterContractError",
     "AdapterDescriptor",
     "AdapterInput",
