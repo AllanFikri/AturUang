@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, time
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from io import BytesIO
@@ -21,6 +22,7 @@ from .ingestion_adapter import (
     EventRole,
     NormalizedEventEnvelope,
     ObservedAccountEvidence,
+    PaymentComponentEvidence,
     SafeDiagnostic,
     SourceEventStatus,
     SourceSummaryEvidence,
@@ -67,8 +69,8 @@ _MONTHS: dict[str, int] = {
 }
 
 _PHONE_RE = re.compile(r"^\+62\d{8,13}$")
-_DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-_TIME_RE = re.compile(r"^\d{2}:\d{2}$")
+_DATE_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+_TIME_RE = re.compile(r"^(\d{2}):(\d{2})$")
 
 
 def _parse_decimal(text: str) -> Decimal:
@@ -100,7 +102,8 @@ def _parse_date_str(s: str) -> str:
         raise AdapterContractError(f"unrecognized month: {mon_name}")
     mon = _MONTHS[mon_name]
     yr = int(parts[2])
-    return f"{yr:04d}-{mon:02d}-{day:02d}"
+    date_obj = date(yr, mon, day)
+    return date_obj.isoformat()
 
 
 @dataclass(frozen=True)
@@ -122,10 +125,13 @@ class _ParsedGoPayRow:
     direction: EventDirection
     direction_raw: str
     amount: Decimal
+    gross_amount: Decimal
     description_raw: str = field(repr=False)
     provider_transaction_id_raw: str | None = field(default=None, repr=False)
     payment_method_raw: str | None = field(default=None, repr=False)
     is_coins_loyalty: bool = False
+    is_split_payment: bool = False
+    payment_components: tuple[PaymentComponentEvidence, ...] = ()
 
 
 class GoPayEStatementAdapter(UniversalSourceAdapter):
@@ -141,10 +147,12 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
         self, header_lines: Sequence[str]
     ) -> tuple[str | None, bool]:
         candidates: set[str] = set()
-        for line in header_lines:
-            m = _PHONE_RE.match(line.strip())
-            if m:
-                candidates.add(m.group(0))
+        for idx, line in enumerate(header_lines):
+            # Only check header lines in the identity position (line 1 or 2)
+            if idx in (1, 2):
+                m = _PHONE_RE.match(line.strip())
+                if m:
+                    candidates.add(m.group(0))
 
         if len(candidates) == 0:
             return None, False
@@ -191,8 +199,8 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
 
         period_str = p_start[:7]
 
-        # Extract identity from header
-        acc_num, is_ambiguous = self._extract_account_candidates(lines[1:5])
+        # Extract identity from exact structural header position
+        acc_num, is_ambiguous = self._extract_account_candidates(lines[:5])
         if is_ambiguous:
             return None, [
                 SafeDiagnostic(
@@ -268,8 +276,8 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
         return summary, []
 
     def _parse_transaction_rows(
-        self, lines: Sequence[str]
-    ) -> tuple[list[_ParsedGoPayRow], list[SafeDiagnostic]]:
+        self, lines: Sequence[str], summary: _GoPaySummary
+    ) -> tuple[list[_ParsedGoPayRow], list[SafeDiagnostic], bool]:
         rows: list[_ParsedGoPayRow] = []
         diagnostics: list[SafeDiagnostic] = []
 
@@ -289,7 +297,7 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                     message="Transaction table header not found",
                     severity=DiagnosticSeverity.ERROR,
                 )
-            ]
+            ], False
 
         tx_blocks: list[list[str]] = []
         curr_block: list[str] = []
@@ -304,6 +312,9 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
         if curr_block:
             tx_blocks.append(curr_block)
 
+        raw_parsed_rows: list[_ParsedGoPayRow] = []
+        seen_tx_ids: dict[str, tuple[str, ...]] = {}
+
         for blk in tx_blocks:
             if len(blk) < 3:
                 diagnostics.append(
@@ -313,11 +324,11 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                         severity=DiagnosticSeverity.ERROR,
                     )
                 )
-                return [], diagnostics
+                return [], diagnostics, False
 
             d_str = blk[0]
-            d_parts = d_str.split("/")
-            if len(d_parts) != 3:
+            m_date = _DATE_RE.match(d_str)
+            if not m_date:
                 diagnostics.append(
                     SafeDiagnostic(
                         code="GOPAY_ROW_DATETIME_INVALID",
@@ -325,22 +336,52 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                         severity=DiagnosticSeverity.ERROR,
                     )
                 )
-                return [], diagnostics
+                return [], diagnostics, False
 
             try:
-                occurred_date = f"{int(d_parts[2]):04d}-{int(d_parts[1]):02d}-{int(d_parts[0]):02d}"
+                day, mon, yr = (
+                    int(m_date.group(1)),
+                    int(m_date.group(2)),
+                    int(m_date.group(3)),
+                )
+                date_obj = date(yr, mon, day)
+                occurred_date = date_obj.isoformat()
             except ValueError:
                 diagnostics.append(
                     SafeDiagnostic(
                         code="GOPAY_ROW_DATETIME_INVALID",
-                        message="Invalid transaction date values",
+                        message="Invalid calendar date in transaction row",
                         severity=DiagnosticSeverity.ERROR,
                     )
                 )
-                return [], diagnostics
+                return [], diagnostics, False
 
-            t_str = blk[1] if len(blk) > 1 and _TIME_RE.match(blk[1]) else "00:00"
-            occurred_at = f"{occurred_date}T{t_str}:00"
+            if len(blk) < 2 or not _TIME_RE.match(blk[1]):
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="GOPAY_ROW_DATETIME_INVALID",
+                        message="Missing or invalid transaction time",
+                        severity=DiagnosticSeverity.ERROR,
+                    )
+                )
+                return [], diagnostics, False
+
+            m_time = _TIME_RE.match(blk[1])
+            try:
+                hh, mm = int(m_time.group(1)), int(m_time.group(2))
+                time_obj = time(hh, mm)
+                time_str = f"{time_obj.hour:02d}:{time_obj.minute:02d}"
+            except ValueError:
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="GOPAY_ROW_DATETIME_INVALID",
+                        message="Invalid time values in transaction row",
+                        severity=DiagnosticSeverity.ERROR,
+                    )
+                )
+                return [], diagnostics, False
+
+            occurred_at = f"{occurred_date}T{time_str}:00"
 
             desc_line = blk[2] if len(blk) > 2 else ""
             id_line = blk[3] if len(blk) > 3 else ""
@@ -350,12 +391,13 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
 
             # Check if GoPay Coins loyalty event without cash
             if "GoPay Coins" in full_pm_text and "Rp" not in full_pm_text:
-                rows.append(
+                raw_parsed_rows.append(
                     _ParsedGoPayRow(
                         occurred_at=occurred_at,
                         direction=EventDirection.INFLOW,
                         direction_raw="COINS",
                         amount=Decimal("0"),
+                        gross_amount=Decimal("0"),
                         description_raw=desc_line,
                         provider_transaction_id_raw=id_line or None,
                         payment_method_raw="GoPay Coins",
@@ -374,12 +416,12 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                         severity=DiagnosticSeverity.ERROR,
                     )
                 )
-                return [], diagnostics
+                return [], diagnostics, False
 
             sign = m_amt.group(1)
             raw_amt_str = m_amt.group(2).replace(".", "")
             try:
-                amt_dec = Decimal(raw_amt_str)
+                gross_amt_dec = Decimal(raw_amt_str)
             except Exception:
                 diagnostics.append(
                     SafeDiagnostic(
@@ -388,7 +430,7 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                         severity=DiagnosticSeverity.ERROR,
                     )
                 )
-                return [], diagnostics
+                return [], diagnostics, False
 
             if sign == "-":
                 direction = EventDirection.OUTFLOW
@@ -397,27 +439,112 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                 direction = EventDirection.INFLOW
                 direction_raw = "MASUK"
 
+            is_split = (
+                "GoPay Saldo" in full_pm_text and "GoPay Coins" in full_pm_text
+            )
+
             pm_raw = " ".join(l for l in pm_lines if "Rp" not in l).strip()
             if not pm_raw:
-                if "BCA VA" in full_pm_text:
+                if is_split:
+                    pm_raw = "GoPay Saldo / GoPay Coins"
+                elif "BCA VA" in full_pm_text:
                     pm_raw = "BCA VA"
                 elif "GoPay Saldo" in full_pm_text:
                     pm_raw = "GoPay Saldo"
 
-            rows.append(
+            raw_parsed_rows.append(
                 _ParsedGoPayRow(
                     occurred_at=occurred_at,
                     direction=direction,
                     direction_raw=direction_raw,
-                    amount=amt_dec,
+                    amount=gross_amt_dec,
+                    gross_amount=gross_amt_dec,
                     description_raw=desc_line,
                     provider_transaction_id_raw=id_line or None,
                     payment_method_raw=pm_raw or None,
                     is_coins_loyalty=False,
+                    is_split_payment=is_split,
                 )
             )
 
-        return rows, []
+        # Handle Split Payment Resolution
+        split_rows = [r for r in raw_parsed_rows if r.is_split_payment]
+        is_split_ambiguous = False
+
+        if len(split_rows) == 1 and summary.coins_used > 0:
+            sr = split_rows[0]
+            coins_dec = Decimal(summary.coins_used)
+            if sr.gross_amount >= coins_dec:
+                net_cash = sr.gross_amount - coins_dec
+                components = (
+                    PaymentComponentEvidence(
+                        method_raw="GoPay Saldo",
+                        amount=net_cash,
+                        currency="IDR",
+                    ),
+                    PaymentComponentEvidence(
+                        method_raw="GoPay Coins",
+                        amount=coins_dec,
+                        currency="IDR",
+                    ),
+                )
+                resolved_rows: list[_ParsedGoPayRow] = []
+                for r in raw_parsed_rows:
+                    if r is sr:
+                        resolved_rows.append(
+                            _ParsedGoPayRow(
+                                occurred_at=r.occurred_at,
+                                direction=r.direction,
+                                direction_raw=r.direction_raw,
+                                amount=net_cash,
+                                gross_amount=r.gross_amount,
+                                description_raw=r.description_raw,
+                                provider_transaction_id_raw=r.provider_transaction_id_raw,
+                                payment_method_raw=r.payment_method_raw,
+                                is_coins_loyalty=False,
+                                is_split_payment=True,
+                                payment_components=components,
+                            )
+                        )
+                    else:
+                        resolved_rows.append(r)
+                raw_parsed_rows = resolved_rows
+        elif len(split_rows) > 1 and summary.coins_used > 0:
+            is_split_ambiguous = True
+
+        # Handle Duplicate Provider Transaction IDs & Deduplication
+        deduped_rows: list[_ParsedGoPayRow] = []
+        for r in raw_parsed_rows:
+            tx_id = r.provider_transaction_id_raw
+            if tx_id:
+                sig = (
+                    r.occurred_at,
+                    r.direction.value,
+                    str(r.amount),
+                    sha256(r.description_raw.encode("utf-8")).hexdigest(),
+                    sha256((r.payment_method_raw or "").encode("utf-8")).hexdigest(),
+                    str(r.is_coins_loyalty),
+                )
+                if tx_id in seen_tx_ids:
+                    if seen_tx_ids[tx_id] == sig:
+                        # Identical row evidence -> deduplicate
+                        continue
+                    else:
+                        # Conflicting row evidence -> fail closed
+                        diagnostics.append(
+                            SafeDiagnostic(
+                                code="GOPAY_DUPLICATE_TRANSACTION_ID_CONFLICT",
+                                message="Conflicting transaction evidence found for duplicate provider transaction ID",
+                                severity=DiagnosticSeverity.ERROR,
+                            )
+                        )
+                        return [], diagnostics, False
+                else:
+                    seen_tx_ids[tx_id] = sig
+
+            deduped_rows.append(r)
+
+        return deduped_rows, [], is_split_ambiguous
 
     def parse(self, source: AdapterInput) -> AdapterResult:
         validate_adapter_input(self.descriptor, source)
@@ -458,9 +585,6 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                     ),
                 )
             p1_text = reader.pages[0].extract_text() or ""
-            full_text = "\n".join(
-                page.extract_text() or "" for page in reader.pages
-            )
             lines = [l.strip() for l in p1_text.splitlines() if l.strip()]
         except Exception:
             return AdapterResult(
@@ -472,23 +596,6 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                     SafeDiagnostic(
                         code="GOPAY_STRUCTURE_TRUNCATED",
                         message="Failed to parse PDF binary payload",
-                        severity=DiagnosticSeverity.ERROR,
-                    ),
-                ),
-            )
-
-        # Check global identity conflict in full document
-        all_phone_matches = set(_PHONE_RE.findall(full_text))
-        if len(all_phone_matches) > 1:
-            return AdapterResult(
-                descriptor=self.descriptor,
-                source_document_id=source.source_document_id,
-                parse_status=AdapterParseStatus.FAILED,
-                period_status=source.period_status,
-                diagnostics=(
-                    SafeDiagnostic(
-                        code="GOPAY_ACCOUNT_IDENTITY_AMBIGUOUS",
-                        message="Multiple conflicting wallet identities found in document",
                         severity=DiagnosticSeverity.ERROR,
                     ),
                 ),
@@ -506,7 +613,9 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
             )
 
         # 2. Transaction Rows Extraction
-        rows, row_diagnostics = self._parse_transaction_rows(lines)
+        rows, row_diagnostics, is_split_ambiguous = self._parse_transaction_rows(
+            lines, summary
+        )
         if row_diagnostics:
             return AdapterResult(
                 descriptor=self.descriptor,
@@ -516,7 +625,7 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                 diagnostics=tuple(row_diagnostics),
             )
 
-        # 3. Sum Validation against Source Totals
+        # 3. Sum Validation & Reconciliation Policy
         cash_rows = [r for r in rows if not r.is_coins_loyalty]
         calc_inflow = sum(
             (r.amount for r in cash_rows if r.direction == EventDirection.INFLOW),
@@ -527,23 +636,53 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
             Decimal("0"),
         )
 
-        if (
-            calc_inflow > summary.incoming_total
-            or (calc_outflow - Decimal(summary.coins_used)) > summary.outgoing_total
-        ):
-            return AdapterResult(
-                descriptor=self.descriptor,
-                source_document_id=source.source_document_id,
-                parse_status=AdapterParseStatus.FAILED,
-                period_status=source.period_status,
-                diagnostics=(
-                    SafeDiagnostic(
-                        code="GOPAY_SUMMARY_MISMATCH",
-                        message="Transaction sums exceed statement summary totals",
-                        severity=DiagnosticSeverity.ERROR,
-                    ),
-                ),
+        inflow_reconciled = (
+            abs(calc_inflow - summary.incoming_total) < Decimal("0.005")
+        )
+        outflow_reconciled = (
+            abs(calc_outflow - summary.outgoing_total) < Decimal("0.005")
+        )
+
+        parse_status = AdapterParseStatus.COMPLETED
+        diagnostics: list[SafeDiagnostic] = []
+
+        if is_split_ambiguous:
+            parse_status = AdapterParseStatus.REVIEW_REQUIRED
+            diagnostics.append(
+                SafeDiagnostic(
+                    code="GOPAY_SPLIT_PAYMENT_ALLOCATION_AMBIGUOUS",
+                    message="Multiple split payment transactions found with aggregate-only coins usage",
+                    severity=DiagnosticSeverity.WARNING,
+                )
             )
+        elif not (inflow_reconciled and outflow_reconciled):
+            if (
+                calc_inflow > summary.incoming_total
+                or calc_outflow > summary.outgoing_total
+            ):
+                return AdapterResult(
+                    descriptor=self.descriptor,
+                    source_document_id=source.source_document_id,
+                    parse_status=AdapterParseStatus.FAILED,
+                    period_status=source.period_status,
+                    diagnostics=(
+                        SafeDiagnostic(
+                            code="GOPAY_SUMMARY_MISMATCH",
+                            message="Transaction cash sum exceeds statement summary totals",
+                            severity=DiagnosticSeverity.ERROR,
+                        ),
+                    ),
+                )
+            else:
+                # Source summary reports totals greater than visible transaction rows (incomplete rowset)
+                parse_status = AdapterParseStatus.REVIEW_REQUIRED
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="GOPAY_SOURCE_SUMMARY_ROWSET_MISMATCH",
+                        message="Statement summary totals do not match visible transaction row sums",
+                        severity=DiagnosticSeverity.WARNING,
+                    )
+                )
 
         # Natural Document Key
         acc_part = (
@@ -647,6 +786,7 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                 provider_transaction_id_raw=row.provider_transaction_id_raw,
                 payment_method_raw=row.payment_method_raw,
                 balance_after=None,
+                payment_components=row.payment_components,
             )
 
             row_fp = sha256(
@@ -681,10 +821,10 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
         return AdapterResult(
             descriptor=self.descriptor,
             source_document_id=source.source_document_id,
-            parse_status=AdapterParseStatus.COMPLETED,
+            parse_status=parse_status,
             period_status=source.period_status,
             events=tuple(envelopes),
-            diagnostics=(),
+            diagnostics=tuple(diagnostics),
         )
 
 

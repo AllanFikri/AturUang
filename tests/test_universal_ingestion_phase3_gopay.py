@@ -366,13 +366,26 @@ class TestUniversalIngestionPhase3GoPay(unittest.TestCase):
         self.assertEqual(sum_events[0].payload.period_start, "2026-01-01")
         self.assertEqual(sum_events[0].payload.period_end, "2026-01-31")
 
-    # 16. Datetime extraction precision
+    # 16. Datetime extraction precision and validation
     def test_16_datetime_extraction_precision(self) -> None:
-        inp = self._make_input(self._fixture_pdf("single_page_statement"))
-        res = self.adapter.parse(inp)
-        cm_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
-        self.assertEqual(cm_events[0].payload.occurred_at, "2026-01-15T10:30:00")
-        self.assertEqual(cm_events[1].payload.occurred_at, "2026-01-16T14:20:00")
+        with self.subTest("valid_datetime"):
+            inp = self._make_input(self._fixture_pdf("single_page_statement"))
+            res = self.adapter.parse(inp)
+            cm_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(cm_events[0].payload.occurred_at, "2026-01-15T10:30:00")
+            self.assertEqual(cm_events[1].payload.occurred_at, "2026-01-16T14:20:00")
+
+        with self.subTest("invalid_calendar_date_fails"):
+            inp_date = self._make_input(self._fixture_pdf("invalid_date_statement"))
+            res_date = self.adapter.parse(inp_date)
+            self.assertEqual(res_date.parse_status, AdapterParseStatus.FAILED)
+            self.assertTrue(any(d.code == "GOPAY_ROW_DATETIME_INVALID" for d in res_date.diagnostics))
+
+        with self.subTest("invalid_time_fails"):
+            inp_time = self._make_input(self._fixture_pdf("invalid_time_statement"))
+            res_time = self.adapter.parse(inp_time)
+            self.assertEqual(res_time.parse_status, AdapterParseStatus.FAILED)
+            self.assertTrue(any(d.code == "GOPAY_ROW_DATETIME_INVALID" for d in res_time.diagnostics))
 
     # 17. IDR inflow transaction direction and amount
     def test_17_idr_inflow_transaction_direction_and_amount(self) -> None:
@@ -404,25 +417,60 @@ class TestUniversalIngestionPhase3GoPay(unittest.TestCase):
         self.assertIsInstance(cm_events[0].payload.amount, Decimal)
         self.assertIsNone(cm_events[0].payload.balance_after)
 
-    # 20. Native transaction reference extracted
+    # 20. Native transaction reference and duplicate handling
     def test_20_native_transaction_reference_extracted(self) -> None:
-        inp = self._make_input(self._fixture_pdf("single_page_statement"))
-        res = self.adapter.parse(inp)
-        cm_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
-        self.assertEqual(
-            cm_events[0].payload.provider_transaction_id_raw, "TXID001ID"
-        )
-        self.assertEqual(
-            cm_events[1].payload.provider_transaction_id_raw, "TXID002ID"
-        )
+        with self.subTest("native_id_extracted"):
+            inp = self._make_input(self._fixture_pdf("single_page_statement"))
+            res = self.adapter.parse(inp)
+            cm_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(
+                cm_events[0].payload.provider_transaction_id_raw, "TXID001ID"
+            )
+            self.assertEqual(
+                cm_events[1].payload.provider_transaction_id_raw, "TXID002ID"
+            )
 
-    # 21. Payment method raw extracted
+        with self.subTest("identical_duplicate_id_deduped"):
+            inp_dup = self._make_input(self._fixture_pdf("duplicate_tx_id_identical_statement"))
+            res_dup = self.adapter.parse(inp_dup)
+            self.assertEqual(res_dup.parse_status, AdapterParseStatus.COMPLETED)
+            cm_events = [e for e in res_dup.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(len(cm_events), 1)
+
+        with self.subTest("conflicting_duplicate_id_fails"):
+            inp_conflict = self._make_input(self._fixture_pdf("duplicate_tx_id_conflict_statement"))
+            res_conflict = self.adapter.parse(inp_conflict)
+            self.assertEqual(res_conflict.parse_status, AdapterParseStatus.FAILED)
+            self.assertTrue(
+                any(d.code == "GOPAY_DUPLICATE_TRANSACTION_ID_CONFLICT" for d in res_conflict.diagnostics)
+            )
+
+    # 21. Payment method raw and components extracted
     def test_21_payment_method_raw_extracted(self) -> None:
-        inp = self._make_input(self._fixture_pdf("single_page_statement"))
-        res = self.adapter.parse(inp)
-        cm_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
-        self.assertEqual(cm_events[0].payload.payment_method_raw, "BCA VA")
-        self.assertEqual(cm_events[1].payload.payment_method_raw, "GoPay Saldo")
+        with self.subTest("single_method"):
+            inp = self._make_input(self._fixture_pdf("single_page_statement"))
+            res = self.adapter.parse(inp)
+            cm_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(cm_events[0].payload.payment_method_raw, "BCA VA")
+            self.assertEqual(cm_events[1].payload.payment_method_raw, "GoPay Saldo")
+
+        with self.subTest("split_method_components"):
+            inp_split = self._make_input(self._fixture_pdf("split_payment_statement"))
+            res_split = self.adapter.parse(inp_split)
+            self.assertEqual(res_split.parse_status, AdapterParseStatus.COMPLETED)
+            cm_events = [e for e in res_split.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(len(cm_events), 1)
+            cm = cm_events[0].payload
+            self.assertEqual(cm.amount, Decimal("45000.00"))
+            self.assertEqual(len(cm.payment_components), 2)
+            self.assertEqual(cm.payment_components[0].method_raw, "GoPay Saldo")
+            self.assertEqual(cm.payment_components[0].amount, Decimal("45000.00"))
+            self.assertEqual(cm.payment_components[1].method_raw, "GoPay Coins")
+            self.assertEqual(cm.payment_components[1].amount, Decimal("5000.00"))
+            self.assertEqual(
+                cm.payment_components[0].amount + cm.payment_components[1].amount,
+                Decimal("50000.00"),
+            )
 
     # 22. Wrapped multiline transaction block
     def test_22_wrapped_multiline_transaction_block(self) -> None:
@@ -464,18 +512,46 @@ class TestUniversalIngestionPhase3GoPay(unittest.TestCase):
 
     # 26. IDR summary reconciliation success
     def test_26_idr_summary_reconciliation_success(self) -> None:
-        inp = self._make_input(self._fixture_pdf("single_page_statement"))
-        res = self.adapter.parse(inp)
-        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        with self.subTest("exact_idr_reconciled"):
+            inp = self._make_input(self._fixture_pdf("single_page_statement"))
+            res = self.adapter.parse(inp)
+            self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
 
-    # 27. IDR summary mismatch fail-closed
+        with self.subTest("split_payment_net_cash_reconciled"):
+            inp_split = self._make_input(self._fixture_pdf("split_payment_statement"))
+            res_split = self.adapter.parse(inp_split)
+            self.assertEqual(res_split.parse_status, AdapterParseStatus.COMPLETED)
+
+    # 27. IDR summary mismatch fail-closed & review policies
     def test_27_idr_summary_mismatch_fail_closed(self) -> None:
-        inp = self._make_input(self._fixture_pdf("summary_mismatch_statement"))
-        res = self.adapter.parse(inp)
-        self.assertEqual(res.parse_status, AdapterParseStatus.FAILED)
-        self.assertTrue(
-            any(d.code == "GOPAY_SUMMARY_MISMATCH" for d in res.diagnostics)
-        )
+        with self.subTest("transaction_exceeds_summary_fails"):
+            inp = self._make_input(self._fixture_pdf("summary_mismatch_statement"))
+            res = self.adapter.parse(inp)
+            self.assertEqual(res.parse_status, AdapterParseStatus.FAILED)
+            self.assertTrue(
+                any(d.code == "GOPAY_SUMMARY_MISMATCH" for d in res.diagnostics)
+            )
+
+        with self.subTest("incomplete_rowset_review_required"):
+            inp_inc = self._make_input(self._fixture_pdf("incomplete_rowset_statement"))
+            res_inc = self.adapter.parse(inp_inc)
+            self.assertEqual(res_inc.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+            self.assertTrue(
+                any(d.code == "GOPAY_SOURCE_SUMMARY_ROWSET_MISMATCH" for d in res_inc.diagnostics)
+            )
+            # Trusted evidence preserved
+            cm_events = [e for e in res_inc.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(len(cm_events), 1)
+            sum_events = [e for e in res_inc.events if e.event_role == EventRole.SOURCE_SUMMARY]
+            self.assertEqual(len(sum_events), 1)
+
+        with self.subTest("multiple_split_ambiguous_review_required"):
+            inp_amb = self._make_input(self._fixture_pdf("multiple_split_ambiguous_statement"))
+            res_amb = self.adapter.parse(inp_amb)
+            self.assertEqual(res_amb.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+            self.assertTrue(
+                any(d.code == "GOPAY_SPLIT_PAYMENT_ALLOCATION_AMBIGUOUS" for d in res_amb.diagnostics)
+            )
 
     # 28. Zero-activity document parsing
     def test_28_zero_activity_statement_parsing(self) -> None:
