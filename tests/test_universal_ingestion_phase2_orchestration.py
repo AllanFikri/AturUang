@@ -1,3 +1,4 @@
+from decimal import Decimal
 import inspect
 import sqlite3
 import unittest
@@ -7,25 +8,44 @@ from aturuang.ingestion_adapter import (
     AdapterDescriptor,
     AdapterParseStatus,
     AdapterResult,
+    BalanceSnapshotEvidence,
+    CashMovementEvidence,
+    CommerceOrderEvidence,
     DiagnosticSeverity,
+    EventDirection,
+    EventRole,
+    InvestmentTradeEvidence,
+    NormalizedEventEnvelope,
+    ObservedAccountEvidence,
     SafeDiagnostic,
+    SnapshotKind,
+    SourceEventStatus,
+    SourceSummaryEvidence,
 )
 from aturuang.ingestion_contracts import (
+    ConfidenceLevel,
     DocumentIdentityStatus,
     PeriodStatus,
     SourceChannel,
+    SourceProvenanceContract,
     TemplateMatchStatus,
 )
 from aturuang.ingestion_discovery import (
     ArtifactOccurrence,
     DiscoveredArtifact,
+    DiscoveryResult,
 )
 from aturuang.ingestion_orchestration import (
     AdapterCatalog,
     AdapterCatalogError,
+    DryRunBatchStatus,
     DryRunDisposition,
     SqliteRegistryAuthority,
     dry_run_artifact,
+    dry_run_batch,
+    safe_dry_run_batch_json,
+    semantic_document_canonical_json,
+    semantic_document_sha256,
 )
 from aturuang.ingestion_preflight import (
     DetectionMethod,
@@ -138,8 +158,11 @@ class FakeRegistry:
         template_status=TemplateMatchStatus.KNOWN,
         template_id="bca_monthly_statement_v1",
         parser_version="parser-v1",
+        natural=(),
     ):
         self.exact = tuple(exact)
+        self.natural = tuple(natural)
+        self.natural_calls = 0
         self.capability = {
             "source_registry_id": source_registry_id,
             "channel": channel,
@@ -160,6 +183,14 @@ class FakeRegistry:
 
     def lookup_exact_documents(self, content_sha256):
         return self.exact
+
+    def lookup_natural_documents(
+        self,
+        source_registry_id,
+        natural_document_key,
+    ):
+        self.natural_calls += 1
+        return self.natural
 
     def source_capability(self, source_registry_id):
         return self.capability
@@ -230,6 +261,91 @@ def run_known(
         preflight_func=preflight_func,
     ), adapter
 
+
+
+
+def semantic_event(
+    *,
+    source_document_id="dryrun-doc",
+    source_registry_id="bca_statement",
+    template_id="template-v1",
+    parser_version="parser-v1",
+    role=EventRole.CASH_MOVEMENT,
+    payload=None,
+    row_seed="row",
+    evidence_quality=ConfidenceLevel.HIGH,
+    parse_confidence=ConfidenceLevel.HIGH,
+    raw_locator="private/source.pdf",
+    raw_text="raw evidence",
+    diagnostics=(),
+):
+    if payload is None:
+        payload = CashMovementEvidence(
+            amount=Decimal("1"),
+            currency="IDR",
+            direction=EventDirection.OUTFLOW,
+            status=SourceEventStatus.POSTED,
+            occurred_at="2026-08-01",
+            description_raw="Merchant Alpha",
+        )
+    return NormalizedEventEnvelope(
+        source_document_id=source_document_id,
+        source_registry_id=source_registry_id,
+        template_id=template_id,
+        parser_version=parser_version,
+        source_channel=SourceChannel.PDF,
+        event_role=role,
+        source_event_id="row-source-id",
+        row_fingerprint=digest(row_seed.encode("utf-8")),
+        evidence_quality=evidence_quality,
+        parse_confidence=parse_confidence,
+        provenance=SourceProvenanceContract(
+            source_document_id=source_document_id,
+            raw_locator=raw_locator,
+            raw_text=raw_text,
+        ),
+        payload=payload,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def semantic_result(
+    events,
+    *,
+    source_document_id="dryrun-doc",
+    source_registry_id="bca_statement",
+    template_id="template-v1",
+    parser_version="parser-v1",
+    natural_key="bca:main:2026-08",
+    period_status=PeriodStatus.CLOSED,
+    period_start="2026-08-01",
+    period_end="2026-08-31",
+):
+    descriptor = AdapterDescriptor(
+        adapter_id="semantic-test",
+        source_registry_id=source_registry_id,
+        template_id=template_id,
+        parser_version=parser_version,
+        source_channel=SourceChannel.PDF,
+    )
+    return AdapterResult(
+        descriptor=descriptor,
+        source_document_id=source_document_id,
+        parse_status=AdapterParseStatus.COMPLETED,
+        period_status=period_status,
+        events=tuple(events),
+        period_start=period_start,
+        period_end=period_end,
+        natural_document_key_candidate=natural_key,
+    )
+
+
+def semantic_sha_for_result(result):
+    return semantic_document_sha256(
+        result.descriptor.source_registry_id,
+        result.natural_document_key_candidate,
+        result,
+    )
 
 class TestUniversalIngestionPhase2Orchestration(unittest.TestCase):
     def test_13_exact_sha_registry_duplicate_short_circuits_before_adapter(self):
@@ -620,6 +736,536 @@ class TestUniversalIngestionPhase2Orchestration(unittest.TestCase):
             DryRunDisposition.REVIEW_REQUIRED,
         )
         self.assertEqual(result.diagnostics[0].code, "ROW_REVIEW")
+
+
+    def test_31_different_bytes_equivalent_evidence_same_semantic_sha(self):
+        first = semantic_result(
+            (semantic_event(source_document_id="dryrun-a", row_seed="a"),),
+            source_document_id="dryrun-a",
+        )
+        second = semantic_result(
+            (semantic_event(source_document_id="dryrun-b", row_seed="b"),),
+            source_document_id="dryrun-b",
+        )
+        self.assertEqual(
+            semantic_sha_for_result(first),
+            semantic_sha_for_result(second),
+        )
+
+    def test_32_input_event_order_does_not_change_semantic_sha(self):
+        a = semantic_event(
+            payload=CashMovementEvidence(
+                amount=Decimal("1"),
+                currency="IDR",
+                direction=EventDirection.OUTFLOW,
+                status=SourceEventStatus.POSTED,
+                occurred_at="2026-08-01",
+            ),
+            row_seed="a",
+        )
+        b = semantic_event(
+            payload=CashMovementEvidence(
+                amount=Decimal("2"),
+                currency="IDR",
+                direction=EventDirection.OUTFLOW,
+                status=SourceEventStatus.POSTED,
+                occurred_at="2026-08-02",
+            ),
+            row_seed="b",
+        )
+        self.assertEqual(
+            semantic_sha_for_result(semantic_result((a, b))),
+            semantic_sha_for_result(semantic_result((b, a))),
+        )
+
+    def test_33_duplicate_event_multiplicity_changes_semantic_sha(self):
+        event = semantic_event()
+        self.assertNotEqual(
+            semantic_sha_for_result(semantic_result((event,))),
+            semantic_sha_for_result(semantic_result((event, event))),
+        )
+
+    def test_34_decimal_equivalent_forms_canonicalize_equally(self):
+        hashes = {
+            semantic_sha_for_result(
+                semantic_result(
+                    (
+                        semantic_event(
+                            payload=CashMovementEvidence(
+                                amount=value,
+                                currency="IDR",
+                                direction=EventDirection.OUTFLOW,
+                                status=SourceEventStatus.POSTED,
+                            )
+                        ),
+                    )
+                )
+            )
+            for value in (
+                Decimal("1"),
+                Decimal("1.0"),
+                Decimal("1.00"),
+            )
+        }
+        self.assertEqual(len(hashes), 1)
+
+    def test_35_negative_zero_canonicalizes_to_zero(self):
+        def build(value):
+            return semantic_result(
+                (
+                    semantic_event(
+                        payload=CashMovementEvidence(
+                            amount=value,
+                            currency="IDR",
+                            direction=EventDirection.OUTFLOW,
+                            status=SourceEventStatus.POSTED,
+                        )
+                    ),
+                )
+            )
+        self.assertEqual(
+            semantic_sha_for_result(build(Decimal("0"))),
+            semantic_sha_for_result(build(Decimal("-0.00"))),
+        )
+
+    def test_36_unicode_and_whitespace_normalization_is_deterministic(self):
+        first = semantic_event(
+            role=EventRole.ACCOUNT_OBSERVATION,
+            payload=ObservedAccountEvidence(
+                observed_provider_account_key="acct-1",
+                display_name_raw="  ＡＢＣ   Wallet  ",
+            ),
+        )
+        second = semantic_event(
+            role=EventRole.ACCOUNT_OBSERVATION,
+            payload=ObservedAccountEvidence(
+                observed_provider_account_key="acct-1",
+                display_name_raw="ABC Wallet",
+            ),
+        )
+        self.assertEqual(
+            semantic_sha_for_result(semantic_result((first,))),
+            semantic_sha_for_result(semantic_result((second,))),
+        )
+
+    def test_37_provenance_differences_do_not_change_semantic_sha(self):
+        first = semantic_event(
+            raw_locator=r"C:\Private\one.pdf",
+            raw_text="raw one",
+        )
+        second = semantic_event(
+            raw_locator=r"D:\Private\two.pdf",
+            raw_text="raw two",
+        )
+        self.assertEqual(
+            semantic_sha_for_result(semantic_result((first,))),
+            semantic_sha_for_result(semantic_result((second,))),
+        )
+
+    def test_38_diagnostic_and_confidence_differences_do_not_change_semantic_sha(self):
+        first = semantic_event()
+        second = semantic_event(
+            evidence_quality=ConfidenceLevel.LOW,
+            parse_confidence=ConfidenceLevel.UNKNOWN,
+            diagnostics=(
+                SafeDiagnostic(
+                    code="ROW_REVIEW",
+                    severity=DiagnosticSeverity.WARNING,
+                    message="Safe review marker.",
+                    review_required=True,
+                    locator_token="abcdef123456",
+                ),
+            ),
+        )
+        self.assertEqual(
+            semantic_sha_for_result(semantic_result((first,))),
+            semantic_sha_for_result(semantic_result((second,))),
+        )
+
+    def test_39_template_and_parser_versions_do_not_change_semantic_sha(self):
+        first = semantic_result(
+            (
+                semantic_event(
+                    template_id="template-a",
+                    parser_version="parser-a",
+                ),
+            ),
+            template_id="template-a",
+            parser_version="parser-a",
+        )
+        second = semantic_result(
+            (
+                semantic_event(
+                    template_id="template-b",
+                    parser_version="parser-b",
+                ),
+            ),
+            template_id="template-b",
+            parser_version="parser-b",
+        )
+        self.assertEqual(
+            semantic_sha_for_result(first),
+            semantic_sha_for_result(second),
+        )
+
+    def test_40_source_registry_id_changes_semantic_sha(self):
+        result = semantic_result((semantic_event(),))
+        self.assertNotEqual(
+            semantic_document_sha256(
+                "bca_statement",
+                "bca:main:2026-08",
+                result,
+            ),
+            semantic_document_sha256(
+                "jago_statement",
+                "bca:main:2026-08",
+                result,
+            ),
+        )
+
+    def test_41_natural_document_key_changes_semantic_sha(self):
+        result = semantic_result((semantic_event(),))
+        self.assertNotEqual(
+            semantic_document_sha256(
+                "bca_statement",
+                "account-a:2026-08",
+                result,
+            ),
+            semantic_document_sha256(
+                "bca_statement",
+                "account-b:2026-08",
+                result,
+            ),
+        )
+
+    def test_42_all_six_evidence_roles_have_deterministic_canonical_forms(self):
+        payloads = (
+            (
+                EventRole.CASH_MOVEMENT,
+                CashMovementEvidence(
+                    amount=Decimal("100"),
+                    currency="IDR",
+                    direction=EventDirection.OUTFLOW,
+                    status=SourceEventStatus.POSTED,
+                ),
+            ),
+            (
+                EventRole.BALANCE_SNAPSHOT,
+                BalanceSnapshotEvidence(
+                    balance=Decimal("1000"),
+                    currency="IDR",
+                    snapshot_kind=SnapshotKind.CLOSING,
+                ),
+            ),
+            (
+                EventRole.SOURCE_SUMMARY,
+                SourceSummaryEvidence(currency="IDR"),
+            ),
+            (
+                EventRole.ACCOUNT_OBSERVATION,
+                ObservedAccountEvidence(
+                    observed_provider_account_key="acct-1",
+                    display_name_raw="Main Account",
+                ),
+            ),
+            (
+                EventRole.INVESTMENT_TRADE,
+                InvestmentTradeEvidence(
+                    instrument_raw="BBCA",
+                    trade_date="2026-08-01",
+                    settlement_date="2026-08-05",
+                    side_raw="BUY",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("9000"),
+                    currency="IDR",
+                ),
+            ),
+            (
+                EventRole.COMMERCE_ORDER,
+                CommerceOrderEvidence(
+                    order_native_id_raw="order-1",
+                    order_date="2026-08-01",
+                    order_total=Decimal("50000"),
+                    currency="IDR",
+                ),
+            ),
+        )
+        result = semantic_result(
+            tuple(
+                semantic_event(
+                    role=role,
+                    payload=payload,
+                    row_seed=role.value,
+                )
+                for role, payload in payloads
+            )
+        )
+        canonical = semantic_document_canonical_json(
+            "bca_statement",
+            "six-role-key",
+            result,
+        )
+        self.assertEqual(
+            canonical,
+            semantic_document_canonical_json(
+                "bca_statement",
+                "six-role-key",
+                result,
+            ),
+        )
+        for role, _ in payloads:
+            self.assertIn(role.value, canonical)
+
+    def test_43_semantic_duplicate_maps_to_skipped_duplicate(self):
+        key = "bca:main:2026-08"
+        probe = AdapterResult(
+            descriptor=SyntheticAdapter().descriptor,
+            source_document_id="probe",
+            parse_status=AdapterParseStatus.COMPLETED,
+            period_status=PeriodStatus.UNKNOWN,
+            events=(),
+            natural_document_key_candidate=key,
+        )
+        existing = SourceDocumentReadRecord(
+            source_document_id="doc-existing",
+            source_registry_id="bca_statement",
+            content_sha256="1" * 64,
+            natural_document_key=key,
+            semantic_sha256=semantic_document_sha256(
+                "bca_statement",
+                key,
+                probe,
+            ),
+        )
+        result, _ = run_known(
+            b"semantic-duplicate-new-bytes",
+            registry=FakeRegistry(natural=(existing,)),
+        )
+        self.assertEqual(
+            result.identity_status,
+            DocumentIdentityStatus.SEMANTIC_DUPLICATE,
+        )
+        self.assertEqual(
+            result.disposition,
+            DryRunDisposition.SKIPPED_DUPLICATE,
+        )
+
+    def test_44_revision_conflict_maps_to_review_required(self):
+        existing = SourceDocumentReadRecord(
+            source_document_id="doc-existing",
+            source_registry_id="bca_statement",
+            content_sha256="2" * 64,
+            natural_document_key="bca:main:2026-08",
+            semantic_sha256="f" * 64,
+        )
+        result, _ = run_known(
+            b"revision-conflict",
+            registry=FakeRegistry(natural=(existing,)),
+        )
+        self.assertEqual(
+            result.identity_status,
+            DocumentIdentityStatus.REVISION_OR_CONFLICT,
+        )
+        self.assertEqual(
+            result.disposition,
+            DryRunDisposition.REVIEW_REQUIRED,
+        )
+
+    def test_45_missing_natural_key_maps_to_ambiguous_review(self):
+        result, _ = run_known(
+            b"missing-natural-key",
+            adapter=SyntheticAdapter(natural_key=None),
+        )
+        self.assertEqual(
+            result.identity_status,
+            DocumentIdentityStatus.AMBIGUOUS,
+        )
+        self.assertEqual(
+            result.disposition,
+            DryRunDisposition.REVIEW_REQUIRED,
+        )
+
+    def test_46_exact_duplicate_precedence_wins_before_semantic_classification(self):
+        data = b"exact-precedence"
+        existing = SourceDocumentReadRecord(
+            source_document_id="exact-existing",
+            source_registry_id="other-source",
+            content_sha256=digest(data),
+            natural_document_key="other-key",
+            semantic_sha256="a" * 64,
+        )
+        registry = FakeRegistry(exact=(existing,))
+        adapter = SyntheticAdapter()
+        result = dry_run_artifact(
+            "ignored-root",
+            artifact(data),
+            registry=registry,
+            adapter_catalog=AdapterCatalog((adapter,)),
+            payload_reader=lambda *args, **kwargs: self.fail(
+                "payload reader should not run"
+            ),
+        )
+        self.assertEqual(
+            result.identity_status,
+            DocumentIdentityStatus.EXACT_DUPLICATE,
+        )
+        self.assertEqual(adapter.parse_calls, 0)
+        self.assertEqual(registry.natural_calls, 0)
+
+    def test_47_dry_run_document_ordering_is_deterministic(self):
+        first = artifact(b"order-a", extra_extensions=(".jpg",))
+        second = artifact(b"order-b", extra_extensions=(".jpg",))
+        discovery = DiscoveryResult(
+            artifacts=(second, first),
+            diagnostics=(),
+            archives_seen=0,
+            physical_files_seen=4,
+            supported_occurrences=4,
+        )
+        batch = dry_run_batch(
+            "ignored-root",
+            discovery,
+            registry=FakeRegistry(),
+            adapter_catalog=AdapterCatalog(()),
+        )
+        self.assertEqual(
+            [item.content_sha256 for item in batch.documents],
+            sorted((first.content_sha256, second.content_sha256)),
+        )
+
+    def test_48_repeated_dry_run_has_identical_safe_output(self):
+        first = artifact(b"repeat-a", extra_extensions=(".jpg",))
+        second = artifact(b"repeat-b", extra_extensions=(".jpg",))
+        discovery = DiscoveryResult(
+            artifacts=(second, first),
+            diagnostics=(),
+            archives_seen=0,
+            physical_files_seen=4,
+            supported_occurrences=4,
+        )
+        first_batch = dry_run_batch(
+            "ignored-root",
+            discovery,
+            registry=FakeRegistry(),
+            adapter_catalog=AdapterCatalog(()),
+        )
+        second_batch = dry_run_batch(
+            "ignored-root",
+            discovery,
+            registry=FakeRegistry(),
+            adapter_catalog=AdapterCatalog(()),
+        )
+        first_safe = safe_dry_run_batch_json(first_batch)
+        second_safe = safe_dry_run_batch_json(second_batch)
+        self.assertEqual(first_safe, second_safe)
+        self.assertNotIn("private/", first_safe)
+        self.assertEqual(
+            first_batch.overall_status,
+            DryRunBatchStatus.REVIEW_REQUIRED,
+        )
+
+
+
+    def test_semantic_duplicate_precedence_over_adapter_review_flag(self):
+        data = b"semantic-duplicate-review-adapter"
+        key = "bca:main:2026-08"
+
+        review_diagnostic = SafeDiagnostic(
+            code="ROW_REVIEW",
+            severity=DiagnosticSeverity.WARNING,
+            message="Synthetic review marker.",
+            review_required=True,
+            locator_token="abcdef123456",
+        )
+
+        adapter = SyntheticAdapter(
+            parse_status=AdapterParseStatus.REVIEW_REQUIRED,
+            natural_key=key,
+            diagnostics=(review_diagnostic,),
+        )
+
+        probe_result = AdapterResult(
+            descriptor=adapter.descriptor,
+            source_document_id="probe",
+            parse_status=AdapterParseStatus.REVIEW_REQUIRED,
+            period_status=PeriodStatus.UNKNOWN,
+            events=(),
+            diagnostics=(review_diagnostic,),
+            natural_document_key_candidate=key,
+        )
+
+        existing = SourceDocumentReadRecord(
+            source_document_id="doc-existing",
+            source_registry_id="bca_statement",
+            content_sha256="4" * 64,
+            natural_document_key=key,
+            semantic_sha256=semantic_document_sha256(
+                "bca_statement",
+                key,
+                probe_result,
+            ),
+        )
+
+        result, _ = run_known(
+            data,
+            registry=FakeRegistry(natural=(existing,)),
+            adapter=adapter,
+        )
+
+        self.assertEqual(
+            result.identity_status,
+            DocumentIdentityStatus.SEMANTIC_DUPLICATE,
+        )
+        self.assertEqual(
+            result.disposition,
+            DryRunDisposition.SKIPPED_DUPLICATE,
+        )
+
+
+    def test_internal_adapter_exception_is_batch_fatal(self):
+        data = b"adapter-internal-exception"
+
+        class ExplodingAdapter:
+            descriptor = AdapterDescriptor(
+                adapter_id="synthetic-exploding",
+                source_registry_id="bca_statement",
+                template_id="bca_monthly_statement_v1",
+                parser_version="parser-v1",
+                source_channel=SourceChannel.PDF,
+            )
+
+            def parse(self, source):
+                raise RuntimeError("synthetic internal adapter failure")
+
+        discovery = DiscoveryResult(
+            artifacts=(artifact(data),),
+            diagnostics=(),
+            archives_seen=0,
+            physical_files_seen=1,
+            supported_occurrences=1,
+        )
+
+        batch = dry_run_batch(
+            "ignored-root",
+            discovery,
+            registry=FakeRegistry(),
+            adapter_catalog=AdapterCatalog((ExplodingAdapter(),)),
+            payload_reader=lambda *args, **kwargs: data,
+            preflight_func=lambda payload, **kwargs: known_preflight(payload),
+        )
+
+        self.assertEqual(
+            batch.documents[0].disposition,
+            DryRunDisposition.FAILED,
+        )
+        self.assertEqual(
+            batch.documents[0].diagnostics[-1].code,
+            "ADAPTER_EXECUTION_FAILED",
+        )
+        self.assertEqual(
+            batch.overall_status,
+            DryRunBatchStatus.FAILED,
+        )
 
 
 if __name__ == "__main__":

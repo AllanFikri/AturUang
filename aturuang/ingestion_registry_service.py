@@ -255,6 +255,44 @@ def lookup_source_documents_by_content_sha(
     )
 
 
+def lookup_source_documents_by_natural_key(
+    con: sqlite3.Connection,
+    *,
+    source_registry_id: str,
+    natural_document_key: str,
+) -> tuple[SourceDocumentReadRecord, ...]:
+    """Returns same-source natural identity candidates without writes."""
+    _require_registry_schema(con)
+    rows = con.execute(
+        """
+        SELECT source_document_id,
+               source_registry_id,
+               content_sha256,
+               natural_document_key,
+               semantic_sha256
+        FROM registry_source_documents
+        WHERE source_registry_id=?
+          AND natural_document_key=?
+        ORDER BY source_document_id
+        """,
+        (source_registry_id, natural_document_key),
+    ).fetchall()
+    return tuple(
+        SourceDocumentReadRecord(
+            source_document_id=str(row["source_document_id"]),
+            source_registry_id=str(row["source_registry_id"]),
+            content_sha256=str(row["content_sha256"]),
+            natural_document_key=str(row["natural_document_key"]),
+            semantic_sha256=(
+                str(row["semantic_sha256"])
+                if row["semantic_sha256"]
+                else None
+            ),
+        )
+        for row in rows
+    )
+
+
 def create_or_get_import_batch(
     con: sqlite3.Connection,
     *,

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
+from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
+import json
 import sqlite3
+import unicodedata
 from typing import Callable, Iterable, Mapping, Protocol
 
 from .ingestion_adapter import (
@@ -13,6 +16,7 @@ from .ingestion_adapter import (
     AdapterParseStatus,
     AdapterResult,
     DiagnosticSeverity,
+    NormalizedEventEnvelope,
     SafeDiagnostic,
     UniversalSourceAdapter,
     validate_adapter_input,
@@ -27,6 +31,7 @@ from .ingestion_discovery import (
     ArtifactPayloadError,
     DiscoveredArtifact,
     DiscoveryPolicy,
+    DiscoveryResult,
     read_discovered_artifact,
 )
 from .ingestion_preflight import (
@@ -40,6 +45,7 @@ from .ingestion_registry_service import (
     TemplateResolution,
     get_source_capability,
     lookup_source_documents_by_content_sha,
+    lookup_source_documents_by_natural_key,
     resolve_template,
 )
 
@@ -55,6 +61,12 @@ class AdapterCatalogError(OrchestrationError):
 class DryRunDisposition(str, Enum):
     READY_FOR_STAGING = "READY_FOR_STAGING"
     SKIPPED_DUPLICATE = "SKIPPED_DUPLICATE"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    FAILED = "FAILED"
+
+
+class DryRunBatchStatus(str, Enum):
+    COMPLETED = "COMPLETED"
     REVIEW_REQUIRED = "REVIEW_REQUIRED"
     FAILED = "FAILED"
 
@@ -88,6 +100,7 @@ class DryRunDocumentResult:
     observed_extensions: tuple[str, ...]
     disposition: DryRunDisposition
     identity_status: DocumentIdentityStatus | None
+    semantic_sha256: str | None = None
     related_existing_document_id: str | None = None
     preflight: DocumentPreflight | None = None
     selected_adapter: AdapterDescriptor | None = None
@@ -105,10 +118,31 @@ class DryRunDocumentResult:
     )
 
 
+@dataclass(frozen=True)
+class DryRunBatchResult:
+    unique_artifact_count: int
+    occurrence_count: int
+    exact_duplicate_count: int
+    semantic_duplicate_count: int
+    ready_for_staging_count: int
+    review_required_count: int
+    failed_count: int
+    documents: tuple[DryRunDocumentResult, ...]
+    diagnostics: tuple[DryRunDiagnostic, ...]
+    overall_status: DryRunBatchStatus
+
+
 class ReadOnlyRegistryAuthority(Protocol):
     def lookup_exact_documents(
         self,
         content_sha256: str,
+    ) -> tuple[SourceDocumentReadRecord, ...]:
+        ...
+
+    def lookup_natural_documents(
+        self,
+        source_registry_id: str,
+        natural_document_key: str,
     ) -> tuple[SourceDocumentReadRecord, ...]:
         ...
 
@@ -138,6 +172,17 @@ class SqliteRegistryAuthority:
         return lookup_source_documents_by_content_sha(
             self.connection,
             content_sha256=content_sha256,
+        )
+
+    def lookup_natural_documents(
+        self,
+        source_registry_id: str,
+        natural_document_key: str,
+    ) -> tuple[SourceDocumentReadRecord, ...]:
+        return lookup_source_documents_by_natural_key(
+            self.connection,
+            source_registry_id=source_registry_id,
+            natural_document_key=natural_document_key,
         )
 
     def source_capability(
@@ -735,40 +780,595 @@ def dry_run_artifact(
     )
 
     if adapter_result.parse_status is AdapterParseStatus.FAILED:
-        disposition = DryRunDisposition.FAILED
-    elif (
+        return DryRunDocumentResult(
+            source_document_id=temporary_document_id,
+            disposition=DryRunDisposition.FAILED,
+            identity_status=None,
+            preflight=preflight,
+            selected_adapter=selected_descriptor,
+            adapter_result=adapter_result,
+            natural_document_key_candidate=(
+                adapter_result.natural_document_key_candidate
+            ),
+            diagnostics=converted_diagnostics,
+            **_base_result_kwargs(artifact),
+        )
+
+    natural_key = adapter_result.natural_document_key_candidate
+    try:
+        semantic_sha = semantic_document_sha256(
+            source_registry_id,
+            natural_key,
+            adapter_result,
+        )
+    except Exception:
+        return _failed_result(
+            artifact,
+            source_document_id=temporary_document_id,
+            code="SEMANTIC_CANONICALIZATION_FAILED",
+            stage=DryRunStage.IDENTITY,
+            message="Semantic document canonicalization failed.",
+            preflight=preflight,
+            selected_adapter=selected_descriptor,
+        )
+
+    adapter_requires_review = (
         adapter_result.parse_status
         is AdapterParseStatus.REVIEW_REQUIRED
         or adapter_result.review_required
-    ):
+    )
+
+    if natural_key is None:
+        return DryRunDocumentResult(
+            source_document_id=temporary_document_id,
+            disposition=DryRunDisposition.REVIEW_REQUIRED,
+            identity_status=DocumentIdentityStatus.AMBIGUOUS,
+            semantic_sha256=semantic_sha,
+            preflight=preflight,
+            selected_adapter=selected_descriptor,
+            adapter_result=adapter_result,
+            natural_document_key_candidate=None,
+            diagnostics=converted_diagnostics
+            + (
+                _diagnostic(
+                    "NATURAL_KEY_MISSING",
+                    DryRunStage.IDENTITY,
+                    DiagnosticSeverity.WARNING,
+                    "Natural document identity is unavailable.",
+                    source_document_id=temporary_document_id,
+                ),
+            ),
+            **_base_result_kwargs(artifact),
+        )
+
+    try:
+        natural_records = registry.lookup_natural_documents(
+            source_registry_id,
+            natural_key,
+        )
+    except RegistryNotInitializedError:
+        return DryRunDocumentResult(
+            source_document_id=temporary_document_id,
+            disposition=DryRunDisposition.REVIEW_REQUIRED,
+            identity_status=DocumentIdentityStatus.AMBIGUOUS,
+            semantic_sha256=semantic_sha,
+            preflight=preflight,
+            selected_adapter=selected_descriptor,
+            adapter_result=adapter_result,
+            natural_document_key_candidate=natural_key,
+            diagnostics=converted_diagnostics
+            + (
+                _diagnostic(
+                    "REGISTRY_AUTHORITY_UNAVAILABLE",
+                    DryRunStage.IDENTITY,
+                    DiagnosticSeverity.WARNING,
+                    "Registry identity authority is unavailable.",
+                    source_document_id=temporary_document_id,
+                ),
+            ),
+            **_base_result_kwargs(artifact),
+        )
+    except Exception:
+        return _failed_result(
+            artifact,
+            source_document_id=temporary_document_id,
+            code="NATURAL_IDENTITY_LOOKUP_FAILED",
+            stage=DryRunStage.IDENTITY,
+            message="Natural document identity lookup failed.",
+            preflight=preflight,
+            selected_adapter=selected_descriptor,
+        )
+
+    try:
+        identity_status, related_document_id = _classify_semantic_identity(
+            natural_records,
+            source_registry_id=source_registry_id,
+            natural_document_key=natural_key,
+            semantic_sha256=semantic_sha,
+        )
+    except OrchestrationError:
+        return _failed_result(
+            artifact,
+            source_document_id=temporary_document_id,
+            code="NATURAL_IDENTITY_INVARIANT_FAILED",
+            stage=DryRunStage.IDENTITY,
+            message="Natural document identity authority is inconsistent.",
+            preflight=preflight,
+            selected_adapter=selected_descriptor,
+        )
+
+    identity_diagnostics: tuple[DryRunDiagnostic, ...] = ()
+    if identity_status is DocumentIdentityStatus.SEMANTIC_DUPLICATE:
+        disposition = DryRunDisposition.SKIPPED_DUPLICATE
+        identity_diagnostics = (
+            _diagnostic(
+                "SEMANTIC_DUPLICATE",
+                DryRunStage.IDENTITY,
+                DiagnosticSeverity.INFO,
+                "Equivalent normalized source document already exists.",
+                source_document_id=temporary_document_id,
+            ),
+        )
+    elif identity_status is DocumentIdentityStatus.REVISION_OR_CONFLICT:
         disposition = DryRunDisposition.REVIEW_REQUIRED
+        identity_diagnostics = (
+            _diagnostic(
+                "REVISION_OR_CONFLICT",
+                DryRunStage.IDENTITY,
+                DiagnosticSeverity.WARNING,
+                "Natural document identity has different semantic evidence.",
+                source_document_id=temporary_document_id,
+            ),
+        )
+    elif identity_status is DocumentIdentityStatus.AMBIGUOUS:
+        disposition = DryRunDisposition.REVIEW_REQUIRED
+        identity_diagnostics = (
+            _diagnostic(
+                "SEMANTIC_IDENTITY_AMBIGUOUS",
+                DryRunStage.IDENTITY,
+                DiagnosticSeverity.WARNING,
+                "Existing semantic identity evidence is incomplete.",
+                source_document_id=temporary_document_id,
+            ),
+        )
     else:
-        disposition = DryRunDisposition.READY_FOR_STAGING
+        disposition = (
+            DryRunDisposition.REVIEW_REQUIRED
+            if adapter_requires_review
+            else DryRunDisposition.READY_FOR_STAGING
+        )
 
     return DryRunDocumentResult(
         source_document_id=temporary_document_id,
         disposition=disposition,
-        identity_status=None,
+        identity_status=identity_status,
+        semantic_sha256=semantic_sha,
+        related_existing_document_id=related_document_id,
         preflight=preflight,
         selected_adapter=selected_descriptor,
         adapter_result=adapter_result,
-        natural_document_key_candidate=(
-            adapter_result.natural_document_key_candidate
-        ),
-        diagnostics=converted_diagnostics,
+        natural_document_key_candidate=natural_key,
+        diagnostics=converted_diagnostics + identity_diagnostics,
         **_base_result_kwargs(artifact),
     )
+
+
+SEMANTIC_DOCUMENT_VERSION = "semantic-document-v1"
+
+_CASEFOLD_SEMANTIC_FIELDS = {"currency"}
+_NON_SEMANTIC_PAYLOAD_FIELDS = {"event_hint"}
+_BATCH_FATAL_CODES = {
+    "EXACT_SHA_AMBIGUOUS",
+    "EXACT_SHA_LOOKUP_FAILED",
+    "PAYLOAD_INTEGRITY_FAILED",
+    "PAYLOAD_REPLAY_FAILED",
+    "PREFLIGHT_IDENTITY_MISMATCH",
+    "DETECTION_INVARIANT_FAILED",
+    "REGISTRY_AUTHORITY_FAILED",
+    "SOURCE_CHANNEL_INVALID",
+    "ADAPTER_CATALOG_INVARIANT_FAILED",
+    "ADAPTER_INPUT_MISMATCH",
+    "ADAPTER_CONTRACT_FAILED",
+    "ADAPTER_EXECUTION_FAILED",
+    "ADAPTER_RESULT_INVALID",
+    "ADAPTER_RESULT_MISMATCH",
+    "SEMANTIC_CANONICALIZATION_FAILED",
+    "NATURAL_IDENTITY_LOOKUP_FAILED",
+    "NATURAL_IDENTITY_INVARIANT_FAILED",
+}
+
+
+def _normalize_semantic_text(value: str, *, casefold: bool = False) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    normalized = " ".join(normalized.split())
+    return normalized.casefold() if casefold else normalized
+
+
+def _normalize_semantic_decimal(value: Decimal) -> str:
+    if not isinstance(value, Decimal):
+        raise OrchestrationError("semantic numeric values must be Decimal")
+    if not value.is_finite():
+        raise OrchestrationError("semantic Decimal values must be finite")
+    if value == 0:
+        return "0"
+    return format(value.normalize(), "f")
+
+
+def _canonical_semantic_value(value: object, *, field_name: str | None = None) -> object:
+    if value is None:
+        return None
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Decimal):
+        return _normalize_semantic_decimal(value)
+    if isinstance(value, str):
+        return _normalize_semantic_text(
+            value,
+            casefold=field_name in _CASEFOLD_SEMANTIC_FIELDS,
+        )
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        raise OrchestrationError(
+            "binary float is forbidden in semantic canonicalization"
+        )
+    if is_dataclass(value):
+        result: dict[str, object] = {}
+        for item in fields(value):
+            if item.name in _NON_SEMANTIC_PAYLOAD_FIELDS:
+                continue
+            result[item.name] = _canonical_semantic_value(
+                getattr(value, item.name),
+                field_name=item.name,
+            )
+        return result
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_semantic_value(item, field_name=str(key))
+            for key, item in sorted(
+                value.items(),
+                key=lambda pair: str(pair[0]),
+            )
+        }
+    if isinstance(value, (tuple, list)):
+        return [_canonical_semantic_value(item) for item in value]
+    raise OrchestrationError("unsupported semantic canonicalization value")
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _canonical_semantic_event(
+    event: NormalizedEventEnvelope,
+) -> dict[str, object]:
+    if not isinstance(event, NormalizedEventEnvelope):
+        raise OrchestrationError(
+            "semantic event must be NormalizedEventEnvelope"
+        )
+    payload = _canonical_semantic_value(event.payload)
+    if not isinstance(payload, dict):
+        raise OrchestrationError(
+            "semantic event payload must canonicalize to an object"
+        )
+    return {
+        "event_role": event.event_role.value,
+        "payload": payload,
+    }
+
+
+def semantic_document_canonical_json(
+    source_registry_id: str,
+    natural_document_key: str | None,
+    adapter_result: AdapterResult,
+) -> str:
+    if not isinstance(adapter_result, AdapterResult):
+        raise OrchestrationError(
+            "semantic document requires AdapterResult"
+        )
+    events = [
+        _canonical_semantic_event(event)
+        for event in adapter_result.events
+    ]
+    events.sort(key=_canonical_json)
+    document = {
+        "events": events,
+        "natural_document_key": (
+            _normalize_semantic_text(natural_document_key)
+            if natural_document_key is not None
+            else None
+        ),
+        "period_end": (
+            _normalize_semantic_text(adapter_result.period_end)
+            if adapter_result.period_end is not None
+            else None
+        ),
+        "period_start": (
+            _normalize_semantic_text(adapter_result.period_start)
+            if adapter_result.period_start is not None
+            else None
+        ),
+        "period_status": adapter_result.period_status.value,
+        "source_registry_id": _normalize_semantic_text(
+            source_registry_id
+        ),
+        "version": SEMANTIC_DOCUMENT_VERSION,
+    }
+    return _canonical_json(document)
+
+
+def semantic_document_sha256(
+    source_registry_id: str,
+    natural_document_key: str | None,
+    adapter_result: AdapterResult,
+) -> str:
+    canonical = semantic_document_canonical_json(
+        source_registry_id,
+        natural_document_key,
+        adapter_result,
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _classify_semantic_identity(
+    records: tuple[SourceDocumentReadRecord, ...],
+    *,
+    source_registry_id: str,
+    natural_document_key: str,
+    semantic_sha256: str,
+) -> tuple[DocumentIdentityStatus, str | None]:
+    for record in records:
+        if (
+            record.source_registry_id != source_registry_id
+            or record.natural_document_key != natural_document_key
+        ):
+            raise OrchestrationError(
+                "natural identity lookup returned conflicting authority"
+            )
+    if not records:
+        return (DocumentIdentityStatus.NEW, None)
+    ordered = tuple(
+        sorted(records, key=lambda item: item.source_document_id)
+    )
+    for record in ordered:
+        if record.semantic_sha256 == semantic_sha256:
+            return (
+                DocumentIdentityStatus.SEMANTIC_DUPLICATE,
+                record.source_document_id,
+            )
+    if any(record.semantic_sha256 is None for record in ordered):
+        return (DocumentIdentityStatus.AMBIGUOUS, None)
+    return (
+        DocumentIdentityStatus.REVISION_OR_CONFLICT,
+        ordered[0].source_document_id,
+    )
+
+
+def _safe_preflight_view(
+    preflight: DocumentPreflight | None,
+) -> dict[str, object] | None:
+    if preflight is None:
+        return None
+    detection = preflight.template_detection
+    return {
+        "content_sha256": preflight.content_sha256,
+        "extension": preflight.extension,
+        "media_type": preflight.media_type,
+        "period_status": preflight.period_status.value,
+        "quality_status": preflight.quality_status.value,
+        "template_detection": {
+            "source_registry_id": detection.source_registry_id,
+            "status": detection.status.value,
+            "template_id": detection.template_id,
+        },
+    }
+
+
+def safe_dry_run_document_view(
+    result: DryRunDocumentResult,
+) -> dict[str, object]:
+    adapter_view = None
+    if result.selected_adapter is not None:
+        adapter_view = {
+            "adapter_id": result.selected_adapter.adapter_id,
+            "parser_version": result.selected_adapter.parser_version,
+            "source_channel": result.selected_adapter.source_channel.value,
+            "source_registry_id": result.selected_adapter.source_registry_id,
+            "template_id": result.selected_adapter.template_id,
+        }
+    return {
+        "content_sha256": result.content_sha256,
+        "diagnostics": [
+            {
+                "code": item.code,
+                "locator_token": item.locator_token,
+                "message": item.message,
+                "severity": item.severity.value,
+                "source_document_id": item.source_document_id,
+                "stage": item.stage.value,
+            }
+            for item in result.diagnostics
+        ],
+        "disposition": result.disposition.value,
+        "identity_status": (
+            result.identity_status.value
+            if result.identity_status is not None
+            else None
+        ),
+        "observed_extensions": list(result.observed_extensions),
+        "occurrence_tokens": list(result.occurrence_tokens),
+        "preflight": _safe_preflight_view(result.preflight),
+        "related_existing_document_id": (
+            result.related_existing_document_id
+        ),
+        "selected_adapter": adapter_view,
+        "semantic_sha256": result.semantic_sha256,
+        "size_bytes": result.size_bytes,
+        "source_document_id": result.source_document_id,
+    }
+
+
+def safe_dry_run_batch_json(result: DryRunBatchResult) -> str:
+    return _canonical_json(
+        {
+            "diagnostics": [
+                {
+                    "code": item.code,
+                    "locator_token": item.locator_token,
+                    "message": item.message,
+                    "severity": item.severity.value,
+                    "source_document_id": item.source_document_id,
+                    "stage": item.stage.value,
+                }
+                for item in result.diagnostics
+            ],
+            "documents": [
+                safe_dry_run_document_view(item)
+                for item in result.documents
+            ],
+            "exact_duplicate_count": result.exact_duplicate_count,
+            "failed_count": result.failed_count,
+            "occurrence_count": result.occurrence_count,
+            "overall_status": result.overall_status.value,
+            "ready_for_staging_count": result.ready_for_staging_count,
+            "review_required_count": result.review_required_count,
+            "semantic_duplicate_count": result.semantic_duplicate_count,
+            "unique_artifact_count": result.unique_artifact_count,
+        }
+    )
+
+
+def _diagnostic_sort_key(
+    item: DryRunDiagnostic,
+) -> tuple[str, str, str, str]:
+    return (
+        item.stage.value,
+        item.code,
+        item.source_document_id or "",
+        item.locator_token or "",
+    )
+
+
+def dry_run_batch(
+    root: str | object,
+    discovery: DiscoveryResult,
+    *,
+    registry: ReadOnlyRegistryAuthority,
+    adapter_catalog: AdapterCatalog,
+    claimed_source_registry_ids: Mapping[str, str] | None = None,
+    discovery_policy: DiscoveryPolicy | None = None,
+    payload_reader: Callable[..., bytes] = read_discovered_artifact,
+    preflight_func: PreflightFunction = preflight_bytes,
+) -> DryRunBatchResult:
+    claims = dict(claimed_source_registry_ids or {})
+    documents = tuple(
+        dry_run_artifact(
+            root,
+            artifact,
+            registry=registry,
+            adapter_catalog=adapter_catalog,
+            claimed_source_registry_id=claims.get(
+                artifact.content_sha256
+            ),
+            discovery_policy=discovery_policy,
+            payload_reader=payload_reader,
+            preflight_func=preflight_func,
+        )
+        for artifact in sorted(
+            discovery.artifacts,
+            key=lambda item: item.content_sha256,
+        )
+    )
+
+    diagnostics = [
+        _diagnostic(
+            item.code,
+            DryRunStage.DISCOVERY,
+            DiagnosticSeverity.WARNING,
+            "Discovery reported a safe diagnostic.",
+            locator_token=item.locator_token,
+        )
+        for item in discovery.diagnostics
+    ]
+    for document in documents:
+        diagnostics.extend(document.diagnostics)
+    ordered_diagnostics = tuple(
+        sorted(diagnostics, key=_diagnostic_sort_key)
+    )
+
+    exact_duplicate_count = sum(
+        item.identity_status is DocumentIdentityStatus.EXACT_DUPLICATE
+        for item in documents
+    )
+    semantic_duplicate_count = sum(
+        item.identity_status is DocumentIdentityStatus.SEMANTIC_DUPLICATE
+        for item in documents
+    )
+    ready_for_staging_count = sum(
+        item.disposition is DryRunDisposition.READY_FOR_STAGING
+        for item in documents
+    )
+    review_required_count = sum(
+        item.disposition is DryRunDisposition.REVIEW_REQUIRED
+        for item in documents
+    )
+    failed_count = sum(
+        item.disposition is DryRunDisposition.FAILED
+        for item in documents
+    )
+
+    if any(
+        item.code in _BATCH_FATAL_CODES
+        for item in ordered_diagnostics
+    ):
+        overall_status = DryRunBatchStatus.FAILED
+    elif review_required_count or failed_count:
+        overall_status = DryRunBatchStatus.REVIEW_REQUIRED
+    else:
+        overall_status = DryRunBatchStatus.COMPLETED
+
+    return DryRunBatchResult(
+        unique_artifact_count=len(documents),
+        occurrence_count=sum(
+            len(item.occurrences) for item in documents
+        ),
+        exact_duplicate_count=exact_duplicate_count,
+        semantic_duplicate_count=semantic_duplicate_count,
+        ready_for_staging_count=ready_for_staging_count,
+        review_required_count=review_required_count,
+        failed_count=failed_count,
+        documents=documents,
+        diagnostics=ordered_diagnostics,
+        overall_status=overall_status,
+    )
+
+
 
 
 __all__ = [
     "AdapterCatalog",
     "AdapterCatalogError",
+    "DryRunBatchResult",
+    "DryRunBatchStatus",
     "DryRunDiagnostic",
     "DryRunDisposition",
     "DryRunDocumentResult",
     "DryRunStage",
     "OrchestrationError",
     "ReadOnlyRegistryAuthority",
+    "SEMANTIC_DOCUMENT_VERSION",
     "SqliteRegistryAuthority",
     "dry_run_artifact",
+    "dry_run_batch",
+    "safe_dry_run_batch_json",
+    "safe_dry_run_document_view",
+    "semantic_document_canonical_json",
+    "semantic_document_sha256",
 ]
