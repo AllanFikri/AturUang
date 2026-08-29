@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "privacy": "synthetic-sanitized-only",
+  "cases": {
+    "normal_statement": {
+      "pages": [
+        "Laporan Keuangan Bulanan\nJuli 2026\nHalaman 1 dari 3\nPT Bank Jago Tbk berizin dan diawasi oleh Otoritas Jasa Keuangan (OJK) dan Bank Indonesia\nwww.jago.com\nSYNTHETIC USER / 100011112222\nJL. SYNTHETIC NO. 1, RT.001/RW.001\nKota Malang, Jawa Timur\nRINGKASAN SALDO DALAM RUPIAH\nTotal Saldo Personal\nTotal Saldo Bersama\nSaldo akhir pada 31 Jul 2026\n1.250.000,00\n0\n1.250.000,00\nSOROTAN\nRp 500.000\n50% UANG MASUK\nRp 250.000\n50% UANG KELUAR\nKANTONG PERSONAL\nNama Kantong\nMata Uang\nSaldo Sebelumnya\nTotal Pemasukan\nTotal Pengeluaran\nSaldo Akhir\nKantong Utama\nIDR\n1.000.000,00\n+500.000,00\n-250.000,00\n1.250.000,00\nTotal Saldo Personal\nIDR\n1.000.000,00\n30 Jun 2026\n1.250.000,00\n31 Jul 2026",
+        "Laporan Keuangan Bulanan\nJuli 2026\nHalaman 2 dari 3\nPT Bank Jago Tbk berizin dan diawasi oleh Otoritas Jasa Keuangan (OJK) dan Bank Indonesia\nwww.jago.com\nKantong Utama\nID Kantong 100011112222\nAkun Aktif, mulai 01 Jan 2026\nSaldo Sebelumnya\nTotal Pemasukan\nTotal Pengeluaran\nSaldo Akhir\n1.000.000,00\n+\n500.000,00\n-\n250.000,00\n1.250.000,00\nTanggal & Waktu\nSumber/Tujuan\nRincian Transaksi\nCatatan\nJumlah\nSaldo\n05 Jul 2026\n10.15\nSYNTHETIC SENDER\nBCA 1234567890\nTransfer Masuk\nID# 9900112233\n+500.000,00\n1.500.000,00\n10 Jul 2026\n14.30\nSYNTHETIC MERCHANT\nPembayaran QRIS\nID# 9900445566\nCatatan belanja bulanan\n-150.000,00\n1.350.000,00\n15 Jul 2026\n09.00\nKantong Tabungan\nPindah uang antar Kantong\nID# 9900778899\n-100.000,00\n1.250.000,00",
+        "Laporan Keuangan Bulanan\nJuli 2026\nHalaman 3 dari 3\nPT Bank Jago Tbk berizin dan diawasi oleh Otoritas Jasa Keuangan (OJK) dan Bank Indonesia\nwww.jago.com\nKantong Tabungan\nID Kantong 200033334444\nAkun Aktif, mulai 15 Feb 2026\nSaldo Sebelumnya\nTotal Pemasukan\nTotal Pengeluaran\nSaldo Akhir\n0,00\n+\n100.000,00\n-\n0,00\n100.000,00\nTanggal & Waktu\nSumber/Tujuan\nRincian Transaksi\nCatatan\nJumlah\nSaldo\n15 Jul 2026\n09.00\nKantong Utama\nPindah uang antar Kantong\nID# 9900778899\n+100.000,00\n100.000,00"
+      ]
+    },
+    "zero_activity_statement": {
+      "pages": [
+        "Laporan Keuangan Bulanan\nAgustus 2026\nHalaman 1 dari 2\nPT Bank Jago Tbk berizin dan diawasi oleh Otoritas Jasa Keuangan (OJK)\nwww.jago.com\nSYNTHETIC USER / 100011112222\nRINGKASAN SALDO DALAM RUPIAH\nTotal Saldo Personal\nTotal Saldo Bersama\nSaldo akhir pada 31 Agu 2026\n500.000,00\n0\n500.000,00\nSOROTAN\nRp 0\n0% UANG MASUK\nRp 0\n0% UANG KELUAR\nKANTONG PERSONAL\nNama Kantong\nMata Uang\nSaldo Sebelumnya\nTotal Pemasukan\nTotal Pengeluaran\nSaldo Akhir\nKantong Pasif\nIDR\n500.000,00\n0\n0\n500.000,00\nTotal Saldo Personal\nIDR\n500.000,00\n31 Jul 2026\n500.000,00\n31 Agu 2026",
+        "Laporan Keuangan Bulanan\nAgustus 2026\nHalaman 2 dari 2\nPT Bank Jago Tbk berizin dan diawasi oleh Otoritas Jasa Keuangan (OJK)\nwww.jago.com\nKantong Pasif\nID Kantong 300055556666\nAkun Aktif, mulai 01 Jan 2026\nSaldo Sebelumnya\nTotal Pemasukan\nTotal Pengeluaran\nSaldo Akhir\n500.000,00\n+\n0\n-\n0\n500.000,00"
+      ]
+    },
+    "multipage_continuation_statement": {
+      "pages": [
+        "Laporan Keuangan Bulanan\nSeptember 2026\nHalaman 1 dari 3\nPT Bank Jago Tbk\nwww.jago.com\nSYNTHETIC USER / 100011112222\nRINGKASAN SALDO DALAM RUPIAH\nTotal Saldo Personal\nSaldo akhir pada 30 Sep 2026\n800.000,00\nKANTONG PERSONAL\nKantong Utama\nIDR\n1.000.000,00\n0\n-200.000,00\n800.000,00",
+        "Laporan Keuangan Bulanan\nSeptember 2026\nHalaman 2 dari 3\nwww.jago.com\nKantong Utama\nID Kantong 100011112222\nAkun Aktif, mulai 01 Jan 2026\nSaldo Sebelumnya\nTotal Pemasukan\nTotal Pengeluaran\nSaldo Akhir\n1.000.000,00\n+\n0\n-\n200.000,00\n800.000,00\nTanggal & Waktu\nSumber/Tujuan\nRincian Transaksi\nCatatan\nJumlah\nSaldo\n02 Sep 2026\n08.10\nSTORE A\nPembayaran QRIS\nID# 1122334401\n-100.000,00\n900.000,00",
+        "Laporan Keuangan Bulanan\nSeptember 2026\nHalaman 3 dari 3\nwww.jago.com\nTanggal & Waktu\nSumber/Tujuan\nRincian Transaksi\nCatatan\nJumlah\nSaldo\n03 Sep 2026\n09.20\nSTORE B\nPembayaran QRIS\nID# 1122334402\n-100.000,00\n800.000,00"
+      ]
+    },
+    "missing_period_statement": {
+      "pages": [
+        "Laporan Keuangan Bulanan\nPeriode Tidak Diketahui\nHalaman 1 dari 1\nwww.jago.com\nSYNTHETIC USER / 100011112222\nRINGKASAN SALDO DALAM RUPIAH"
+      ]
+    },
+    "missing_header_account_statement": {
+      "pages": [
+        "Laporan Keuangan Bulanan\nOktober 2026\nHalaman 1 dari 1\nwww.jago.com\nSYNTHETIC USER TANPA NOMOR AKUN\nRINGKASAN SALDO DALAM RUPIAH"
+      ]
+    },
+    "malformed_row_statement": {
+      "pages": [
+        "Laporan Keuangan Bulanan\nOktober 2026\nHalaman 1 dari 2\nwww.jago.com\nSYNTHETIC USER / 100011112222\nRINGKASAN SALDO DALAM RUPIAH\nTotal Saldo Personal\nSaldo akhir pada 31 Okt 2026\n100.000,00\nKANTONG PERSONAL\nKantong Utama\nIDR\n100.000,00\n0\n0\n100.000,00",
+        "Laporan Keuangan Bulanan\nOktober 2026\nHalaman 2 dari 2\nwww.jago.com\nKantong Utama\nID Kantong 100011112222\nAkun Aktif, mulai 01 Jan 2026\nSaldo Sebelumnya\nTotal Pemasukan\nTotal Pengeluaran\nSaldo Akhir\n100.000,00\n+\n0\n-\n0\n100.000,00\nTanggal & Waktu\nSumber/Tujuan\nRincian Transaksi\nCatatan\nJumlah\nSaldo\n05 Okt 2026\n11.00\nBARIS RUSAK TANPA ID DAN NOMINAL\n100.000,00"
+      ]
+    },
+    "duplicate_tx_id_conflict_statement": {
+      "pages": [
+        "Laporan Keuangan Bulanan\nNovember 2026\nHalaman 1 dari 2\nwww.jago.com\nSYNTHETIC USER / 100011112222\nRINGKASAN SALDO DALAM RUPIAH\nTotal Saldo Personal\nSaldo akhir pada 30 Nov 2026\n800.000,00\nKANTONG PERSONAL\nKantong Utama\nIDR\n1.000.000,00\n0\n-200.000,00\n800.000,00",
+        "Laporan Keuangan Bulanan\nNovember 2026\nHalaman 2 dari 2\nwww.jago.com\nKantong Utama\nID Kantong 100011112222\nAkun Aktif, mulai 01 Jan 2026\nSaldo Sebelumnya\nTotal Pemasukan\nTotal Pengeluaran\nSaldo Akhir\n1.000.000,00\n+\n0\n-\n200.000,00\n800.000,00\nTanggal & Waktu\nSumber/Tujuan\nRincian Transaksi\nCatatan\nJumlah\nSaldo\n05 Nov 2026\n10.00\nSTORE A\nPembayaran QRIS\nID# DUPLICATE-999\n-100.000,00\n900.000,00\n06 Nov 2026\n11.00\nSTORE B\nPembayaran QRIS\nID# DUPLICATE-999\n-100.000,00\n800.000,00"
+      ]
+    }
+  }
+}
