@@ -505,10 +505,17 @@ def dry_run_artifact(
         )
 
     try:
-        preflight = preflight_func(
-            payload,
-            extension=artifact.extension,
-        )
+        if claimed_source_registry_id is not None:
+            preflight = preflight_func(
+                payload,
+                extension=artifact.extension,
+                source_hint=claimed_source_registry_id,
+            )
+        else:
+            preflight = preflight_func(
+                payload,
+                extension=artifact.extension,
+            )
     except Exception:
         return _failed_result(
             artifact,

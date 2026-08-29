@@ -237,6 +237,14 @@ SOURCE_TEMPLATE_SIGNATURES_V1: tuple[TemplateSignature, ...] = (
             "Total Pembayaran",
         ),
     ),
+    TemplateSignature(
+        source_registry_id="shopeepay_mutation",
+        template_id="shopeepay_transaction_history_image_v1",
+        media_type="IMAGE",
+        required_markers=(
+            "Transaction History",
+        ),
+    ),
 )
 
 
@@ -598,6 +606,8 @@ def _image_preflight(
     extension: str,
     mime_type: str,
     policy: PreflightPolicy,
+    signatures: Sequence[TemplateSignature] = SOURCE_TEMPLATE_SIGNATURES_V1,
+    source_hint: str | None = None,
 ) -> DocumentPreflight:
     digest = sha256(data).hexdigest()
 
@@ -620,6 +630,40 @@ def _image_preflight(
         )
 
     width, height = dimensions
+
+    normalized_hint = _normalize_marker(source_hint) if source_hint and str(source_hint).strip() else None
+    if normalized_hint == "shopeepay_mutation":
+        shopee_sig = None
+        for sig in signatures:
+            if sig.source_registry_id == "shopeepay_mutation" and sig.media_type == "IMAGE":
+                shopee_sig = sig
+                break
+
+        if shopee_sig is not None:
+            return DocumentPreflight(
+                content_sha256=digest,
+                size_bytes=len(data),
+                extension=extension,
+                media_type="IMAGE",
+                mime_type=mime_type,
+                quality_status=PreflightQuality.READY,
+                page_count=None,
+                image_dimensions=dimensions,
+                text_layer_available=False,
+                pdf_encryption_state=PdfEncryptionState.NOT_PDF,
+                period_status=PeriodStatus.UNKNOWN,
+                template_detection=TemplateDetection(
+                    status=TemplateMatchStatus.KNOWN,
+                    source_registry_id=shopee_sig.source_registry_id,
+                    template_id=shopee_sig.template_id,
+                    template_fingerprint=template_fingerprint(shopee_sig),
+                    method=DetectionMethod.SOURCE_HINT,
+                    required_marker_matches=0,
+                    required_marker_total=len(shopee_sig.required_markers),
+                    reason_code="SOURCE_HINT_IMAGE_ROUTING",
+                ),
+            )
+
     quality = (
         PreflightQuality.LOW_RESOLUTION
         if width < policy.min_image_width or height < policy.min_image_height
@@ -724,6 +768,8 @@ def preflight_bytes(
             extension=extension,
             mime_type=mime_type,
             policy=policy,
+            signatures=signatures,
+            source_hint=source_hint,
         )
 
     return DocumentPreflight(
