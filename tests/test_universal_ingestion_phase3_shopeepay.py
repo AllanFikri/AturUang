@@ -246,6 +246,7 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
 
     # 10. Adapter period authority: CLOSED
     def test_10_adapter_period_authority_closed(self) -> None:
+        # C. Explicit complete month range creates CLOSED period
         img_bytes = _make_synthetic_image(1220, 4000)
         inp = self._make_adapter_input(img_bytes)
         adapter = ShopeePayTransactionHistoryImageAdapter(
@@ -256,8 +257,55 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
         self.assertEqual(res.period_start, "2025-11-01")
         self.assertEqual(res.period_end, "2025-11-30")
 
+        # A. Standalone month heading "November 2099" does NOT create CLOSED period
+        standalone_month_ocr = ImageOcrResult(
+            lines=(
+                ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                ImageOcrLine(text="Payment Method", x=50, y=150, width=200, height=30),
+                ImageOcrLine(text="Top Up", x=50, y=200, width=100, height=30),
+                ImageOcrLine(text="November 2099", x=50, y=250, width=150, height=30),
+                ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                ImageOcrLine(text="-Rp10.000", x=800, y=400, width=150, height=30),
+                ImageOcrLine(text="Merchant Item", x=50, y=450, width=200, height=30),
+                ImageOcrLine(text="15 November 2099", x=50, y=500, width=200, height=30),
+            ),
+            image_width=1220,
+            image_height=2000,
+        )
+        adapter_standalone = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: standalone_month_ocr
+        )
+        res_standalone = adapter_standalone.parse(inp)
+        self.assertEqual(res_standalone.period_status, PeriodStatus.UNKNOWN)
+        self.assertIsNone(res_standalone.period_start)
+        self.assertIsNone(res_standalone.period_end)
+        self.assertIsNone(res_standalone.natural_document_key_candidate)
+
+        # B. Transaction date "25 November 2099" does NOT create CLOSED period
+        tx_date_only_ocr = ImageOcrResult(
+            lines=(
+                ImageOcrLine(text="Riwayat Transaksi", x=50, y=100, width=300, height=30),
+                ImageOcrLine(text="Semua", x=50, y=150, width=100, height=30),
+                ImageOcrLine(text="Top Up", x=50, y=200, width=100, height=30),
+                ImageOcrLine(text="+Rp50.000", x=800, y=400, width=150, height=30),
+                ImageOcrLine(text="Isi Saldo", x=50, y=450, width=200, height=30),
+                ImageOcrLine(text="25 November 2099", x=50, y=500, width=200, height=30),
+            ),
+            image_width=1220,
+            image_height=2000,
+        )
+        adapter_tx = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: tx_date_only_ocr
+        )
+        res_tx = adapter_tx.parse(inp)
+        self.assertEqual(res_tx.period_status, PeriodStatus.UNKNOWN)
+        self.assertIsNone(res_tx.period_start)
+        self.assertIsNone(res_tx.period_end)
+        self.assertIsNone(res_tx.natural_document_key_candidate)
+
     # 11. Adapter period authority: OPEN
     def test_11_adapter_period_authority_open(self) -> None:
+        # D. Explicit partial range creates OPEN period
         img_bytes = _make_synthetic_image(1220, 2000)
         inp = self._make_adapter_input(img_bytes)
         adapter = ShopeePayTransactionHistoryImageAdapter(
@@ -267,6 +315,7 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
         self.assertEqual(res.period_status, PeriodStatus.OPEN)
         self.assertEqual(res.period_start, "2026-08-01")
         self.assertEqual(res.period_end, "2026-08-21")
+        self.assertEqual(res.natural_document_key_candidate, "shopeepay_mutation:unidentified_wallet:2026-08")
 
     # 12. Valid high-res JPEG extraction
     def test_12_valid_high_res_jpeg_extraction(self) -> None:
@@ -490,6 +539,29 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
         )
         res = adapter.parse(inp)
         self.assertEqual(res.natural_document_key_candidate, "shopeepay_mutation:unidentified_wallet:2025-11")
+
+        # E. No authoritative range: period_start=None, period_end=None, natural_key=None, period_status=UNKNOWN
+        no_range_ocr = ImageOcrResult(
+            lines=(
+                ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                ImageOcrLine(text="Payment Method", x=50, y=150, width=200, height=30),
+                ImageOcrLine(text="Top Up", x=50, y=200, width=100, height=30),
+                ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+                ImageOcrLine(text="-Rp20.000", x=800, y=400, width=150, height=30),
+                ImageOcrLine(text="Merchant", x=50, y=450, width=200, height=30),
+                ImageOcrLine(text="10 Oktober 2099", x=50, y=500, width=200, height=30),
+            ),
+            image_width=1220,
+            image_height=2000,
+        )
+        adapter_no_range = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: no_range_ocr
+        )
+        res_no_range = adapter_no_range.parse(inp)
+        self.assertIsNone(res_no_range.natural_document_key_candidate)
+        self.assertIsNone(res_no_range.period_start)
+        self.assertIsNone(res_no_range.period_end)
+        self.assertEqual(res_no_range.period_status, PeriodStatus.UNKNOWN)
 
     # 30. Diagnostics and repr privacy safety
     def test_30_diagnostics_and_repr_privacy_safety(self) -> None:

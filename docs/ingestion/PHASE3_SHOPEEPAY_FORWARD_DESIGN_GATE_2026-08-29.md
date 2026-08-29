@@ -23,17 +23,18 @@ The private corpus consists of 13 SHA-unique ShopeePay transaction-history scree
   - Total Unique Image Artifacts: 13
   - Closed Calendar Periods: 12 (2025-08 through 2026-07)
   - Open / Partial Calendar Periods: 1 (2026-08, activity through 2026-08-21)
-  - Total Visible Transaction Cards: 274
-  - Successful Monetary Movement Candidates: 267
-  - Explicit Failed Evidence Rows: 7
+  - Total Visible Transaction Cards: 326
+  - Successful Monetary Movement Candidates: 305
+  - Explicit Failed Evidence Rows: 21
 
 - Partition 1: High-Resolution 2025 Captures (5 Artifacts):
   - Months: August 2025 through December 2025
   - Dimensions: 1220x3689 to 1220x13017 (native full-resolution mobile scrolling captures, width >= 720 px)
-  - Total Visible Cards: 62
-  - Successful Monetary Rows: 60 (eligible for automated raw-image CASH_MOVEMENT extraction)
-  - Explicit Failed Rows: 2 (internal evidence only, 0 CASH_MOVEMENT)
+  - Total Visible Cards: 114
+  - Successful Monetary Rows: 98 (eligible for automated raw-image CASH_MOVEMENT extraction)
+  - Explicit Failed Rows: 16 (internal evidence only, 0 CASH_MOVEMENT; 2025-08: 14, 2025-09: 2, 2025-10: 0, 2025-11: 0, 2025-12: 0)
   - Optical Extraction: Viable via deterministic vertical slicing using local Windows WinRT OCR transport.
+  - Raw Production Replay: Emits exactly 98 CASH_MOVEMENT envelopes across the 5 high-resolution documents (2025-08: 25, 2025-09: 38, 2025-10: 9, 2025-11: 10, 2025-12: 16).
 
 - Partition 2: Low-Resolution 2026 Captures (8 Artifacts):
   - Months: January 2026 through August 2026
@@ -89,9 +90,15 @@ To prevent degraded optical noise from corrupting financial accounts without low
 ## 5. Period Authority & Calendar Boundaries
 
 - Preflight Period Invariant: Because preflight does not perform OCR, preflight.period_status = PeriodStatus.UNKNOWN for routed ShopeePay images.
-- Adapter Period Authority: The ShopeePay adapter extracts the visible date filter (e.g. 01 Nov 2025 - 30 Nov 2025) from OCR output and determines the definitive AdapterResult period status:
-  - Full calendar month (1st day to last calendar day): PeriodStatus.CLOSED (12 months: 2025-08 through 2026-07).
-  - Partial / ongoing month (e.g. 01 Aug 2026 - 21 Aug 2026): PeriodStatus.OPEN (1 month: 2026-08).
+- Adapter Period Authority & Strict Date-Range Invariants:
+  - PeriodStatus.CLOSED is allowed ONLY when OCR source evidence establishes an explicit period range satisfying:
+    - start day == 1
+    - start year == end year AND start month == end month
+    - end day == actual final calendar day of that month (e.g. 01 Nov 2025 - 30 Nov 2025).
+  - Partial / ongoing range (e.g. 01 Aug 2026 - 21 Aug 2026): PeriodStatus.OPEN.
+  - Standalone Month Headings & Transaction Dates: A standalone month label (e.g. "November 2025") or a card transaction date (e.g. "25 November 2025") MUST NOT establish period authority or CLOSED/OPEN status. They serve only as visual content template markers.
+  - Absence of Authoritative Range: If no explicit date range is found, the adapter yields PeriodStatus.UNKNOWN with period_start=None, period_end=None, and natural_document_key_candidate=None.
+  - Natural Document Key: shopeepay_mutation:unidentified_wallet:<YYYY-MM> is created ONLY after an authoritative date range has been parsed.
 - Screenshot capture completeness does not override calendar period boundaries. Period values are never inferred from filenames.
 
 ---

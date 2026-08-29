@@ -322,8 +322,24 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
         natural_key: str | None = None
 
         date_filter_match = _DATE_FILTER_RE.search(full_text) or _DATE_FILTER_RE.search(ocr_result.text)
-        if not date_filter_match:
-            # Check if header lines have 2 dates
+        if date_filter_match:
+            d1, m1_str, y1, d2, m2_str, y2 = date_filter_match.groups()
+            m1 = _MONTH_NAME_TO_INT.get(m1_str.lower())
+            m2 = _MONTH_NAME_TO_INT.get(m2_str.lower())
+            if m1 and m2:
+                y1_int, y2_int = int(y1), int(y2)
+                d1_int, d2_int = int(d1), int(d2)
+                period_start_str = f"{y1_int:04d}-{m1:02d}-{d1_int:02d}"
+                period_end_str = f"{y2_int:04d}-{m2:02d}-{d2_int:02d}"
+                natural_key = f"shopeepay_mutation:unidentified_wallet:{y1_int:04d}-{m1:02d}"
+
+                last_day_of_month = calendar.monthrange(y2_int, m2)[1]
+                if d1_int == 1 and d2_int == last_day_of_month and m1 == m2 and y1_int == y2_int:
+                    period_status = PeriodStatus.CLOSED
+                else:
+                    period_status = PeriodStatus.OPEN
+        else:
+            # Check if header lines have 2 explicit dates representing a range
             header_lines = [l.text for l in sorted_lines if l.y < 700]
             header_text = " ".join(header_lines)
             all_dates = _DATE_RE.findall(header_text)
@@ -333,41 +349,16 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
                 m1 = _MONTH_NAME_TO_INT.get(m1_str.lower())
                 m2 = _MONTH_NAME_TO_INT.get(m2_str.lower())
                 if m1 and m2:
-                    period_start_str = f"{int(y1):04d}-{m1:02d}-{int(d1):02d}"
-                    period_end_str = f"{int(y2):04d}-{m2:02d}-{int(d2):02d}"
-                    natural_key = f"shopeepay_mutation:unidentified_wallet:{int(y1):04d}-{m1:02d}"
-                    last_day_of_month = calendar.monthrange(int(y2), m2)[1]
-                    if int(d1) == 1 and int(d2) == last_day_of_month and m1 == m2 and y1 == y2:
+                    y1_int, y2_int = int(y1), int(y2)
+                    d1_int, d2_int = int(d1), int(d2)
+                    period_start_str = f"{y1_int:04d}-{m1:02d}-{d1_int:02d}"
+                    period_end_str = f"{y2_int:04d}-{m2:02d}-{d2_int:02d}"
+                    natural_key = f"shopeepay_mutation:unidentified_wallet:{y1_int:04d}-{m1:02d}"
+                    last_day_of_month = calendar.monthrange(y2_int, m2)[1]
+                    if d1_int == 1 and d2_int == last_day_of_month and m1 == m2 and y1_int == y2_int:
                         period_status = PeriodStatus.CLOSED
                     else:
                         period_status = PeriodStatus.OPEN
-        else:
-            d1, m1_str, y1, d2, m2_str, y2 = date_filter_match.groups()
-            m1 = _MONTH_NAME_TO_INT.get(m1_str.lower())
-            m2 = _MONTH_NAME_TO_INT.get(m2_str.lower())
-            if m1 and m2:
-                period_start_str = f"{int(y1):04d}-{m1:02d}-{int(d1):02d}"
-                period_end_str = f"{int(y2):04d}-{m2:02d}-{int(d2):02d}"
-                natural_key = f"shopeepay_mutation:unidentified_wallet:{int(y1):04d}-{m1:02d}"
-
-                last_day_of_month = calendar.monthrange(int(y2), m2)[1]
-                if int(d1) == 1 and int(d2) == last_day_of_month and m1 == m2 and y1 == y2:
-                    period_status = PeriodStatus.CLOSED
-                else:
-                    period_status = PeriodStatus.OPEN
-
-        if period_status == PeriodStatus.UNKNOWN:
-            month_match = _MONTH_HEADER_RE.search(ocr_result.text) or _MONTH_HEADER_RE.search(full_text)
-            if month_match:
-                m_str, y_str = month_match.groups()
-                m_int = _MONTH_NAME_TO_INT.get(m_str.lower())
-                if m_int:
-                    y_int = int(y_str)
-                    last_day = calendar.monthrange(y_int, m_int)[1]
-                    period_start_str = f"{y_int:04d}-{m_int:02d}-01"
-                    period_end_str = f"{y_int:04d}-{m_int:02d}-{last_day:02d}"
-                    natural_key = f"shopeepay_mutation:unidentified_wallet:{y_int:04d}-{m_int:02d}"
-                    period_status = PeriodStatus.CLOSED
 
         # 6. Card Parsing
         parsed_cards = self._parse_transaction_cards(sorted_lines)
