@@ -327,11 +327,7 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
         ]
         header_filter_text = " ".join(header_filter_lines)
 
-        date_filter_match = (
-            _DATE_FILTER_RE.search(header_filter_text)
-            or _DATE_FILTER_RE.search(full_text)
-            or _DATE_FILTER_RE.search(ocr_result.text)
-        )
+        date_filter_match = _DATE_FILTER_RE.search(header_filter_text)
         if date_filter_match:
             d1, m1_str, y1, d2, m2_str, y2 = date_filter_match.groups()
             m1 = _MONTH_NAME_TO_INT.get(m1_str.lower())

@@ -353,11 +353,28 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
         adapter_tx = ShopeePayTransactionHistoryImageAdapter(
             ocr_extractor=lambda b: tx_dates_ocr
         )
-        res_tx = adapter_tx.parse(inp)
-        self.assertEqual(res_tx.period_status, PeriodStatus.UNKNOWN)
-        self.assertIsNone(res_tx.period_start)
-        self.assertIsNone(res_tx.period_end)
-        self.assertIsNone(res_tx.natural_document_key_candidate)
+        # I. Valid-looking range located ONLY in transaction body (y >= 600) -> period UNKNOWN, natural_key=None
+        body_range_ocr = ImageOcrResult(
+            lines=(
+                ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+                ImageOcrLine(text="Payment Method", x=50, y=150, width=200, height=30),
+                ImageOcrLine(text="Top Up", x=50, y=200, width=100, height=30),
+                ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                ImageOcrLine(text="-Rp10.000", x=800, y=700, width=150, height=30),
+                ImageOcrLine(text="Merchant Item 01 November 2099 - 30 November 2099", x=50, y=750, width=350, height=30),
+                ImageOcrLine(text="15 November 2099", x=50, y=800, width=200, height=30),
+            ),
+            image_width=1220,
+            image_height=2000,
+        )
+        adapter_body = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: body_range_ocr
+        )
+        res_body = adapter_body.parse(inp)
+        self.assertEqual(res_body.period_status, PeriodStatus.UNKNOWN)
+        self.assertIsNone(res_body.period_start)
+        self.assertIsNone(res_body.period_end)
+        self.assertIsNone(res_body.natural_document_key_candidate)
 
     # 11. Adapter period authority: OPEN
     def test_11_adapter_period_authority_open(self) -> None:
