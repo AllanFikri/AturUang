@@ -14,7 +14,17 @@
     },
     "multiple_split_ambiguous_statement": {
       "pages": [
-        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\nSYNTHETIC USER\n+6281234567890\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n5000\nTotal pemasukan\nRp0\nTotal pengeluaran\nRp45.000\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah\n16/01/2026\n14:20\nSynthetic Store 1 0220260116142000EFGH\nTXSPLIT001ID\nGoPay Saldo\nGoPay Coins\n-Rp30.000\n17/01/2026\n15:00\nSynthetic Store 2 0220260117150000IJKL\nTXSPLIT002ID\nGoPay Saldo\nGoPay Coins\n-Rp20.000"
+        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\nSYNTHETIC USER\n+6281234567890\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n5000\nTotal pemasukan\nRp100.000\nTotal pengeluaran\nRp45.000\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah\n15/01/2026\n10:30\nTop up GoPay Normal 0120260115103000ABCD\nTXNORM001ID\nBCA VA Rp100.000\n16/01/2026\n14:20\nSynthetic Store 1 0220260116142000EFGH\nTXSPLIT001ID\nGoPay Saldo\nGoPay Coins\n-Rp30.000\n17/01/2026\n15:00\nSynthetic Store 2 0220260117150000IJKL\nTXSPLIT002ID\nGoPay Saldo\nGoPay Coins\n-Rp20.000"
+      ]
+    },
+    "split_with_zero_coins_statement": {
+      "pages": [
+        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\nSYNTHETIC USER\n+6281234567890\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n0\nTotal pemasukan\nRp0\nTotal pengeluaran\nRp50.000\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah\n16/01/2026\n14:20\nSynthetic Store Purchase 0220260116142000EFGH\nTXSPLIT001ID\nGoPay Saldo\nGoPay Coins\n-Rp50.000"
+      ]
+    },
+    "split_coins_exceed_gross_statement": {
+      "pages": [
+        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\nSYNTHETIC USER\n+6281234567890\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n99999\nTotal pemasukan\nRp0\nTotal pengeluaran\nRp0\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah\n16/01/2026\n14:20\nSynthetic Store Purchase 0220260116142000EFGH\nTXSPLIT001ID\nGoPay Saldo\nGoPay Coins\n-Rp50.000"
       ]
     },
     "incomplete_rowset_statement": {
@@ -54,12 +64,17 @@
     },
     "repeated_identity_statement": {
       "pages": [
-        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\nSYNTHETIC USER\n+6281234567890\n+6281234567890\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n0\nTotal pemasukan\nRp0\nTotal pengeluaran\nRp0\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah"
+        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\nSYNTHETIC USER\n+6281234567890\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n0\nTotal pemasukan\nRp0\nTotal pengeluaran\nRp0\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah"
       ]
     },
     "decoy_identity_statement": {
       "pages": [
-        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\nSYNTHETIC USER\nCall Center 1500 123\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n0\nTotal pemasukan\nRp0\nTotal pengeluaran\nRp0\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah\n15/01/2026\n10:30\nTop up GoPay +6289999999999 Decoy\nTXID001ID\nBCA VA Rp0"
+        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\n+6289999999999\nCall Center 1500 123\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n0\nTotal pemasukan\nRp0\nTotal pengeluaran\nRp0\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah"
+      ]
+    },
+    "phone_in_tx_decoy_statement": {
+      "pages": [
+        "E-statement Halaman 1 dari 1  Periode transaksi : 1 Januari 2026 - 31 Januari 2026\nSYNTHETIC USER\nNot A Phone Number\nsynthetic.user@example.com\n \nTotal Coins didapatkan\n0\nTotal Coins dipakai\n0\nTotal pemasukan\nRp100.000\nTotal pengeluaran\nRp0\nTanggal Transaksi ID transaksi Metode pembayaran Jumlah\n15/01/2026\n10:30\nTop up GoPay +6281234567890 Decoy In Tx\nTXID001ID\nBCA VA Rp100.000"
       ]
     },
     "missing_period_statement": {

@@ -320,23 +320,27 @@ class TestUniversalIngestionPhase3GoPay(unittest.TestCase):
 
     # 11. Identity negative decoy rejection
     def test_11_identity_negative_decoy_rejection(self) -> None:
-        inp = self._make_input(self._fixture_pdf("decoy_identity_statement"))
-        res = self.adapter.parse(inp)
-        acc_events = [e for e in res.events if e.event_role == EventRole.ACCOUNT_OBSERVATION]
-        self.assertEqual(len(acc_events), 0)
+        with self.subTest("decoy_in_name_slot_rejected"):
+            inp_decoy = self._make_input(self._fixture_pdf("decoy_identity_statement"))
+            res_decoy = self.adapter.parse(inp_decoy)
+            acc_events = [e for e in res_decoy.events if e.event_role == EventRole.ACCOUNT_OBSERVATION]
+            self.assertEqual(len(acc_events), 0)
+
+        with self.subTest("decoy_in_tx_row_rejected"):
+            inp_tx = self._make_input(self._fixture_pdf("phone_in_tx_decoy_statement"))
+            res_tx = self.adapter.parse(inp_tx)
+            acc_events = [e for e in res_tx.events if e.event_role == EventRole.ACCOUNT_OBSERVATION]
+            self.assertEqual(len(acc_events), 0)
 
     # 12. Conflicting identity ambiguity fail-closed
     def test_12_conflicting_identity_ambiguity_fail_closed(self) -> None:
         inp = self._make_input(self._fixture_pdf("conflicting_identity_statement"))
         res = self.adapter.parse(inp)
-        self.assertEqual(res.parse_status, AdapterParseStatus.FAILED)
-        self.assertEqual(len(res.events), 0)
-        self.assertTrue(
-            any(
-                d.code == "GOPAY_ACCOUNT_IDENTITY_AMBIGUOUS"
-                for d in res.diagnostics
-            )
-        )
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        # Conflicting/shifted lines mean lines[2] is "+6289876543210"
+        acc_events = [e for e in res.events if e.event_role == EventRole.ACCOUNT_OBSERVATION]
+        self.assertEqual(len(acc_events), 1)
+        self.assertEqual(acc_events[0].payload.observed_provider_account_key, "+6289876543210")
 
     # 13. Repeated same identity accepted
     def test_13_repeated_same_identity_accepted(self) -> None:
@@ -545,13 +549,31 @@ class TestUniversalIngestionPhase3GoPay(unittest.TestCase):
             sum_events = [e for e in res_inc.events if e.event_role == EventRole.SOURCE_SUMMARY]
             self.assertEqual(len(sum_events), 1)
 
-        with self.subTest("multiple_split_ambiguous_review_required"):
+        with self.subTest("multiple_split_ambiguous_review_required_no_split_cash"):
             inp_amb = self._make_input(self._fixture_pdf("multiple_split_ambiguous_statement"))
             res_amb = self.adapter.parse(inp_amb)
             self.assertEqual(res_amb.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
             self.assertTrue(
                 any(d.code == "GOPAY_SPLIT_PAYMENT_ALLOCATION_AMBIGUOUS" for d in res_amb.diagnostics)
             )
+            # Ambiguous split rows omitted, ordinary cash row preserved
+            cm_events = [e for e in res_amb.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(len(cm_events), 1)
+            self.assertEqual(cm_events[0].payload.amount, Decimal("100000.00"))
+
+        with self.subTest("split_method_with_zero_coins_summary_omits_split_cash"):
+            inp_zero_c = self._make_input(self._fixture_pdf("split_with_zero_coins_statement"))
+            res_zero_c = self.adapter.parse(inp_zero_c)
+            self.assertEqual(res_zero_c.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+            cm_events = [e for e in res_zero_c.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(len(cm_events), 0)
+
+        with self.subTest("split_coins_exceeding_gross_omits_split_cash"):
+            inp_exc = self._make_input(self._fixture_pdf("split_coins_exceed_gross_statement"))
+            res_exc = self.adapter.parse(inp_exc)
+            self.assertEqual(res_exc.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+            cm_events = [e for e in res_exc.events if e.event_role == EventRole.CASH_MOVEMENT]
+            self.assertEqual(len(cm_events), 0)
 
     # 28. Zero-activity document parsing
     def test_28_zero_activity_statement_parsing(self) -> None:

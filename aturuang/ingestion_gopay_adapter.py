@@ -144,21 +144,13 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
     )
 
     def _extract_account_candidates(
-        self, header_lines: Sequence[str]
-    ) -> tuple[str | None, bool]:
-        candidates: set[str] = set()
-        for idx, line in enumerate(header_lines):
-            # Only check header lines in the identity position (line 1 or 2)
-            if idx in (1, 2):
-                m = _PHONE_RE.match(line.strip())
-                if m:
-                    candidates.add(m.group(0))
-
-        if len(candidates) == 0:
-            return None, False
-        if len(candidates) == 1:
-            return next(iter(candidates)), False
-        return None, True
+        self, lines: Sequence[str]
+    ) -> str | None:
+        if len(lines) > 2:
+            candidate = lines[2].strip()
+            if _PHONE_RE.match(candidate):
+                return candidate
+        return None
 
     def _extract_document_summary(
         self, lines: Sequence[str]
@@ -199,18 +191,13 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
 
         period_str = p_start[:7]
 
-        # Extract identity from exact structural header position
-        acc_num, is_ambiguous = self._extract_account_candidates(lines[:5])
-        if is_ambiguous:
-            return None, [
-                SafeDiagnostic(
-                    code="GOPAY_ACCOUNT_IDENTITY_AMBIGUOUS",
-                    message="Multiple distinct wallet identities found in header",
-                    severity=DiagnosticSeverity.ERROR,
-                )
-            ]
-
-        acc_holder = lines[1] if len(lines) > 1 and lines[1] != acc_num else None
+        # Extract identity strictly from lines[2] slot
+        acc_num = self._extract_account_candidates(lines)
+        acc_holder = (
+            lines[1].strip()
+            if len(lines) > 1 and lines[1].strip() != acc_num
+            else None
+        )
 
         coins_got = 0
         coins_used = 0
@@ -471,10 +458,10 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
         split_rows = [r for r in raw_parsed_rows if r.is_split_payment]
         is_split_ambiguous = False
 
-        if len(split_rows) == 1 and summary.coins_used > 0:
+        if len(split_rows) == 1:
             sr = split_rows[0]
             coins_dec = Decimal(summary.coins_used)
-            if sr.gross_amount >= coins_dec:
+            if summary.coins_used > 0 and sr.gross_amount >= coins_dec:
                 net_cash = sr.gross_amount - coins_dec
                 components = (
                     PaymentComponentEvidence(
@@ -509,8 +496,16 @@ class GoPayEStatementAdapter(UniversalSourceAdapter):
                     else:
                         resolved_rows.append(r)
                 raw_parsed_rows = resolved_rows
-        elif len(split_rows) > 1 and summary.coins_used > 0:
+            else:
+                is_split_ambiguous = True
+                raw_parsed_rows = [
+                    r for r in raw_parsed_rows if not r.is_split_payment
+                ]
+        elif len(split_rows) > 1:
             is_split_ambiguous = True
+            raw_parsed_rows = [
+                r for r in raw_parsed_rows if not r.is_split_payment
+            ]
 
         # Handle Duplicate Provider Transaction IDs & Deduplication
         deduped_rows: list[_ParsedGoPayRow] = []
