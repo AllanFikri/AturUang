@@ -1,0 +1,393 @@
+{
+  "version": 1,
+  "privacy": "synthetic-sanitized-only",
+  "cases": {
+    "valid_high_res_november": {
+      "image_width": 1220,
+      "image_height": 4000,
+      "lines": [
+        {
+          "text": "10:08",
+          "x": 50,
+          "y": 20,
+          "width": 80,
+          "height": 30
+        },
+        {
+          "text": "< Transaction History",
+          "x": 50,
+          "y": 150,
+          "width": 400,
+          "height": 50
+        },
+        {
+          "text": "01 Nov 2025 - 30 Nov 2025",
+          "x": 60,
+          "y": 260,
+          "width": 350,
+          "height": 40
+        },
+        {
+          "text": "Payment Method",
+          "x": 600,
+          "y": 260,
+          "width": 250,
+          "height": 40
+        },
+        {
+          "text": "All Top Up Payment Transfer",
+          "x": 50,
+          "y": 380,
+          "width": 600,
+          "height": 50
+        },
+        {
+          "text": "November 2025",
+          "x": 50,
+          "y": 500,
+          "width": 300,
+          "height": 50
+        },
+        {
+          "text": "Cashback Bonus",
+          "x": 180,
+          "y": 620,
+          "width": 250,
+          "height": 40
+        },
+        {
+          "text": "+Rp100",
+          "x": 900,
+          "y": 620,
+          "width": 150,
+          "height": 40
+        },
+        {
+          "text": "From ShopeePay",
+          "x": 180,
+          "y": 670,
+          "width": 200,
+          "height": 35
+        },
+        {
+          "text": "25 November 2025",
+          "x": 180,
+          "y": 715,
+          "width": 250,
+          "height": 35
+        },
+        {
+          "text": "Payment",
+          "x": 180,
+          "y": 820,
+          "width": 150,
+          "height": 40
+        },
+        {
+          "text": "-Rp100.000",
+          "x": 850,
+          "y": 820,
+          "width": 200,
+          "height": 40
+        },
+        {
+          "text": "byU",
+          "x": 180,
+          "y": 870,
+          "width": 80,
+          "height": 35
+        },
+        {
+          "text": "25 November 2025",
+          "x": 180,
+          "y": 915,
+          "width": 250,
+          "height": 35
+        },
+        {
+          "text": "Top Up",
+          "x": 180,
+          "y": 1020,
+          "width": 120,
+          "height": 40
+        },
+        {
+          "text": "+Rp99.000",
+          "x": 870,
+          "y": 1020,
+          "width": 180,
+          "height": 40
+        },
+        {
+          "text": "From Bank Transfer",
+          "x": 180,
+          "y": 1070,
+          "width": 250,
+          "height": 35
+        },
+        {
+          "text": "25 November 2025",
+          "x": 180,
+          "y": 1115,
+          "width": 250,
+          "height": 35
+        }
+      ]
+    },
+    "valid_partial_august": {
+      "image_width": 1220,
+      "image_height": 2000,
+      "lines": [
+        {
+          "text": "< Transaction History",
+          "x": 50,
+          "y": 150,
+          "width": 400,
+          "height": 50
+        },
+        {
+          "text": "01 Aug 2026 - 21 Aug 2026",
+          "x": 60,
+          "y": 260,
+          "width": 350,
+          "height": 40
+        },
+        {
+          "text": "Top Up Payment Transfer",
+          "x": 50,
+          "y": 380,
+          "width": 500,
+          "height": 50
+        },
+        {
+          "text": "August 2026",
+          "x": 50,
+          "y": 500,
+          "width": 250,
+          "height": 50
+        },
+        {
+          "text": "Payment",
+          "x": 180,
+          "y": 620,
+          "width": 150,
+          "height": 40
+        },
+        {
+          "text": "-Rp25.000",
+          "x": 850,
+          "y": 620,
+          "width": 180,
+          "height": 40
+        },
+        {
+          "text": "Shopee Marketplace",
+          "x": 180,
+          "y": 670,
+          "width": 300,
+          "height": 35
+        },
+        {
+          "text": "15 August 2026",
+          "x": 180,
+          "y": 715,
+          "width": 250,
+          "height": 35
+        }
+      ]
+    },
+    "with_failed_transaction": {
+      "image_width": 1220,
+      "image_height": 2500,
+      "lines": [
+        {
+          "text": "< Transaction History",
+          "x": 50,
+          "y": 150,
+          "width": 400,
+          "height": 50
+        },
+        {
+          "text": "01 Jan 2026 - 31 Jan 2026",
+          "x": 60,
+          "y": 260,
+          "width": 350,
+          "height": 40
+        },
+        {
+          "text": "Top Up Payment Transfer",
+          "x": 50,
+          "y": 380,
+          "width": 500,
+          "height": 50
+        },
+        {
+          "text": "January 2026",
+          "x": 50,
+          "y": 500,
+          "width": 250,
+          "height": 50
+        },
+        {
+          "text": "Payment",
+          "x": 180,
+          "y": 620,
+          "width": 150,
+          "height": 40
+        },
+        {
+          "text": "-Rp18.500",
+          "x": 850,
+          "y": 620,
+          "width": 180,
+          "height": 40
+        },
+        {
+          "text": "Shopee Marketplace",
+          "x": 180,
+          "y": 670,
+          "width": 300,
+          "height": 35
+        },
+        {
+          "text": "Failed",
+          "x": 850,
+          "y": 670,
+          "width": 100,
+          "height": 35
+        },
+        {
+          "text": "20 January 2026",
+          "x": 180,
+          "y": 715,
+          "width": 250,
+          "height": 35
+        },
+        {
+          "text": "Payment",
+          "x": 180,
+          "y": 820,
+          "width": 150,
+          "height": 40
+        },
+        {
+          "text": "-Rp18.500",
+          "x": 850,
+          "y": 820,
+          "width": 180,
+          "height": 40
+        },
+        {
+          "text": "Shopee Marketplace",
+          "x": 180,
+          "y": 870,
+          "width": 300,
+          "height": 35
+        },
+        {
+          "text": "20 January 2026",
+          "x": 180,
+          "y": 915,
+          "width": 250,
+          "height": 35
+        }
+      ]
+    },
+    "non_shopeepay_layout": {
+      "image_width": 1220,
+      "image_height": 2000,
+      "lines": [
+        {
+          "text": "Random Document Header",
+          "x": 50,
+          "y": 100,
+          "width": 300,
+          "height": 40
+        },
+        {
+          "text": "Some text content here",
+          "x": 50,
+          "y": 200,
+          "width": 400,
+          "height": 40
+        }
+      ]
+    },
+    "ambiguous_card_statement": {
+      "image_width": 1220,
+      "image_height": 2000,
+      "lines": [
+        {
+          "text": "< Transaction History",
+          "x": 50,
+          "y": 150,
+          "width": 400,
+          "height": 50
+        },
+        {
+          "text": "01 Nov 2025 - 30 Nov 2025",
+          "x": 60,
+          "y": 260,
+          "width": 350,
+          "height": 40
+        },
+        {
+          "text": "Top Up Payment Transfer",
+          "x": 50,
+          "y": 380,
+          "width": 500,
+          "height": 50
+        },
+        {
+          "text": "November 2025",
+          "x": 50,
+          "y": 500,
+          "width": 300,
+          "height": 50
+        },
+        {
+          "text": "Payment",
+          "x": 180,
+          "y": 620,
+          "width": 150,
+          "height": 40
+        },
+        {
+          "text": "-Rp50.000",
+          "x": 850,
+          "y": 620,
+          "width": 180,
+          "height": 40
+        },
+        {
+          "text": "Valid Merchant",
+          "x": 180,
+          "y": 670,
+          "width": 250,
+          "height": 35
+        },
+        {
+          "text": "10 November 2025",
+          "x": 180,
+          "y": 715,
+          "width": 250,
+          "height": 35
+        },
+        {
+          "text": "Payment Missing Date",
+          "x": 180,
+          "y": 900,
+          "width": 300,
+          "height": 40
+        },
+        {
+          "text": "-Rp99.000",
+          "x": 850,
+          "y": 900,
+          "width": 180,
+          "height": 40
+        }
+      ]
+    }
+  }
+}

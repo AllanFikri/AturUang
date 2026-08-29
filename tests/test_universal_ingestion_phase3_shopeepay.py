@@ -1,0 +1,503 @@
+"""Unit tests for Universal Ingestion Phase 3: ShopeePay Transaction History Image Adapter."""
+
+from __future__ import annotations
+
+import json
+import unittest
+from decimal import Decimal
+from hashlib import sha256
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import MagicMock
+
+from PIL import Image
+
+from aturuang.ingestion_adapter import (
+    AdapterDescriptor,
+    AdapterInput,
+    AdapterParseStatus,
+    CashMovementEvidence,
+    ConfidenceLevel,
+    DiagnosticSeverity,
+    EventDirection,
+    EventRole,
+    SourceEventStatus,
+)
+from aturuang.ingestion_contracts import PeriodStatus, SourceChannel, TemplateMatchStatus
+from aturuang.ingestion_discovery import (
+    ArtifactOccurrence,
+    DiscoveredArtifact,
+)
+from aturuang.ingestion_image_ocr import (
+    ImageOcrError,
+    ImageOcrLine,
+    ImageOcrResult,
+    _dedup_overlapping_lines,
+)
+from aturuang.ingestion_orchestration import (
+    AdapterCatalog,
+    ReadOnlyRegistryAuthority,
+    dry_run_artifact,
+)
+from aturuang.ingestion_preflight import (
+    SOURCE_TEMPLATE_SIGNATURES_V1,
+    PreflightQuality,
+    TemplateSignature,
+    preflight_bytes,
+    template_fingerprint,
+)
+from aturuang.ingestion_shopeepay_adapter import (
+    SHOPEEPAY_ADAPTER_ID,
+    SHOPEEPAY_MIN_OCR_WIDTH,
+    SHOPEEPAY_PARSER_VERSION,
+    SHOPEEPAY_SOURCE_REGISTRY_ID,
+    SHOPEEPAY_TEMPLATE_ID,
+    ShopeePayTransactionHistoryImageAdapter,
+)
+
+FIXTURE_PATH = (
+    Path(__file__).resolve().parent
+    / "fixtures"
+    / "ingestion"
+    / "shopeepay_transaction_history_image_v1.json"
+)
+
+
+def _make_synthetic_image(width: int = 1220, height: int = 2000, format: str = "JPEG") -> bytes:
+    img = Image.new("RGB", (width, height), color=(34, 34, 34))
+    buf = BytesIO()
+    img.save(buf, format=format)
+    return buf.getvalue()
+
+
+class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
+    """30 focused unittest methods for ShopeePay Image Ingestion."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.fixtures = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))["cases"]
+
+    def _get_mock_ocr(self, case_name: str) -> ImageOcrResult:
+        case = self.fixtures[case_name]
+        lines = tuple(
+            ImageOcrLine(
+                text=l["text"],
+                x=l.get("x", 50),
+                y=l.get("y", 100),
+                width=l.get("width", 200),
+                height=l.get("height", 30),
+            )
+            for l in case["lines"]
+        )
+        return ImageOcrResult(
+            lines=lines,
+            image_width=case.get("image_width", 1220),
+            image_height=case.get("image_height", 2000),
+        )
+
+    def _make_adapter_input(self, payload: bytes) -> AdapterInput:
+        sig = next(
+            s for s in SOURCE_TEMPLATE_SIGNATURES_V1
+            if s.source_registry_id == SHOPEEPAY_SOURCE_REGISTRY_ID and s.media_type == "IMAGE"
+        )
+        return AdapterInput(
+            source_document_id="test-shopeepay-doc-1",
+            content_sha256=sha256(payload).hexdigest() if payload else "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            source_registry_id=SHOPEEPAY_SOURCE_REGISTRY_ID,
+            template_id=SHOPEEPAY_TEMPLATE_ID,
+            parser_version=SHOPEEPAY_PARSER_VERSION,
+            source_channel=SourceChannel.IMAGE,
+            template_match_status=TemplateMatchStatus.KNOWN,
+            period_status=PeriodStatus.UNKNOWN,
+            template_fingerprint=template_fingerprint(sig),
+            binary_payload=payload,
+        )
+
+    # 1. Metadata and constants
+    def test_01_adapter_metadata_and_descriptor(self) -> None:
+        adapter = ShopeePayTransactionHistoryImageAdapter()
+        desc = adapter.descriptor
+        self.assertEqual(desc.source_registry_id, "shopeepay_mutation")
+        self.assertEqual(desc.template_id, "shopeepay_transaction_history_image_v1")
+        self.assertEqual(desc.adapter_id, "shopeepay-transaction-history-image-v1")
+        self.assertEqual(desc.parser_version, "parser-v1")
+        self.assertEqual(SHOPEEPAY_MIN_OCR_WIDTH, 720)
+
+    # 2. Template signature & fingerprint
+    def test_02_template_signature_and_fingerprint(self) -> None:
+        shopee_sigs = [
+            s for s in SOURCE_TEMPLATE_SIGNATURES_V1
+            if s.source_registry_id == SHOPEEPAY_SOURCE_REGISTRY_ID
+        ]
+        self.assertEqual(len(shopee_sigs), 1)
+        sig = shopee_sigs[0]
+        self.assertEqual(sig.media_type, "IMAGE")
+        self.assertEqual(sig.template_id, "shopeepay_transaction_history_image_v1")
+        fp = template_fingerprint(sig)
+        self.assertTrue(isinstance(fp, str) and len(fp) == 64)
+
+    # 3. Orchestration forwards source_hint
+    def test_03_orchestration_forwards_source_hint(self) -> None:
+        mock_preflight = MagicMock()
+        img_bytes = _make_synthetic_image(1220, 2000)
+        h = sha256(img_bytes).hexdigest()
+        art = DiscoveredArtifact(
+            content_sha256=h,
+            size_bytes=len(img_bytes),
+            extension=".jpg",
+            occurrences=(
+                ArtifactOccurrence(
+                    source_locator="test.jpg",
+                    extension=".jpg",
+                ),
+            ),
+        )
+
+        mock_preflight.return_value = preflight_bytes(
+            img_bytes,
+            extension=".jpg",
+            source_hint="shopeepay_mutation",
+        )
+
+        dry_run_artifact(
+            root="dummy",
+            artifact=art,
+            registry=MagicMock(),
+            adapter_catalog=AdapterCatalog(()),
+            claimed_source_registry_id="shopeepay_mutation",
+            payload_reader=lambda r, a, policy=None: img_bytes,
+            preflight_func=mock_preflight,
+        )
+
+        mock_preflight.assert_called_once_with(
+            img_bytes,
+            extension=".jpg",
+            source_hint="shopeepay_mutation",
+        )
+
+    # 4. Unclaimed generic image unrouted
+    def test_04_unclaimed_generic_image_unrouted(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 2000)
+        pf = preflight_bytes(img_bytes, extension=".jpg", source_hint=None)
+        self.assertEqual(pf.template_detection.status, TemplateMatchStatus.UNKNOWN_TEMPLATE)
+        self.assertEqual(pf.template_detection.reason_code, "VISUAL_TEMPLATE_REQUIRES_IMAGE_ADAPTER")
+
+    # 5. Source hint cannot bypass layout verification
+    def test_05_source_hint_cannot_bypass_layout_verification(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 2000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("non_shopeepay_layout")
+        )
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertEqual(len(res.events), 0)
+        self.assertTrue(any(d.code == "SHOPEEPAY_TEMPLATE_CONTENT_UNCONFIRMED" for d in res.diagnostics))
+
+    # 6. Corrupt or truncated image fails closed
+    def test_06_corrupt_or_truncated_image_fails_closed(self) -> None:
+        adapter = ShopeePayTransactionHistoryImageAdapter()
+        with self.subTest("empty payload"):
+            inp = self._make_adapter_input(b"")
+            res = adapter.parse(inp)
+            self.assertEqual(res.parse_status, AdapterParseStatus.FAILED)
+        with self.subTest("corrupt header"):
+            inp = self._make_adapter_input(b"not-an-image-data-payload")
+            res = adapter.parse(inp)
+            self.assertEqual(res.parse_status, AdapterParseStatus.FAILED)
+
+    # 7. Provider resolution gate: < 720 px rejected
+    def test_07_provider_resolution_gate_low_res_rejected(self) -> None:
+        extractor_mock = MagicMock()
+        adapter = ShopeePayTransactionHistoryImageAdapter(ocr_extractor=extractor_mock)
+        for w in [118, 145, 209, 274, 305, 719]:
+            with self.subTest(width=w):
+                extractor_mock.reset_mock()
+                img_bytes = _make_synthetic_image(width=w, height=1280)
+                inp = self._make_adapter_input(img_bytes)
+                res = adapter.parse(inp)
+                self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+                self.assertEqual(res.period_status, PeriodStatus.UNKNOWN)
+                self.assertEqual(len(res.events), 0)
+                self.assertIsNone(res.natural_document_key_candidate)
+                self.assertTrue(any(d.code == "SHOPEEPAY_IMAGE_RESOLUTION_INSUFFICIENT" for d in res.diagnostics))
+                extractor_mock.assert_not_called()
+
+    # 8. Provider resolution gate: >= 720 px accepted
+    def test_08_provider_resolution_gate_high_res_accepted(self) -> None:
+        extractor_mock = MagicMock(return_value=self._get_mock_ocr("valid_high_res_november"))
+        adapter = ShopeePayTransactionHistoryImageAdapter(ocr_extractor=extractor_mock)
+        for w in [720, 1080, 1220]:
+            with self.subTest(width=w):
+                extractor_mock.reset_mock()
+                img_bytes = _make_synthetic_image(width=w, height=2000)
+                inp = self._make_adapter_input(img_bytes)
+                res = adapter.parse(inp)
+                self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+                extractor_mock.assert_called_once()
+
+    # 9. Preflight period status unknown
+    def test_09_preflight_period_status_unknown(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 2000)
+        pf = preflight_bytes(img_bytes, extension=".jpg", source_hint="shopeepay_mutation")
+        self.assertEqual(pf.period_status, PeriodStatus.UNKNOWN)
+        self.assertEqual(pf.template_detection.status, TemplateMatchStatus.KNOWN)
+        self.assertEqual(pf.quality_status, PreflightQuality.READY)
+
+    # 10. Adapter period authority: CLOSED
+    def test_10_adapter_period_authority_closed(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        self.assertEqual(res.period_status, PeriodStatus.CLOSED)
+        self.assertEqual(res.period_start, "2025-11-01")
+        self.assertEqual(res.period_end, "2025-11-30")
+
+    # 11. Adapter period authority: OPEN
+    def test_11_adapter_period_authority_open(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 2000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_partial_august")
+        )
+        res = adapter.parse(inp)
+        self.assertEqual(res.period_status, PeriodStatus.OPEN)
+        self.assertEqual(res.period_start, "2026-08-01")
+        self.assertEqual(res.period_end, "2026-08-21")
+
+    # 12. Valid high-res JPEG extraction
+    def test_12_valid_high_res_jpeg_extraction(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000, format="JPEG")
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        self.assertEqual(len(res.events), 3)
+
+    # 13. Valid PNG media extraction
+    def test_13_valid_png_media_extraction(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 2000, format="PNG")
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_partial_august")
+        )
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        self.assertEqual(len(res.events), 1)
+
+    # 14. Tall image vertical slicing geometry
+    def test_14_tall_image_vertical_slicing_geometry(self) -> None:
+        slice_height = 2000
+        slice_overlap = 200
+        total_height = 12723
+        slices = []
+        y_start = 0
+        step = slice_height - slice_overlap
+        while y_start < total_height:
+            y_end = min(y_start + slice_height, total_height)
+            slices.append((y_start, y_end))
+            if y_end >= total_height:
+                break
+            y_start += step
+
+        self.assertTrue(len(slices) >= 7)
+        self.assertEqual(slices[0], (0, 2000))
+        self.assertEqual(slices[-1][1], 12723)
+        for i in range(1, len(slices)):
+            self.assertTrue(slices[i][0] > slices[i - 1][0])
+
+    # 15. Spatial slice overlap deduplication
+    def test_15_spatial_slice_overlap_deduplication(self) -> None:
+        lines = [
+            ImageOcrLine(text="Payment", x=180, y=1850, width=150, height=40),
+            ImageOcrLine(text="-Rp100.000", x=850, y=1850, width=200, height=40),
+            ImageOcrLine(text="Payment", x=180, y=1852, width=150, height=40),
+            ImageOcrLine(text="-Rp100.000", x=850, y=1852, width=200, height=40),
+        ]
+        deduped = _dedup_overlapping_lines(lines, spatial_threshold_y=15)
+        self.assertEqual(len(deduped), 2)
+
+    # 16. Identical date & amount at different Y preserved
+    def test_16_identical_date_amount_different_y_preserved(self) -> None:
+        lines = [
+            ImageOcrLine(text="Payment", x=180, y=500, width=150, height=40),
+            ImageOcrLine(text="-Rp100.000", x=850, y=500, width=200, height=40),
+            ImageOcrLine(text="Payment", x=180, y=1500, width=150, height=40),
+            ImageOcrLine(text="-Rp100.000", x=850, y=1500, width=200, height=40),
+        ]
+        deduped = _dedup_overlapping_lines(lines, spatial_threshold_y=15)
+        self.assertEqual(len(deduped), 4)
+
+    # 17. OCR transport error fails closed
+    def test_17_ocr_transport_error_fails_closed(self) -> None:
+        def failing_ocr(b: bytes) -> ImageOcrResult:
+            raise ImageOcrError("OCR_TIMEOUT", "Timeout occurred")
+
+        adapter = ShopeePayTransactionHistoryImageAdapter(ocr_extractor=failing_ocr)
+        img_bytes = _make_synthetic_image(1220, 2000)
+        inp = self._make_adapter_input(img_bytes)
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.FAILED)
+        self.assertEqual(len(res.events), 0)
+        self.assertTrue(any(d.code == "SHOPEEPAY_OCR_EXECUTION_FAILED" for d in res.diagnostics))
+
+    # 18. Date-only occurred_at preservation
+    def test_18_date_only_occurred_at_preservation(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        for ev in res.events:
+            payload: CashMovementEvidence = ev.payload
+            self.assertEqual(payload.occurred_at, "2025-11-25")
+            self.assertNotIn("00:00", payload.occurred_at)
+
+    # 19. Positive amount inflow mapping
+    def test_19_positive_amount_inflow_mapping(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        inflows = [ev.payload for ev in res.events if ev.payload.direction == EventDirection.INFLOW]
+        self.assertTrue(len(inflows) >= 2)
+        self.assertTrue(any(i.amount == Decimal("100") for i in inflows))
+        self.assertTrue(any(i.amount == Decimal("99000") for i in inflows))
+
+    # 20. Negative amount outflow mapping
+    def test_20_negative_amount_outflow_mapping(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        outflows = [ev.payload for ev in res.events if ev.payload.direction == EventDirection.OUTFLOW]
+        self.assertEqual(len(outflows), 1)
+        self.assertEqual(outflows[0].amount, Decimal("100000"))
+
+    # 21. Decimal amount precision
+    def test_21_decimal_amount_precision(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        for ev in res.events:
+            self.assertTrue(isinstance(ev.payload.amount, Decimal))
+
+    # 22. Multiline description normalization
+    def test_22_multiline_description_normalization(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        descs = [ev.payload.description_raw for ev in res.events]
+        self.assertIn("From ShopeePay", descs)
+        self.assertIn("From Bank Transfer", descs)
+
+    # 23. Explicit failed badge omitted from cash movement
+    def test_23_explicit_failed_badge_omitted_from_cash_movement(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 2500)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("with_failed_transaction")
+        )
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        self.assertEqual(len(res.events), 1)
+        self.assertTrue(any(d.code == "SHOPEEPAY_FAILED_TRANSACTIONS_EXCLUDED" for d in res.diagnostics))
+
+    # 24. Normal transaction status unknown
+    def test_24_normal_transaction_status_unknown(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        for ev in res.events:
+            self.assertEqual(ev.payload.status, SourceEventStatus.UNKNOWN)
+
+    # 25. Zero non-cash envelopes emitted
+    def test_25_zero_non_cash_envelopes_emitted(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        roles = [ev.event_role for ev in res.events]
+        self.assertTrue(all(r == EventRole.CASH_MOVEMENT for r in roles))
+        self.assertNotIn(EventRole.ACCOUNT_OBSERVATION, roles)
+        self.assertNotIn(EventRole.SOURCE_SUMMARY, roles)
+        self.assertNotIn(EventRole.BALANCE_SNAPSHOT, roles)
+        self.assertNotIn(EventRole.ACCOUNT_PERIOD_SUMMARY, roles)
+        self.assertNotIn(EventRole.INVESTMENT_TRADE, roles)
+
+    # 26. Zero provider transaction ID emitted
+    def test_26_zero_provider_transaction_id_emitted(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        for ev in res.events:
+            self.assertIsNone(ev.payload.provider_transaction_id_raw)
+
+    # 27. No semantic category derivation
+    def test_27_no_semantic_category_derivation(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        for ev in res.events:
+            self.assertIsNone(ev.payload.provider_category_raw)
+            self.assertIsNone(ev.payload.event_hint)
+
+    # 28. Financial card ambiguity triggers review & omits ambiguous card
+    def test_28_financial_card_ambiguity_triggers_review(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 2000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("ambiguous_card_statement")
+        )
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertEqual(len(res.events), 1)
+        self.assertTrue(any(d.code == "SHOPEEPAY_CARD_AMBIGUOUS" for d in res.diagnostics))
+
+    # 29. Natural document key unidentified wallet
+    def test_29_natural_document_key_unidentified_wallet(self) -> None:
+        img_bytes = _make_synthetic_image(1220, 4000)
+        inp = self._make_adapter_input(img_bytes)
+        adapter = ShopeePayTransactionHistoryImageAdapter(
+            ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
+        )
+        res = adapter.parse(inp)
+        self.assertEqual(res.natural_document_key_candidate, "shopeepay_mutation:unidentified_wallet:2025-11")
+
+    # 30. Diagnostics and repr privacy safety
+    def test_30_diagnostics_and_repr_privacy_safety(self) -> None:
+        line = ImageOcrLine(text="Sensitive Text", x=0, y=0, width=10, height=10)
+        self.assertNotIn("Sensitive Text", repr(line))
+        res = ImageOcrResult(lines=(line,), image_width=100, image_height=100)
+        self.assertNotIn("Sensitive Text", repr(res))
+
+
+if __name__ == "__main__":
+    unittest.main()

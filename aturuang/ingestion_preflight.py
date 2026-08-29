@@ -657,7 +657,7 @@ def _image_preflight(
                     source_registry_id=shopee_sig.source_registry_id,
                     template_id=shopee_sig.template_id,
                     template_fingerprint=template_fingerprint(shopee_sig),
-                    method=DetectionMethod.SOURCE_HINT,
+                    method=DetectionMethod.NONE,
                     required_marker_matches=0,
                     required_marker_total=len(shopee_sig.required_markers),
                     reason_code="SOURCE_HINT_IMAGE_ROUTING",
