@@ -599,3 +599,95 @@ The phase is internally split into:
 - 2C-C3 semantic document identity and final dry-run result
 
 Phase 3 remains locked until the complete Phase 2 gate passes.
+
+---
+
+# Phase 2 Completion and Phase 3 BCA Entry
+
+## Phase 2C-C1 — Safe Artifact Payload Replay
+
+### Commit
+`f106f13 feat(ingestion): add safe artifact payload replay`
+
+### Result
+- discovered artifact bytes can be replayed without extracting archive content to disk
+- payload SHA and size are revalidated
+- archive lineage and symlink boundaries fail closed
+- targeted Universal Ingestion suite remained green
+- production SQLite remained byte-identical
+
+## Phase 2C-C2 — Read-Only Dry-Run Orchestration
+
+### Commit
+`394c16c feat(ingestion): add read-only dry-run orchestration`
+
+### Result
+- content evidence is separated from source claims
+- registry authority is read-only
+- exact adapter catalog selection is enforced
+- exact SHA duplicate short-circuits before parsing
+- no dry-run registry/ledger writes
+- production SQLite remained byte-identical
+
+## Phase 2C-C3 — Semantic Document Identity
+
+### Commit
+`e20b735 feat(ingestion): add semantic dry-run identity`
+
+### Result
+- semantic-document-v1 canonicalization
+- same-source natural-key semantic duplicate classification
+- revision/conflict and ambiguity classification
+- deterministic batch result and safe serialization
+- internal adapter execution failures are batch-fatal
+- semantic duplicates map to SKIPPED_DUPLICATE
+- 211 targeted Universal Ingestion tests PASS
+- brownfield quick regression PASS
+- production SQLite byte-identical
+
+## Full Phase 2 Completion Gate
+
+### Result
+PASS.
+
+Verified:
+- Phase 2A discovery foundation
+- Phase 2B source/template preflight
+- Phase 2C-A boundary hardening
+- Phase 2C-B adapter contracts
+- Phase 2C-C1 payload replay
+- Phase 2C-C2 read-only dry-run orchestration
+- Phase 2C-C3 semantic document identity
+- exact and semantic duplicate foundation
+- unknown/ambiguous inputs fail closed
+- private provenance boundary
+- no ledger mutation, OCR, or network authority
+- 211 targeted Universal Ingestion tests PASS
+- brownfield quick regression PASS
+- production SQLite byte-identical
+
+Phase 2 is complete.
+
+## Phase 3 BCA Adapter Readiness
+
+Readiness/design gate PASS.
+
+Frozen facts:
+- BCA is the first provider adapter
+- 19 audited private BCA PDFs
+- 2025-01 through 2026-07
+- 4 through 23 pages
+- text layer available
+- encrypted-readable
+- exact template authority already exists
+- existing universal evidence contracts can represent BCA without schema changes
+- legacy BCAEmailParser remains a separate EMAIL evidence path
+- initial provider implementation is restricted to three new files
+- 30 committed BCA tests are mandatory
+- full private 19-PDF replay is mandatory before provider checkpoint push
+
+Forward design is recorded in:
+
+`docs/ingestion/PHASE3_BCA_FORWARD_DESIGN_GATE_2026-08-29.md`
+
+Phase 3 BCA implementation remains locked until the forward-design document passes independent review.
