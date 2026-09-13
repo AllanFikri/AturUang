@@ -677,24 +677,21 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
             ImageOcrLine(text="01 Nov 2025 - 30 Nov 2025", x=50, y=150, width=300, height=30),
             ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
             ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
-            # Valid trusted card at y=400-500
+            # 1. Trusted signed card before ambiguous card (y=400)
             ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
             ImageOcrLine(text="-Rp25.000", x=800, y=400, width=150, height=30),
-            ImageOcrLine(text="Trusted Merchant", x=50, y=450, width=200, height=30),
+            ImageOcrLine(text="Trusted Merchant One", x=50, y=450, width=200, height=30),
             ImageOcrLine(text="20 November 2025", x=50, y=500, width=200, height=30),
+            # 2. Trusted signed card after ambiguous card (y=1000)
+            ImageOcrLine(text="Payment", x=50, y=1000, width=100, height=30),
+            ImageOcrLine(text="-Rp35.000", x=800, y=1000, width=150, height=30),
+            ImageOcrLine(text="Trusted Merchant Two", x=50, y=1050, width=200, height=30),
+            ImageOcrLine(text="21 November 2025", x=50, y=1100, width=200, height=30),
         )
 
-        test_cases = [
+        ambiguous_cases = [
             (
-                "missing transaction date",
-                (
-                    ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
-                    ImageOcrLine(text="-Rp15.000", x=800, y=700, width=150, height=30),
-                    ImageOcrLine(text="Item Without Date", x=50, y=750, width=200, height=30),
-                ),
-            ),
-            (
-                "unsigned Rp amount",
+                "unsigned valid Rp amount",
                 (
                     ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
                     ImageOcrLine(text="Rp50.000", x=800, y=700, width=150, height=30),
@@ -703,7 +700,25 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
                 ),
             ),
             (
-                "malformed amount",
+                "unsigned malformed Rp amount",
+                (
+                    ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                    ImageOcrLine(text="Rp50.00X", x=800, y=700, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=750, width=200, height=30),
+                    ImageOcrLine(text="15 November 2025", x=50, y=800, width=200, height=30),
+                ),
+            ),
+            (
+                "unsigned over-precision Rp amount",
+                (
+                    ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                    ImageOcrLine(text="Rp50.000,123", x=800, y=700, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=750, width=200, height=30),
+                    ImageOcrLine(text="15 November 2025", x=50, y=800, width=200, height=30),
+                ),
+            ),
+            (
+                "signed malformed amount",
                 (
                     ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
                     ImageOcrLine(text="-RpABC", x=800, y=700, width=150, height=30),
@@ -712,7 +727,7 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
                 ),
             ),
             (
-                "over-precision amount",
+                "signed over-precision amount",
                 (
                     ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
                     ImageOcrLine(text="-Rp50.000,123", x=800, y=700, width=150, height=30),
@@ -720,12 +735,20 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
                     ImageOcrLine(text="15 November 2025", x=50, y=800, width=200, height=30),
                 ),
             ),
+            (
+                "missing transaction date",
+                (
+                    ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                    ImageOcrLine(text="-Rp15.000", x=800, y=700, width=150, height=30),
+                    ImageOcrLine(text="Item Without Date", x=50, y=750, width=200, height=30),
+                ),
+            ),
         ]
 
         img_bytes = _make_synthetic_image(1220, 2500)
         inp = self._make_adapter_input(img_bytes)
 
-        for case_name, ambiguous_lines in test_cases:
+        for case_name, ambiguous_lines in ambiguous_cases:
             with self.subTest(case=case_name):
                 combined_ocr = ImageOcrResult(
                     lines=base_header_lines + ambiguous_lines,
@@ -738,16 +761,50 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
                 res = adapter.parse(inp)
                 # 1. parse_status becomes REVIEW_REQUIRED
                 self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
-                # 2. ambiguous candidate emits 0 CASH_MOVEMENT (only the 1 trusted card emits)
-                self.assertEqual(len(res.events), 1)
+                # 2. ambiguous candidate emits 0 CASH_MOVEMENT (only the 2 trusted cards emit)
+                self.assertEqual(len(res.events), 2)
                 self.assertEqual(res.events[0].payload.amount, Decimal("25000.00"))
                 self.assertEqual(res.events[0].payload.direction, EventDirection.OUTFLOW)
-                # 3. no direction is fabricated for the ambiguous candidate (only trusted card exists)
+                self.assertEqual(res.events[1].payload.amount, Decimal("35000.00"))
+                self.assertEqual(res.events[1].payload.direction, EventDirection.OUTFLOW)
+                # 3. Returned trusted events remain ordered by source_y
+                raw_locators = [ev.provenance.raw_locator for ev in res.events]
+                self.assertEqual(raw_locators, ["image:y:400", "image:y:1000"])
+                # 4. Emitted row_index values preserve the omitted physical position (1 and 3)
+                row_indices = [ev.provenance.row_index for ev in res.events]
+                self.assertEqual(row_indices, [1, 3])
+                # 5. No direction is fabricated for the ambiguous candidate
                 for ev in res.events:
-                    self.assertNotEqual(ev.payload.amount, Decimal("15000.00"))
                     self.assertNotEqual(ev.payload.amount, Decimal("50000.00"))
-                # 4. diagnostic includes SHOPEEPAY_CARD_AMBIGUOUS
+                    self.assertNotEqual(ev.payload.amount, Decimal("15000.00"))
+                # 6. Diagnostic includes SHOPEEPAY_CARD_AMBIGUOUS
                 self.assertTrue(any(d.code == "SHOPEEPAY_CARD_AMBIGUOUS" for d in res.diagnostics))
+
+        # Test arbitrary prose containing Rp does not create an unsigned card
+        with self.subTest(case="arbitrary prose containing Rp does not create unsigned card"):
+            prose_lines = (
+                ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                ImageOcrLine(text="-Rp15.000", x=800, y=700, width=150, height=30),
+                ImageOcrLine(text="Beli barang Rp50.000", x=50, y=750, width=200, height=30),
+                ImageOcrLine(text="15 November 2025", x=50, y=800, width=200, height=30),
+            )
+            combined_ocr = ImageOcrResult(
+                lines=base_header_lines + prose_lines,
+                image_width=1220,
+                image_height=2500,
+            )
+            adapter = ShopeePayTransactionHistoryImageAdapter(
+                ocr_extractor=lambda b, ocr=combined_ocr: ocr
+            )
+            res = adapter.parse(inp)
+            self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+            self.assertEqual(len(res.events), 3)
+            self.assertEqual([ev.provenance.row_index for ev in res.events], [1, 2, 3])
+            self.assertEqual(
+                [ev.provenance.raw_locator for ev in res.events],
+                ["image:y:400", "image:y:700", "image:y:1000"],
+            )
+            self.assertFalse(any(d.code == "SHOPEEPAY_CARD_AMBIGUOUS" for d in res.diagnostics))
 
     # 29. Natural document key unidentified wallet
     def test_29_natural_document_key_unidentified_wallet(self) -> None:

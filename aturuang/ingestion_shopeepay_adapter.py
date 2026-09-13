@@ -95,7 +95,7 @@ _AMOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _UNSIGNED_AMOUNT_LINE_RE = re.compile(
-    r"^\s*(?:Rp|RP|rp|RPI|rpi|RP1|rp1)\s*([0-9IOol|.\s]+(?:,[0-9IOol]{2})?)\s*$",
+    r"^\s*(?:Rp|RP|rp|RPI|rpi|RP1|rp1)\s*([0-9IOol|][^\n\r]*?)\s*$",
     re.IGNORECASE,
 )
 _DATE_RE = re.compile(
@@ -639,6 +639,9 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
             u_line = sorted_lines[u_idx]
             if any(abs(u_line.y - sorted_lines[a_idx].y) < 40 for a_idx in amount_indices):
                 continue
+            match = _UNSIGNED_AMOUNT_LINE_RE.match(u_line.text)
+            raw_amt_str = match.group(1) if match else u_line.text
+            parsed_amt = _parse_idr_amount(raw_amt_str)
             cards.append(
                 _ParsedCard(
                     y=u_line.y,
@@ -647,11 +650,12 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
                     date_str="",
                     direction=None,
                     direction_raw=None,
-                    amount=Decimal("0.00"),
+                    amount=parsed_amt if parsed_amt is not None else Decimal("0.00"),
                     is_failed=False,
                     is_ambiguous=True,
-                    ambiguity_reason="UNSIGNED_AMOUNT",
+                    ambiguity_reason="UNSIGNED_AMOUNT" if parsed_amt is not None else "INVALID_UNSIGNED_AMOUNT",
                 )
             )
 
+        cards.sort(key=lambda c: c.y)
         return cards
