@@ -1382,5 +1382,162 @@ Nota Pesanan
         self.assertFalse(hasattr(ev, "payer_responsibility"))
 
 
+
+    # 55. Rincian Pesanan with zero parsed products requires review
+    def test_55_zero_parsed_products_requires_review(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH055
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "UNPARSED_ORDER_ITEM" for d in res.diagnostics))
+
+    # 56. Incomplete numbered product row requires review
+    def test_56_incomplete_numbered_row_requires_review(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH056
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp100.000
+Subtotal Pesanan: Rp100.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Pertama Lengkap
+Rp50.000
+1
+Rp50.000
+2
+Barang Kedua Tidak Lengkap
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "UNPARSED_ORDER_ITEM" for d in res.diagnostics))
+        # Safely parsed item 1 must be preserved
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 1)
+        self.assertEqual(ev.line_items[0].product_name_raw, "Barang Pertama Lengkap")
+
+    # 57. Product price/quantity/subtotal mismatch requires review
+    def test_57_item_arithmetic_mismatch_requires_review(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH057
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Aritmatika Salah
+Rp10.000
+2
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "UNPARSED_ORDER_ITEM" for d in res.diagnostics))
+        # Item must not be silently discarded
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 1)
+        self.assertEqual(ev.line_items[0].product_name_raw, "Barang Aritmatika Salah")
+
+    # 58. Malformed priced payment component requires review
+    def test_58_malformed_priced_component_requires_review(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH058
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Biaya Layanan: RpINVALID
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "MALFORMED_AMOUNT_COMPONENT" for d in res.diagnostics))
+
+    # 59. Valid orders still complete normally
+    def test_59_valid_order_completes_normally(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH059
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp65.000
+Subtotal Pesanan: Rp50.000
+Subtotal Pengiriman: Rp12.000
+Biaya Layanan: Rp3.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Normal
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        self.assertEqual(res.order_reconciliation_status, "MATCHED")
+        self.assertEqual(len(res.events), 1)
+        self.assertFalse(any(d.severity == DiagnosticSeverity.ERROR or d.review_required for d in res.diagnostics))
+
+    # 60. Duplicate replay still produces identical document, event, and line keys
+    def test_60_duplicate_replay_identical_keys(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH060
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Replay
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp1 = self._make_adapter_input(payload=make_multipage_pdf([text]), source_document_id="doc_a.pdf")
+        inp2 = self._make_adapter_input(payload=make_multipage_pdf([text]), source_document_id="doc_b.pdf")
+        res1 = adapter.parse(inp1)
+        res2 = adapter.parse(inp2)
+
+        self.assertEqual(res1.natural_document_key_candidate, res2.natural_document_key_candidate)
+        self.assertEqual(res1.events[0].row_fingerprint, res2.events[0].row_fingerprint)
+        self.assertEqual(
+            res1.events[0].payload.line_items[0].line_key,
+            res2.events[0].payload.line_items[0].line_key,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

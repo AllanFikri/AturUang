@@ -501,85 +501,128 @@ def extract_order_line_items(
                         p_amt = parse_id_amount(clean_lines[k])
                         q_amt = Decimal(clean_lines[k + 1])
                         s_amt = parse_id_amount(clean_lines[k + 2])
-                        if p_amt * q_amt == s_amt:
-                            mid = clean_lines[i:k]
-                            prod_parts: list[str] = []
-                            var_parts: list[str] = []
 
-                            # Separate using coordinates when present
-                            if all_pel:
-                                for ml in mid:
-                                    # check if this line has variation prefix or tab
-                                    if "\t" in ml:
-                                        p_s, v_s = ml.split("\t", 1)
-                                        prod_parts.append(p_s.strip())
-                                        var_parts.append(v_s.strip())
-                                    elif ml.lower().startswith("variasi:"):
-                                        var_parts.append(ml[len("variasi:"):].strip())
-                                    else:
-                                        xs = [el[1] for el in all_pel if el[2] == ml]
-                                        if xs:
-                                            x_val = xs[0]
-                                            if 600 <= x_val < 750:
-                                                var_parts.append(ml)
-                                            else:
-                                                prod_parts.append(ml)
-                                        else:
-                                            prod_parts.append(ml)
-                            else:
-                                # Fallback when no coordinates (e.g. synthetic fixtures)
-                                for ml in mid:
-                                    if "\t" in ml:
-                                        p_s, v_s = ml.split("\t", 1)
-                                        prod_parts.append(p_s.strip())
-                                        var_parts.append(v_s.strip())
-                                    elif ml.lower().startswith("variasi:"):
-                                        var_parts.append(ml[len("variasi:"):].strip())
-                                    else:
-                                        prod_parts.append(ml)
-
-                            p_name = " ".join(prod_parts).strip()
-                            v_name = " ".join(var_parts).strip() if var_parts else None
-
-                            if not p_name:
-                                p_name = f"Item {ord_val}"
-
-                            # Stable line key calculation
-                            norm_p = " ".join(p_name.strip().lower().split())
-                            norm_v = " ".join(v_name.strip().lower().split()) if v_name else ""
-                            sig_tuple = (norm_p, norm_v, str(q_amt), str(s_amt))
-                            occurrence_tracker[sig_tuple] = occurrence_tracker.get(sig_tuple, 0) + 1
-                            occ_idx = occurrence_tracker[sig_tuple]
-
-                            line_key = build_stable_line_key(
-                                order_token=order_token,
-                                product_name_raw=p_name,
-                                variation_raw=v_name,
-                                quantity=q_amt,
-                                line_subtotal=s_amt,
-                                occurrence_index=occ_idx,
-                            )
-
-                            items.append(
-                                CommerceLineItemEvidence(
-                                    line_key=line_key,
-                                    product_name_raw=p_name,
-                                    quantity=q_amt,
-                                    line_subtotal=s_amt,
-                                    currency="IDR",
-                                    variation_raw=v_name,
+                        # Arithmetic verification
+                        if p_amt * q_amt != s_amt:
+                            review_required = True
+                            if not review_reason:
+                                review_reason = "UNPARSED_ORDER_ITEM"
+                            diagnostics.append(
+                                SafeDiagnostic(
+                                    code="UNPARSED_ORDER_ITEM",
+                                    severity=DiagnosticSeverity.WARNING,
+                                    message="Item subtotal does not match unit price multiplied by quantity.",
                                 )
                             )
-                            i = k + 3
-                            found = True
-                            break
+
+                        mid = clean_lines[i:k]
+                        prod_parts: list[str] = []
+                        var_parts: list[str] = []
+
+                        # Separate using coordinates when present
+                        if all_pel:
+                            for ml in mid:
+                                if "\t" in ml:
+                                    p_s, v_s = ml.split("\t", 1)
+                                    prod_parts.append(p_s.strip())
+                                    var_parts.append(v_s.strip())
+                                elif ml.lower().startswith("variasi:"):
+                                    var_parts.append(ml[len("variasi:"):].strip())
+                                else:
+                                    xs = [el[1] for el in all_pel if el[2] == ml]
+                                    if xs:
+                                        x_val = xs[0]
+                                        if 600 <= x_val < 750:
+                                            var_parts.append(ml)
+                                        else:
+                                            prod_parts.append(ml)
+                                    else:
+                                        prod_parts.append(ml)
+                        else:
+                            # Fallback when no coordinates (e.g. synthetic fixtures)
+                            for ml in mid:
+                                if "\t" in ml:
+                                    p_s, v_s = ml.split("\t", 1)
+                                    prod_parts.append(p_s.strip())
+                                    var_parts.append(v_s.strip())
+                                elif ml.lower().startswith("variasi:"):
+                                    var_parts.append(ml[len("variasi:"):].strip())
+                                else:
+                                    prod_parts.append(ml)
+
+                        p_name = " ".join(prod_parts).strip()
+                        v_name = " ".join(var_parts).strip() if var_parts else None
+
+                        if not p_name:
+                            p_name = f"Item {ord_val}"
+
+                        # Stable line key calculation
+                        norm_p = " ".join(p_name.strip().lower().split())
+                        norm_v = " ".join(v_name.strip().lower().split()) if v_name else ""
+                        sig_tuple = (norm_p, norm_v, str(q_amt), str(s_amt))
+                        occurrence_tracker[sig_tuple] = occurrence_tracker.get(sig_tuple, 0) + 1
+                        occ_idx = occurrence_tracker[sig_tuple]
+
+                        line_key = build_stable_line_key(
+                            order_token=order_token,
+                            product_name_raw=p_name,
+                            variation_raw=v_name,
+                            quantity=q_amt,
+                            line_subtotal=s_amt,
+                            occurrence_index=occ_idx,
+                        )
+
+                        items.append(
+                            CommerceLineItemEvidence(
+                                line_key=line_key,
+                                product_name_raw=p_name,
+                                quantity=q_amt,
+                                line_subtotal=s_amt,
+                                currency="IDR",
+                                variation_raw=v_name,
+                            )
+                        )
+                        i = k + 3
+                        found = True
+                        break
                     except Exception:
-                        pass
+                        review_required = True
+                        if not review_reason:
+                            review_reason = "UNPARSED_ORDER_ITEM"
+                        diagnostics.append(
+                            SafeDiagnostic(
+                                code="UNPARSED_ORDER_ITEM",
+                                severity=DiagnosticSeverity.WARNING,
+                                message="Failed to parse item price or quantity.",
+                            )
+                        )
                 k += 1
             if not found:
+                review_required = True
+                if not review_reason:
+                    review_reason = "UNPARSED_ORDER_ITEM"
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="UNPARSED_ORDER_ITEM",
+                        severity=DiagnosticSeverity.WARNING,
+                        message="Numbered order item row could not be parsed safely.",
+                    )
+                )
                 i += 1
         else:
             i += 1
+
+    if not items:
+        review_required = True
+        if not review_reason:
+            review_reason = "UNPARSED_ORDER_ITEM"
+        diagnostics.append(
+            SafeDiagnostic(
+                code="UNPARSED_ORDER_ITEM",
+                severity=DiagnosticSeverity.WARNING,
+                message="Rincian pesanan section found but no valid order item could be parsed.",
+            )
+        )
 
     return tuple(items), diagnostics, review_required, review_reason
 
@@ -611,10 +654,16 @@ def extract_order_amount_components(
     j = 0
     while j < len(pay_lines):
         line = pay_lines[j].strip()
-        m = re.match(r"^([^:\n]+)[:]\s*(.*(?:rp|-rp|[0-9]).*)$", line, re.IGNORECASE)
-        if m and "rp" in m.group(2).lower():
+        m = re.match(r"^([^:\n]+)[:]\s*(.*)$", line, re.IGNORECASE)
+        if m and any(k in m.group(1).lower() for k in ["total", "subtotal", "biaya", "voucher", "diskon", "koin", "promosi"]):
             raw_pairs.append((m.group(1).strip(), m.group(2).strip()))
             j += 1
+        elif m and ("rp" in m.group(2).lower() or any(c.isdigit() for c in m.group(2))):
+            raw_pairs.append((m.group(1).strip(), m.group(2).strip()))
+            j += 1
+        elif j + 1 < len(pay_lines) and any(k in line.lower() for k in ["total", "subtotal", "biaya", "voucher", "diskon", "koin", "promosi"]):
+            raw_pairs.append((line, pay_lines[j + 1].strip()))
+            j += 2
         elif j + 1 < len(pay_lines) and ("rp" in pay_lines[j + 1].lower() or "-rp" in pay_lines[j + 1].lower()):
             raw_pairs.append((line, pay_lines[j + 1].strip()))
             j += 2
@@ -625,47 +674,59 @@ def extract_order_amount_components(
     for lbl, raw_amt_str in raw_pairs:
         try:
             raw_amt = parse_id_amount(raw_amt_str)
-            ll = lbl.lower()
-
-            # Classification
-            if any(k in ll for k in ["subtotal pesanan", "subtotal produk"]):
-                amt = abs(raw_amt)
-            elif any(k in ll for k in ["subtotal pengiriman"]):
-                amt = abs(raw_amt)
-            elif any(k in ll for k in ["biaya layanan", "biaya penanganan", "total proteksi produk"]):
-                amt = abs(raw_amt)
-            elif any(k in ll for k in ["voucher toko", "voucher penjual", "diskon voucher toko", "diskon penjual"]):
-                amt = -abs(raw_amt)
-            elif any(k in ll for k in ["voucher shopee", "diskon voucher shopee", "diskon shopee", "promosi metode pembayaran"]):
-                amt = -abs(raw_amt)
-            elif any(k in ll for k in ["diskon pengiriman", "potongan ongkir", "voucher diskon pengiriman"]):
-                amt = -abs(raw_amt)
-            elif "koin shopee" in ll:
-                amt = -abs(raw_amt)
-            elif "total pembayaran" in ll:
-                amt = abs(raw_amt)
-            else:
-                amt = raw_amt
-                review_required = True
-                review_reason = "UNKNOWN_ORDER_AMOUNT_COMPONENT"
-                diagnostics.append(
-                    SafeDiagnostic(
-                        code="UNKNOWN_ORDER_AMOUNT_COMPONENT",
-                        severity=DiagnosticSeverity.WARNING,
-                        message="Unknown order amount component encountered in payment breakdown.",
-                    )
-                )
-
-            components.append(
-                AmountComponentEvidence(
-                    label_raw=lbl,
-                    amount=amt,
-                    currency="IDR",
-                    direction_raw="CREDIT" if amt < 0 else "DEBIT",
+        except Exception:
+            review_required = True
+            if not review_reason:
+                review_reason = "MALFORMED_AMOUNT_COMPONENT"
+            diagnostics.append(
+                SafeDiagnostic(
+                    code="MALFORMED_AMOUNT_COMPONENT",
+                    severity=DiagnosticSeverity.WARNING,
+                    message="Priced order amount component could not be parsed.",
                 )
             )
-        except Exception:
-            pass
+            continue
+
+        ll = lbl.lower()
+
+        # Classification
+        if any(k in ll for k in ["subtotal pesanan", "subtotal produk"]):
+            amt = abs(raw_amt)
+        elif any(k in ll for k in ["subtotal pengiriman"]):
+            amt = abs(raw_amt)
+        elif any(k in ll for k in ["biaya layanan", "biaya penanganan", "total proteksi produk"]):
+            amt = abs(raw_amt)
+        elif any(k in ll for k in ["voucher toko", "voucher penjual", "diskon voucher toko", "diskon penjual"]):
+            amt = -abs(raw_amt)
+        elif any(k in ll for k in ["voucher shopee", "diskon voucher shopee", "diskon shopee", "promosi metode pembayaran"]):
+            amt = -abs(raw_amt)
+        elif any(k in ll for k in ["diskon pengiriman", "potongan ongkir", "voucher diskon pengiriman"]):
+            amt = -abs(raw_amt)
+        elif "koin shopee" in ll:
+            amt = -abs(raw_amt)
+        elif "total pembayaran" in ll:
+            amt = abs(raw_amt)
+        else:
+            amt = raw_amt
+            review_required = True
+            if not review_reason:
+                review_reason = "UNKNOWN_ORDER_AMOUNT_COMPONENT"
+            diagnostics.append(
+                SafeDiagnostic(
+                    code="UNKNOWN_ORDER_AMOUNT_COMPONENT",
+                    severity=DiagnosticSeverity.WARNING,
+                    message="Unknown order amount component encountered in payment breakdown.",
+                )
+            )
+
+        components.append(
+            AmountComponentEvidence(
+                label_raw=lbl,
+                amount=amt,
+                currency="IDR",
+                direction_raw="CREDIT" if amt < 0 else "DEBIT",
+            )
+        )
 
     return tuple(components), diagnostics, review_required, review_reason
 
