@@ -616,9 +616,7 @@ Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
         self.assertEqual(cash.source_debit, Decimal("500000.00"))
         self.assertIsNone(cash.source_credit)
         self.assertEqual(cash.signed_amount, Decimal("-500000.00"))
-        self.assertEqual(len(res.events), 1)
-        self.assertEqual(res.events[0].payload.direction, EventDirection.OUTFLOW)
-        self.assertEqual(res.events[0].payload.amount, Decimal("500000.00"))
+        self.assertEqual(len(res.events), 0)
 
     # 29. Credit sign
     def test_29_credit_produces_positive_signed_amount(self) -> None:
@@ -635,7 +633,7 @@ Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
         self.assertEqual(cash.source_credit, Decimal("750000.00"))
         self.assertEqual(cash.signed_amount, Decimal("750000.00"))
         self.assertEqual(len(res.events), 1)
-        self.assertEqual(res.events[0].payload.direction, EventDirection.INFLOW)
+        self.assertEqual(res.events[0].payload.direction, EventDirection.OUTFLOW)
         self.assertEqual(res.events[0].payload.amount, Decimal("750000.00"))
 
     # 30. Parenthesized negative balance
@@ -829,6 +827,274 @@ Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
         res = adapter.parse(self._make_adapter_input(payload=pdf))
         self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
         self.assertTrue(any(d.code == "UNRECOGNIZED_STOCKBIT_EVENT" for d in res.diagnostics))
+
+
+    # 41. Stockbit source ending equals debit minus credit
+    def test_41_source_ending_equals_debit_minus_credit(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 1,000,000 0 1,000,000 0
+16/10/2025 16/10/2025 R 832025 Receipt From: SYNTH_CLIENT_001 0 400,000 600,000 0
+T O T A L 1,000,000 400,000 600,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertTrue(res.source_total_control_matched)
+        self.assertEqual(res.document_reconciliation_status, "DETAIL_EXACT")
+        self.assertEqual(res.ending_balance, Decimal("600000.00"))
+        self.assertEqual(res.total_debits, Decimal("1000000.00"))
+        self.assertEqual(res.total_credits, Decimal("400000.00"))
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+
+    # 42. Credit minus debit is rejected for non-zero broker balances
+    def test_42_credit_minus_debit_rejected_for_nonzero_broker_balance(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 1,000,000 0 1,000,000 0
+16/10/2025 16/10/2025 R 832025 Receipt From: SYNTH_CLIENT_001 0 400,000 600,000 0
+T O T A L 1,000,000 400,000 600,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        # Broker rule matches
+        self.assertTrue(res.source_total_control_matched)
+        self.assertEqual(res.total_debits - res.total_credits, res.ending_balance)
+        # Bank formula credit - debit is rejected for non-zero broker balances
+        bank_calculated_ending = res.total_credits - res.total_debits
+        self.assertNotEqual(bank_calculated_ending, res.ending_balance)
+        self.assertEqual(bank_calculated_ending, -res.ending_balance)
+
+        # Mismatched totals fail closed
+        p_mismatch = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 1,000,000 0 1,000,000 0
+16/10/2025 16/10/2025 R 832025 Receipt From: SYNTH_CLIENT_001 0 400,000 -600,000 0
+T O T A L 1,000,000 400,000 -600,000 0
+"""
+        res_mismatch = adapter.parse(self._make_adapter_input(payload=make_multipage_pdf([p_mismatch])))
+        self.assertFalse(res_mismatch.source_total_control_matched)
+        self.assertEqual(res_mismatch.document_reconciliation_status, "CASH_RECONCILIATION_MISMATCH")
+        self.assertEqual(res_mismatch.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+
+    # 43. Undue Trading equals negative source ending balance
+    def test_43_undue_trading_equals_negative_source_ending_balance(self) -> None:
+        header = SYNTHETIC_HEADER + """Cash Investor 0
+Cash 0
+Undue Trading -600,000
+Short Sell 0
+Portfolio 0
+Equity NAB 0
+Avail Limit 0
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 600,000 0 600,000 0
+T O T A L 600,000 0 600,000 0
+"""
+        pdf = make_multipage_pdf([header])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertTrue(res.undue_trading_control_matched)
+        self.assertEqual(res.portfolio_valuation.undue_trading, Decimal("-600000.00"))
+        self.assertEqual(res.ending_balance, Decimal("600000.00"))
+        self.assertEqual(res.portfolio_valuation.undue_trading, -res.ending_balance)
+
+    # 44. Zero detail difference is DETAIL_EXACT
+    def test_44_zero_detail_difference_is_detail_exact(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 500,000 0 500,000 0
+T O T A L 500,000 0 500,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(res.detail_difference, Decimal("0.00"))
+        self.assertEqual(res.document_reconciliation_status, "DETAIL_EXACT")
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+
+    # 45. Positive IDR 1 difference is SOURCE_ROUNDING_DIFFERENCE
+    def test_45_positive_one_idr_difference_is_source_rounding_difference(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 500,001 0 500,000 0
+T O T A L 500,000 0 500,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(res.detail_difference, Decimal("1.00"))
+        self.assertEqual(res.document_reconciliation_status, "SOURCE_ROUNDING_DIFFERENCE")
+        self.assertTrue(res.source_total_control_matched)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        self.assertTrue(any(d.code == "SOURCE_ROUNDING_DIFFERENCE" for d in res.diagnostics))
+
+    # 46. Negative IDR 1 difference is SOURCE_ROUNDING_DIFFERENCE
+    def test_46_negative_one_idr_difference_is_source_rounding_difference(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 499,999 0 500,000 0
+T O T A L 500,000 0 500,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(res.detail_difference, Decimal("-1.00"))
+        self.assertEqual(res.document_reconciliation_status, "SOURCE_ROUNDING_DIFFERENCE")
+        self.assertTrue(res.source_total_control_matched)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        self.assertTrue(any(d.code == "SOURCE_ROUNDING_DIFFERENCE" for d in res.diagnostics))
+
+    # 47. Difference above IDR 1 is REVIEW_REQUIRED
+    def test_47_difference_above_one_idr_is_review_required(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 500,005 0 500,000 0
+T O T A L 500,000 0 500,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(res.detail_difference, Decimal("5.00"))
+        self.assertEqual(res.document_reconciliation_status, "CASH_RECONCILIATION_MISMATCH")
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "CASH_RECONCILIATION_MISMATCH" for d in res.diagnostics))
+
+    # 48. TRADE_ACCRUAL emits no cash movement
+    def test_48_trade_accrual_emits_no_cash_movement(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 350,000 0 350,000 1 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 1)
+        cash = res.cash_evidence[0]
+        self.assertEqual(cash.source_entry_type, "TRADE_ACCRUAL")
+        self.assertFalse(cash.cash_movement_candidate)
+        self.assertFalse(cash.requires_cross_source_match)
+        cash_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
+        self.assertEqual(len(cash_events), 0)
+
+    # 49. ESTIMATED_INTEREST emits no cash movement
+    def test_49_estimated_interest_emits_no_cash_movement(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+31/10/2025 31/10/2025 Z Z Estimated Interest 0 25 25 1 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 1)
+        cash = res.cash_evidence[0]
+        self.assertEqual(cash.source_entry_type, "ESTIMATED_INTEREST")
+        self.assertFalse(cash.cash_movement_candidate)
+        self.assertFalse(cash.requires_cross_source_match)
+        cash_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
+        self.assertEqual(len(cash_events), 0)
+
+    # 50. DATAFEED entries emit no cash movement in Phase 3
+    def test_50_datafeed_entries_emit_no_cash_movement_in_phase3(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+10/10/2025 10/10/2025 M Biaya Datafeed October 2025 15,000 0 15,000 1 0
+11/10/2025 11/10/2025 R Biaya Datafeed October 2025 0 15,000 0 1 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 2)
+        self.assertEqual(res.cash_evidence[0].source_entry_type, "DATAFEED_FEE")
+        self.assertFalse(res.cash_evidence[0].cash_movement_candidate)
+        self.assertEqual(res.cash_evidence[1].source_entry_type, "DATAFEED_SETTLEMENT")
+        self.assertFalse(res.cash_evidence[1].cash_movement_candidate)
+        cash_events = [e for e in res.events if e.event_role == EventRole.CASH_MOVEMENT]
+        self.assertEqual(len(cash_events), 0)
+
+    # 51. P settlement produces owner inflow direction
+    def test_51_p_settlement_produces_owner_inflow_direction(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 500,000 0 500,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 1)
+        cash = res.cash_evidence[0]
+        self.assertEqual(cash.source_entry_type, "BROKER_PAYMENT_TO_OWNER")
+        self.assertTrue(cash.cash_movement_candidate)
+        self.assertTrue(cash.requires_cross_source_match)
+        self.assertEqual(cash.owner_cash_direction, "IN")
+        self.assertGreater(cash.owner_cash_signed_amount, Decimal("0.00"))
+        self.assertEqual(cash.owner_cash_signed_amount, Decimal("500000.00"))
+        self.assertEqual(len(res.events), 1)
+        self.assertEqual(res.events[0].payload.direction, EventDirection.INFLOW)
+
+    # 52. R settlement produces owner outflow direction
+    def test_52_r_settlement_produces_owner_outflow_direction(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 R 832025 Receipt From: SYNTH_CLIENT_001 0 750,000 0 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 1)
+        cash = res.cash_evidence[0]
+        self.assertEqual(cash.source_entry_type, "BROKER_RECEIPT_FROM_OWNER")
+        self.assertTrue(cash.cash_movement_candidate)
+        self.assertTrue(cash.requires_cross_source_match)
+        self.assertEqual(cash.owner_cash_direction, "OUT")
+        self.assertLess(cash.owner_cash_signed_amount, Decimal("0.00"))
+        self.assertEqual(cash.owner_cash_signed_amount, Decimal("-750000.00"))
+        self.assertEqual(len(res.events), 1)
+        self.assertEqual(res.events[0].payload.direction, EventDirection.OUTFLOW)
+
+    # 53. source_ending_balance is not treated as a running bank balance
+    def test_53_source_ending_balance_not_treated_as_running_bank_balance(self) -> None:
+        cash = StockbitCashEvidence(
+            transaction_date="2025-10-15",
+            due_date="2025-10-15",
+            source_reference="P 123",
+            source_description="Payment to: CLIENT",
+            source_debit=Decimal("500000.00"),
+            source_credit=None,
+            signed_amount=Decimal("-500000.00"),
+            source_ending_balance=Decimal("0.00"),
+            source_row_ordinal=1,
+            row_evidence_key="row-1",
+            source_entry_type="BROKER_PAYMENT_TO_OWNER",
+            source_action="PAYMENT",
+            owner_cash_direction="IN",
+            owner_cash_signed_amount=Decimal("500000.00"),
+            cash_movement_candidate=True,
+            requires_cross_source_match=True,
+        )
+        self.assertEqual(cash.source_ending_balance, Decimal("0.00"))
+        self.assertEqual(cash.running_balance, Decimal("0.00"))
+        self.assertTrue(hasattr(cash, "source_ending_balance"))
+
+    # 54. Every recognized ledger row has a non-empty source entry type
+    def test_54_every_recognized_ledger_row_has_nonempty_source_entry_type(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 100,000 0 100,000 1 0
+16/10/2025 16/10/2025 P 832024 Payment to: SYNTH_CLIENT_001 200,000 0 300,000 0
+17/10/2025 17/10/2025 R 832025 Receipt From: SYNTH_CLIENT_001 0 50,000 250,000 0
+18/10/2025 18/10/2025 P 999 Inv: 123456. 10,000 0 260,000 0
+19/10/2025 19/10/2025 M Biaya Datafeed October 2025 5,000 0 265,000 0
+20/10/2025 20/10/2025 Z Z Estimated Interest 0 100 264,900 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 6)
+        for row in res.cash_evidence:
+            self.assertTrue(bool(row.source_entry_type))
+            self.assertNotEqual(row.source_entry_type, "UNRECOGNIZED_STOCKBIT_EVENT")
+            self.assertTrue(bool(row.source_action))
 
 
 if __name__ == "__main__":

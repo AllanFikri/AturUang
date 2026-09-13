@@ -80,7 +80,7 @@ class StockbitDocumentIdentity:
     review_reason: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class StockbitCashEvidence:
     transaction_date: str
     due_date: str | None
@@ -89,12 +89,64 @@ class StockbitCashEvidence:
     source_debit: Decimal | None
     source_credit: Decimal | None
     signed_amount: Decimal
-    running_balance: Decimal | None
+    source_ending_balance: Decimal | None
     source_row_ordinal: int
     row_evidence_key: str
-    requires_cross_source_match: bool = True  # Subject to Phase 5 Jago RDN matching
+    source_entry_type: str = "TRADE_ACCRUAL"
+    source_action: str = ""
+    owner_cash_direction: str | None = None
+    owner_cash_signed_amount: Decimal | None = None
+    cash_movement_candidate: bool = False
+    requires_cross_source_match: bool = False
     review_reason: str | None = None
     evidence_role: str = StockbitEvidenceRole.CASH_EVIDENCE.value
+
+    def __init__(
+        self,
+        transaction_date: str,
+        due_date: str | None,
+        source_reference: str | None,
+        source_description: str,
+        source_debit: Decimal | None,
+        source_credit: Decimal | None,
+        signed_amount: Decimal,
+        source_ending_balance: Decimal | None = None,
+        source_row_ordinal: int = 0,
+        row_evidence_key: str = "",
+        source_entry_type: str = "TRADE_ACCRUAL",
+        source_action: str = "",
+        owner_cash_direction: str | None = None,
+        owner_cash_signed_amount: Decimal | None = None,
+        cash_movement_candidate: bool = False,
+        requires_cross_source_match: bool = False,
+        review_reason: str | None = None,
+        evidence_role: str = StockbitEvidenceRole.CASH_EVIDENCE.value,
+        running_balance: Decimal | None = None,
+    ) -> None:
+        if source_ending_balance is None and running_balance is not None:
+            source_ending_balance = running_balance
+        object.__setattr__(self, "transaction_date", transaction_date)
+        object.__setattr__(self, "due_date", due_date)
+        object.__setattr__(self, "source_reference", source_reference)
+        object.__setattr__(self, "source_description", source_description)
+        object.__setattr__(self, "source_debit", source_debit)
+        object.__setattr__(self, "source_credit", source_credit)
+        object.__setattr__(self, "signed_amount", signed_amount)
+        object.__setattr__(self, "source_ending_balance", source_ending_balance)
+        object.__setattr__(self, "source_row_ordinal", source_row_ordinal)
+        object.__setattr__(self, "row_evidence_key", row_evidence_key)
+        object.__setattr__(self, "source_entry_type", source_entry_type)
+        object.__setattr__(self, "source_action", source_action)
+        object.__setattr__(self, "owner_cash_direction", owner_cash_direction)
+        object.__setattr__(self, "owner_cash_signed_amount", owner_cash_signed_amount)
+        object.__setattr__(self, "cash_movement_candidate", cash_movement_candidate)
+        object.__setattr__(self, "requires_cross_source_match", requires_cross_source_match)
+        object.__setattr__(self, "review_reason", review_reason)
+        object.__setattr__(self, "evidence_role", evidence_role)
+
+    @property
+    def running_balance(self) -> Decimal | None:
+        return self.source_ending_balance
 
 
 @dataclass(frozen=True)
@@ -166,6 +218,10 @@ class StockbitAdapterResult(AdapterResult):
     ending_balance: Decimal | None = None
     total_debits: Decimal | None = None
     total_credits: Decimal | None = None
+    document_reconciliation_status: str = "DETAIL_EXACT"
+    detail_difference: Decimal = Decimal("0.00")
+    source_total_control_matched: bool = True
+    undue_trading_control_matched: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -212,15 +268,18 @@ def build_row_evidence_key(
     source_reference: str | None = None,
     source_description: str | None = None,
     signed_amount: Decimal | None = None,
+    source_ending_balance: Decimal | None = None,
     running_balance: Decimal | None = None,
     source_row_ordinal: int | None = None,
 ) -> tuple[str, bool, str | None]:
     """Constructs a deterministic row-level evidence key."""
+    if source_ending_balance is None and running_balance is not None:
+        source_ending_balance = running_balance
     has_stable_core = bool(
         transaction_date
         and source_description
         and signed_amount is not None
-        and (source_reference or running_balance is not None)
+        and (source_reference or source_ending_balance is not None)
     )
 
     if has_stable_core:
@@ -234,7 +293,7 @@ def build_row_evidence_key(
                 re.sub(r"\s+", " ", (source_reference or "").strip().upper()),
                 re.sub(r"\s+", " ", (source_description or "").strip().upper()),
                 str(signed_amount),
-                str(running_balance) if running_balance is not None else "",
+                str(source_ending_balance) if source_ending_balance is not None else "",
             )
         )
         return sha256(payload.encode("utf-8")).hexdigest(), False, None
@@ -610,6 +669,8 @@ class StockbitStatementAdapter:
         trade_evidence_list: list[StockbitTradeEvidence] = []
         opening_balance: Decimal | None = None
         source_ending_balance: Decimal | None = None
+        parsed_total_debits: Decimal | None = None
+        parsed_total_credits: Decimal | None = None
 
         cur_trade_date: str | None = None
         cur_due_date: str | None = None
@@ -635,9 +696,12 @@ class StockbitStatementAdapter:
                 continue
 
             if line.startswith("T O T A L"):
-                m_t = re.findall(r"\(?[\d,]+(?:\.\d+)?\)?", line)
-                if len(m_t) >= 3 and source_ending_balance is None:
-                    source_ending_balance = _parse_decimal_amount(m_t[2])
+                m_t = re.findall(r"[-\(]?[\d,]+(?:\.\d+)?\)?", line)
+                if len(m_t) >= 3:
+                    parsed_total_debits = _parse_decimal_amount(m_t[0])
+                    parsed_total_credits = _parse_decimal_amount(m_t[1])
+                    if source_ending_balance is None:
+                        source_ending_balance = _parse_decimal_amount(m_t[2])
                 continue
 
             if line.startswith("Total - Interest"):
@@ -688,43 +752,88 @@ class StockbitStatementAdapter:
                 cr_val = Decimal("0.00")
                 bal_val: Decimal | None = None
 
+                source_entry_type = "UNRECOGNIZED_STOCKBIT_EVENT"
+                source_action = ""
+                owner_cash_direction = None
+                owner_cash_signed_amount = None
+                cash_movement_candidate = False
+                requires_cross_source_match = False
+
                 if m_trx:
+                    source_entry_type = "TRADE_ACCRUAL"
+                    source_action = "TRADE_ACCRUAL"
                     ref_val = "I"
                     desc_val = m_trx.group(1)
                     nums = [_parse_decimal_amount(x) for x in m_trx.group(2).split()]
                     if len(nums) >= 3:
                         db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
                 elif m_pay:
+                    source_entry_type = "BROKER_PAYMENT_TO_OWNER"
+                    source_action = "PAYMENT"
                     ref_val = f"P {m_pay.group(1)}"
                     desc_val = m_pay.group(2).strip()
                     nums = [_parse_decimal_amount(x) for x in m_pay.group(3).split()]
                     if len(nums) >= 3:
                         db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                    cash_movement_candidate = True
+                    requires_cross_source_match = True
+                    owner_cash_direction = "IN"
+                    owner_cash_signed_amount = db_val if db_val > 0 else (cr_val if cr_val > 0 else Decimal("0.00"))
                 elif m_rec:
+                    source_entry_type = "BROKER_RECEIPT_FROM_OWNER"
+                    source_action = "RECEIPT"
                     ref_val = f"R {m_rec.group(1)}"
                     desc_val = m_rec.group(2).strip()
                     nums = [_parse_decimal_amount(x) for x in m_rec.group(3).split()]
                     if len(nums) >= 3:
                         db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                    cash_movement_candidate = True
+                    requires_cross_source_match = True
+                    owner_cash_direction = "OUT"
+                    owner_cash_signed_amount = -(cr_val if cr_val > 0 else (db_val if db_val > 0 else Decimal("0.00")))
                 elif m_inv:
-                    ref_val = f"{m_inv.group(1)} {m_inv.group(2)}"
+                    source_entry_type = "INVOICE_SETTLEMENT"
+                    source_action = "INVOICE_SETTLEMENT"
+                    inv_pref = m_inv.group(1).upper()
+                    ref_val = f"{inv_pref} {m_inv.group(2)}"
                     desc_val = m_inv.group(3).strip() + "."
                     nums = [_parse_decimal_amount(x) for x in m_inv.group(4).split()]
                     if len(nums) >= 3:
                         db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                    cash_movement_candidate = True
+                    requires_cross_source_match = True
+                    if inv_pref == "P":
+                        owner_cash_direction = "IN"
+                        owner_cash_signed_amount = db_val if db_val > 0 else (cr_val if cr_val > 0 else Decimal("0.00"))
+                    else:
+                        owner_cash_direction = "OUT"
+                        owner_cash_signed_amount = -(cr_val if cr_val > 0 else (db_val if db_val > 0 else Decimal("0.00")))
                 elif m_feed:
+                    feed_pref = m_feed.group(1).upper()
                     feed_ref_num = m_feed.group(2) or ""
-                    ref_val = f"{m_feed.group(1)} {feed_ref_num}".strip()
+                    ref_val = f"{feed_pref} {feed_ref_num}".strip()
                     desc_val = m_feed.group(3).strip()
                     nums = [_parse_decimal_amount(x) for x in m_feed.group(4).split()]
                     if len(nums) >= 3:
                         db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                    if feed_pref == "M":
+                        source_entry_type = "DATAFEED_FEE"
+                        source_action = "DATAFEED_FEE"
+                    else:
+                        source_entry_type = "DATAFEED_SETTLEMENT"
+                        source_action = "DATAFEED_SETTLEMENT"
+                    cash_movement_candidate = False
+                    requires_cross_source_match = False
                 elif m_int:
+                    source_entry_type = "ESTIMATED_INTEREST"
+                    source_action = "ESTIMATED_INTEREST"
                     ref_val = "Z"
                     desc_val = m_int.group(1)
                     nums = [_parse_decimal_amount(x) for x in m_int.group(2).split()]
                     if len(nums) >= 3:
                         db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                    cash_movement_candidate = False
+                    requires_cross_source_match = False
                 else:
                     diag, row_key = handle_unrecognized_row(line, row_ordinal, doc_key)
                     diagnostics.append(diag)
@@ -740,7 +849,7 @@ class StockbitStatementAdapter:
                     source_reference=ref_val,
                     source_description=desc_val,
                     signed_amount=signed_amount,
-                    running_balance=bal_val,
+                    source_ending_balance=bal_val,
                     source_row_ordinal=row_ordinal,
                 )
 
@@ -752,10 +861,15 @@ class StockbitStatementAdapter:
                     source_debit=db_val if db_val > 0 else None,
                     source_credit=cr_val if cr_val > 0 else None,
                     signed_amount=signed_amount,
-                    running_balance=bal_val,
+                    source_ending_balance=bal_val,
                     source_row_ordinal=row_ordinal,
                     row_evidence_key=row_key,
-                    requires_cross_source_match=True,
+                    source_entry_type=source_entry_type,
+                    source_action=source_action,
+                    owner_cash_direction=owner_cash_direction,
+                    owner_cash_signed_amount=owner_cash_signed_amount,
+                    cash_movement_candidate=cash_movement_candidate,
+                    requires_cross_source_match=requires_cross_source_match,
                     review_reason=r_reason,
                 )
                 cash_evidence_list.append(cash_ev)
@@ -819,57 +933,89 @@ class StockbitStatementAdapter:
                     else:
                         cur_text.append(l)
 
-        # 7. Cash Equation Validation
-        total_debits = sum((c.source_debit or Decimal("0.00")) for c in cash_evidence_list)
-        total_credits = sum((c.source_credit or Decimal("0.00")) for c in cash_evidence_list)
-        equation_mismatch = False
+        # 7. Broker Cash Reconciliation & Controls
+        detail_total_debits = sum((c.source_debit or Decimal("0.00")) for c in cash_evidence_list)
+        detail_total_credits = sum((c.source_credit or Decimal("0.00")) for c in cash_evidence_list)
 
-        if cash_evidence_list and source_ending_balance is not None:
-            opening = opening_balance if opening_balance is not None else Decimal("0.00")
-            calculated_ending = opening + total_credits - total_debits
-            if calculated_ending != source_ending_balance:
-                equation_mismatch = True
-                review_reasons.append("CASH_EQUATION_MISMATCH")
+        doc_total_debits = parsed_total_debits if parsed_total_debits is not None else detail_total_debits
+        doc_total_credits = parsed_total_credits if parsed_total_credits is not None else detail_total_credits
+        doc_ending_balance = source_ending_balance if source_ending_balance is not None else (opening_balance or Decimal("0.00"))
+
+        if not cash_evidence_list and parsed_total_debits is None:
+            source_total_control_matched = True
+            undue_trading_control_matched = True
+            doc_reconciliation_status = "DETAIL_EXACT"
+            detail_diff = Decimal("0.00")
+        else:
+            # P3.7.3-R1.2: source_total_debit - source_total_credit == source_ending_balance
+            source_total_control_matched = (doc_total_debits - doc_total_credits == doc_ending_balance)
+
+            # header_undue_trading == -source_ending_balance
+            undue_trading_control_matched = True
+            if portfolio_valuation and portfolio_valuation.undue_trading is not None and doc_ending_balance is not None:
+                undue_trading_control_matched = (portfolio_valuation.undue_trading == -doc_ending_balance)
+
+            # P3.7.3-R1.3: Detail difference = (detail_debits - detail_credits) - doc_ending_balance
+            detail_diff = (detail_total_debits - detail_total_credits) - doc_ending_balance
+
+            if not source_total_control_matched:
+                doc_reconciliation_status = "CASH_RECONCILIATION_MISMATCH"
+                review_reasons.append("CASH_RECONCILIATION_MISMATCH")
                 diagnostics.append(
                     SafeDiagnostic(
-                        code="CASH_EQUATION_MISMATCH",
+                        code="CASH_RECONCILIATION_MISMATCH",
                         severity=DiagnosticSeverity.WARNING,
-                        message=(
-                            f"Cash equation mismatch: opening ({opening}) + credits ({total_credits}) "
-                            f"- debits ({total_debits}) = {calculated_ending} != source ({source_ending_balance})"
-                        ),
+                        message="Broker source total control mismatch between debits, credits, and ending balance.",
                         review_required=True,
                     )
                 )
-                updated_cash = []
-                for c in cash_evidence_list:
-                    updated_cash.append(
-                        StockbitCashEvidence(
-                            transaction_date=c.transaction_date,
-                            due_date=c.due_date,
-                            source_reference=c.source_reference,
-                            source_description=c.source_description,
-                            source_debit=c.source_debit,
-                            source_credit=c.source_credit,
-                            signed_amount=c.signed_amount,
-                            running_balance=c.running_balance,
-                            source_row_ordinal=c.source_row_ordinal,
-                            row_evidence_key=c.row_evidence_key,
-                            requires_cross_source_match=c.requires_cross_source_match,
-                            review_reason="CASH_EQUATION_MISMATCH",
-                        )
+            elif detail_diff == Decimal("0.00"):
+                doc_reconciliation_status = "DETAIL_EXACT"
+            elif abs(detail_diff) <= Decimal("1.00"):
+                doc_reconciliation_status = "SOURCE_ROUNDING_DIFFERENCE"
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="SOURCE_ROUNDING_DIFFERENCE",
+                        severity=DiagnosticSeverity.INFO,
+                        message="Non-blocking source rounding difference between ledger details and total balance.",
+                        review_required=False,
                     )
-                cash_evidence_list = updated_cash
+                )
+            else:
+                doc_reconciliation_status = "CASH_RECONCILIATION_MISMATCH"
+                review_reasons.append("CASH_RECONCILIATION_MISMATCH")
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="CASH_RECONCILIATION_MISMATCH",
+                        severity=DiagnosticSeverity.WARNING,
+                        message="Cash reconciliation mismatch: detail difference exceeds allowable tolerance.",
+                        review_required=True,
+                    )
+                )
+
+            if not undue_trading_control_matched:
+                review_reasons.append("UNDUE_TRADING_CONTROL_MISMATCH")
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="UNDUE_TRADING_CONTROL_MISMATCH",
+                        severity=DiagnosticSeverity.WARNING,
+                        message="Header undue trading does not match negative ending balance.",
+                        review_required=True,
+                    )
+                )
 
         # 8. Build Normalized Event Envelopes
         events: list[NormalizedEventEnvelope] = []
         for c in cash_evidence_list:
-            if c.signed_amount > 0:
+            if not c.cash_movement_candidate:
+                continue
+
+            if c.owner_cash_direction == "IN":
                 direction = EventDirection.INFLOW
-                amt = c.signed_amount
-            elif c.signed_amount < 0:
+                amt = c.owner_cash_signed_amount if c.owner_cash_signed_amount is not None else Decimal("0.00")
+            elif c.owner_cash_direction == "OUT":
                 direction = EventDirection.OUTFLOW
-                amt = abs(c.signed_amount)
+                amt = abs(c.owner_cash_signed_amount) if c.owner_cash_signed_amount is not None else Decimal("0.00")
             else:
                 direction = EventDirection.NEUTRAL
                 amt = Decimal("0.00")
@@ -882,10 +1028,10 @@ class StockbitStatementAdapter:
                 occurred_at=c.transaction_date,
                 posted_at=c.transaction_date,
                 settlement_date=c.due_date,
-                direction_raw="CR" if c.signed_amount > 0 else ("DB" if c.signed_amount < 0 else None),
+                direction_raw=c.owner_cash_direction,
                 description_raw=c.source_description,
                 reference_raw=c.source_reference,
-                balance_after=c.running_balance,
+                balance_after=c.source_ending_balance,
             )
             provenance = SourceProvenanceContract(
                 source_document_id=source.source_document_id,
@@ -971,7 +1117,6 @@ class StockbitStatementAdapter:
 
         has_review = bool(
             identity.review_required
-            or equation_mismatch
             or any(d.review_required for d in diagnostics)
         )
 
@@ -997,7 +1142,11 @@ class StockbitStatementAdapter:
             holding_snapshots=tuple(holding_snapshots_list),
             portfolio_valuation=portfolio_valuation,
             opening_balance=opening_balance,
-            ending_balance=source_ending_balance,
-            total_debits=total_debits,
-            total_credits=total_credits,
+            ending_balance=doc_ending_balance,
+            total_debits=doc_total_debits,
+            total_credits=doc_total_credits,
+            document_reconciliation_status=doc_reconciliation_status,
+            detail_difference=detail_diff,
+            source_total_control_matched=source_total_control_matched,
+            undue_trading_control_matched=undue_trading_control_matched,
         )
