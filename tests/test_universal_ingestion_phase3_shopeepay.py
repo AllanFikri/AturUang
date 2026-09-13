@@ -573,9 +573,28 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
         adapter = ShopeePayTransactionHistoryImageAdapter(
             ocr_extractor=lambda b: self._get_mock_ocr("valid_high_res_november")
         )
-        res = adapter.parse(inp)
-        for ev in res.events:
-            self.assertTrue(isinstance(ev.payload.amount, Decimal))
+        res1 = adapter.parse(inp)
+        res2 = adapter.parse(inp)
+        self.assertTrue(len(res1.events) > 0)
+        # Decimal type and exponent exactly -2
+        for ev in res1.events:
+            amt = ev.payload.amount
+            self.assertIsInstance(amt, Decimal)
+            self.assertEqual(amt.as_tuple().exponent, -2)
+
+        # Deterministic repeated parse result
+        self.assertEqual(res1.parse_status, res2.parse_status)
+        self.assertEqual(res1.period_status, res2.period_status)
+        self.assertEqual(res1.natural_document_key_candidate, res2.natural_document_key_candidate)
+        self.assertEqual(len(res1.events), len(res2.events))
+        # Identical event ordering and row fingerprints
+        fps1 = [ev.row_fingerprint for ev in res1.events]
+        fps2 = [ev.row_fingerprint for ev in res2.events]
+        self.assertEqual(fps1, fps2)
+        for ev1, ev2 in zip(res1.events, res2.events):
+            self.assertEqual(ev1.payload.amount, ev2.payload.amount)
+            self.assertEqual(ev1.payload.direction, ev2.payload.direction)
+            self.assertEqual(ev1.payload.occurred_at, ev2.payload.occurred_at)
 
     # 22. Multiline description normalization
     def test_22_multiline_description_normalization(self) -> None:
@@ -653,15 +672,82 @@ class TestUniversalIngestionPhase3ShopeePay(unittest.TestCase):
 
     # 28. Financial card ambiguity triggers review & omits ambiguous card
     def test_28_financial_card_ambiguity_triggers_review(self) -> None:
-        img_bytes = _make_synthetic_image(1220, 2000)
-        inp = self._make_adapter_input(img_bytes)
-        adapter = ShopeePayTransactionHistoryImageAdapter(
-            ocr_extractor=lambda b: self._get_mock_ocr("ambiguous_card_statement")
+        base_header_lines = (
+            ImageOcrLine(text="Transaction History", x=50, y=100, width=300, height=30),
+            ImageOcrLine(text="01 Nov 2025 - 30 Nov 2025", x=50, y=150, width=300, height=30),
+            ImageOcrLine(text="Payment Method", x=50, y=200, width=200, height=30),
+            ImageOcrLine(text="Top Up", x=50, y=250, width=100, height=30),
+            # Valid trusted card at y=400-500
+            ImageOcrLine(text="Payment", x=50, y=400, width=100, height=30),
+            ImageOcrLine(text="-Rp25.000", x=800, y=400, width=150, height=30),
+            ImageOcrLine(text="Trusted Merchant", x=50, y=450, width=200, height=30),
+            ImageOcrLine(text="20 November 2025", x=50, y=500, width=200, height=30),
         )
-        res = adapter.parse(inp)
-        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
-        self.assertEqual(len(res.events), 1)
-        self.assertTrue(any(d.code == "SHOPEEPAY_CARD_AMBIGUOUS" for d in res.diagnostics))
+
+        test_cases = [
+            (
+                "missing transaction date",
+                (
+                    ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                    ImageOcrLine(text="-Rp15.000", x=800, y=700, width=150, height=30),
+                    ImageOcrLine(text="Item Without Date", x=50, y=750, width=200, height=30),
+                ),
+            ),
+            (
+                "unsigned Rp amount",
+                (
+                    ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                    ImageOcrLine(text="Rp50.000", x=800, y=700, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=750, width=200, height=30),
+                    ImageOcrLine(text="15 November 2025", x=50, y=800, width=200, height=30),
+                ),
+            ),
+            (
+                "malformed amount",
+                (
+                    ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                    ImageOcrLine(text="-RpABC", x=800, y=700, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=750, width=200, height=30),
+                    ImageOcrLine(text="15 November 2025", x=50, y=800, width=200, height=30),
+                ),
+            ),
+            (
+                "over-precision amount",
+                (
+                    ImageOcrLine(text="Payment", x=50, y=700, width=100, height=30),
+                    ImageOcrLine(text="-Rp50.000,123", x=800, y=700, width=150, height=30),
+                    ImageOcrLine(text="Merchant Item", x=50, y=750, width=200, height=30),
+                    ImageOcrLine(text="15 November 2025", x=50, y=800, width=200, height=30),
+                ),
+            ),
+        ]
+
+        img_bytes = _make_synthetic_image(1220, 2500)
+        inp = self._make_adapter_input(img_bytes)
+
+        for case_name, ambiguous_lines in test_cases:
+            with self.subTest(case=case_name):
+                combined_ocr = ImageOcrResult(
+                    lines=base_header_lines + ambiguous_lines,
+                    image_width=1220,
+                    image_height=2500,
+                )
+                adapter = ShopeePayTransactionHistoryImageAdapter(
+                    ocr_extractor=lambda b, ocr=combined_ocr: ocr
+                )
+                res = adapter.parse(inp)
+                # 1. parse_status becomes REVIEW_REQUIRED
+                self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+                # 2. ambiguous candidate emits 0 CASH_MOVEMENT (only the 1 trusted card emits)
+                self.assertEqual(len(res.events), 1)
+                self.assertEqual(res.events[0].payload.amount, Decimal("25000.00"))
+                self.assertEqual(res.events[0].payload.direction, EventDirection.OUTFLOW)
+                # 3. no direction is fabricated for the ambiguous candidate (only trusted card exists)
+                for ev in res.events:
+                    self.assertNotEqual(ev.payload.amount, Decimal("15000.00"))
+                    self.assertNotEqual(ev.payload.amount, Decimal("50000.00"))
+                # 4. diagnostic includes SHOPEEPAY_CARD_AMBIGUOUS
+                self.assertTrue(any(d.code == "SHOPEEPAY_CARD_AMBIGUOUS" for d in res.diagnostics))
 
     # 29. Natural document key unidentified wallet
     def test_29_natural_document_key_unidentified_wallet(self) -> None:

@@ -91,7 +91,12 @@ _MONTH_NAME_TO_INT: dict[str, int] = {
 }
 
 _AMOUNT_RE = re.compile(
-    r"([+-])\s*(?:Rp|RP|rp|RPI|rpi|RP1|rp1)\s*([0-9IOol|.\s]+(?:,[0-9IOol]{2})?)",
+    r"([+-])\s*(?:Rp|RP|rp|RPI|rpi|RP1|rp1)\s*([^\n\r]+)",
+    re.IGNORECASE,
+)
+_UNSIGNED_AMOUNT_LINE_RE = re.compile(
+    r"^\s*(?:Rp|RP|rp|RPI|rpi|RP1|rp1)\s*([0-9IOol|.\s]+(?:,[0-9IOol]{2})?)\s*$",
+    re.IGNORECASE,
 )
 _DATE_RE = re.compile(
     r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b",
@@ -110,8 +115,8 @@ class _ParsedCard:
     title: str
     description: str
     date_str: str
-    direction: EventDirection
-    direction_raw: str
+    direction: EventDirection | None
+    direction_raw: str | None
     amount: Decimal
     is_failed: bool
     is_ambiguous: bool = False
@@ -119,12 +124,35 @@ class _ParsedCard:
 
 
 def _parse_idr_amount(raw_str: str) -> Decimal | None:
-    cleaned = re.sub(r"^[+-]\s*(?:Rp|RP|rp|RPI|rpi|RP1|rp1)?", "", raw_str, flags=re.I).strip()
+    cleaned = re.sub(r"^[+-]\s*(?:Rp|RP|rp|RPI|rpi|RP1|rp1)?", "", str(raw_str), flags=re.I).strip()
     cleaned = cleaned.replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1").replace("|", "1").replace(" ", "")
-    cleaned = cleaned.replace(".", "").replace(",", ".")
+    if not cleaned:
+        return None
+    if "," in cleaned:
+        parts = cleaned.split(",")
+        if len(parts) != 2:
+            return None
+        int_part, frac_part = parts
+        int_part = int_part.replace(".", "")
+        if not int_part.isdigit() or not frac_part.isdigit():
+            return None
+        if len(frac_part) > 2:
+            return None  # Over-precision fails closed
+        if len(frac_part) == 1:
+            frac_part = frac_part + "0"
+        elif len(frac_part) == 0:
+            frac_part = "00"
+        val_str = f"{int_part}.{frac_part}"
+    else:
+        int_part = cleaned.replace(".", "")
+        if not int_part.isdigit():
+            return None
+        val_str = f"{int_part}.00"
     try:
-        val = Decimal(cleaned)
-        return val if val >= Decimal("0.00") else None
+        val = Decimal(val_str)
+        if val < Decimal("0.00") or val.as_tuple().exponent != -2:
+            return None
+        return val
     except InvalidOperation:
         return None
 
@@ -464,6 +492,7 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
         cards: list[_ParsedCard] = []
 
         raw_amount_indices: list[int] = []
+        unsigned_amount_indices: list[int] = []
         for idx, line in enumerate(sorted_lines):
             clean_text = line.text.casefold()
             if "%" in line.text or _DATE_FILTER_RE.search(line.text) or _DATE_RE.search(line.text):
@@ -475,6 +504,8 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
                 continue
             if _AMOUNT_RE.search(line.text):
                 raw_amount_indices.append(idx)
+            elif _UNSIGNED_AMOUNT_LINE_RE.match(line.text):
+                unsigned_amount_indices.append(idx)
 
         amount_indices: list[int] = []
         for a_idx in raw_amount_indices:
@@ -511,8 +542,8 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
                         title="",
                         description="",
                         date_str="",
-                        direction=direction,
-                        direction_raw=direction_raw,
+                        direction=None,
+                        direction_raw=None,
                         amount=Decimal("0.00"),
                         is_failed=False,
                         is_ambiguous=True,
@@ -581,8 +612,8 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
                         title=title,
                         description=description,
                         date_str="",
-                        direction=direction,
-                        direction_raw=direction_raw,
+                        direction=None,
+                        direction_raw=None,
                         amount=amount,
                         is_failed=is_failed,
                         is_ambiguous=True,
@@ -603,5 +634,24 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
                         is_ambiguous=False,
                     )
                 )
+
+        for u_idx in unsigned_amount_indices:
+            u_line = sorted_lines[u_idx]
+            if any(abs(u_line.y - sorted_lines[a_idx].y) < 40 for a_idx in amount_indices):
+                continue
+            cards.append(
+                _ParsedCard(
+                    y=u_line.y,
+                    title="",
+                    description="",
+                    date_str="",
+                    direction=None,
+                    direction_raw=None,
+                    amount=Decimal("0.00"),
+                    is_failed=False,
+                    is_ambiguous=True,
+                    ambiguity_reason="UNSIGNED_AMOUNT",
+                )
+            )
 
         return cards
