@@ -278,6 +278,35 @@ class AdapterCatalog:
         return adapter
 
 
+def build_default_adapter_catalog() -> AdapterCatalog:
+    """Builds the default application adapter catalog with all supported provider adapters."""
+    from .ingestion_bca_adapter import BCAMonthlyStatementAdapter
+    from .ingestion_blu_mutation_adapter import BluAccountMutationAdapter
+    from .ingestion_gopay_adapter import GoPayEStatementAdapter
+    from .ingestion_jago_adapter import JagoMonthlyStatementAdapter
+    from .ingestion_seabank_adapter import SeaBankMonthlyStatementAdapter
+    from .ingestion_shopee_orders_adapter import ShopeeOrdersReceiptAdapter
+    from .ingestion_shopeepay_adapter import ShopeePayTransactionHistoryImageAdapter
+    from .ingestion_stockbit_adapter import StockbitStatementAdapter
+
+    return AdapterCatalog(
+        (
+            BCAMonthlyStatementAdapter(),
+            JagoMonthlyStatementAdapter(),
+            BluAccountMutationAdapter(),
+            GoPayEStatementAdapter(),
+            SeaBankMonthlyStatementAdapter(),
+            ShopeePayTransactionHistoryImageAdapter(),
+            StockbitStatementAdapter(),
+            ShopeeOrdersReceiptAdapter(),
+        )
+    )
+
+
+get_default_adapter_catalog = build_default_adapter_catalog
+build_application_adapter_catalog = build_default_adapter_catalog
+
+
 PreflightFunction = Callable[..., DocumentPreflight]
 
 
@@ -1372,8 +1401,11 @@ __all__ = [
     "ReadOnlyRegistryAuthority",
     "SEMANTIC_DOCUMENT_VERSION",
     "SqliteRegistryAuthority",
+    "build_application_adapter_catalog",
+    "build_default_adapter_catalog",
     "dry_run_artifact",
     "dry_run_batch",
+    "get_default_adapter_catalog",
     "safe_dry_run_batch_json",
     "safe_dry_run_document_view",
     "semantic_document_canonical_json",

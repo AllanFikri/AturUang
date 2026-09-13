@@ -759,8 +759,22 @@ class CommerceOrderEvidence:
     amount_components: tuple[AmountComponentEvidence, ...] = field(
         default_factory=tuple
     )
+    canonical_match_required: bool = True
+    cash_movement_emitted: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.canonical_match_required) is not bool:
+            raise AdapterContractError(
+                "canonical_match_required must be a bool"
+            )
+        if type(self.cash_movement_emitted) is not bool:
+            raise AdapterContractError(
+                "cash_movement_emitted must be a bool"
+            )
+        if self.cash_movement_emitted:
+            raise AdapterContractError(
+                "cash_movement_emitted must be False"
+            )
         object.__setattr__(
             self,
             "order_native_id_raw",

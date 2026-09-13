@@ -8,6 +8,7 @@ preliminary CommerceOrderEvidence without cash movement.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import datetime
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
@@ -85,7 +86,7 @@ def parse_id_amount(raw: str) -> Decimal:
     """Parse Indonesian formatted currency string (e.g. 'Rp187.345' or 'Rp 187.345,00') into Decimal."""
     cleaned = re.sub(r"[^\d,\.]", "", raw).strip()
     if not cleaned:
-        raise ValueError(f"Cannot parse nominal from empty or invalid raw value: {raw!r}")
+        raise ValueError("Cannot parse nominal from invalid amount value")
     if "," in cleaned and "." in cleaned:
         cleaned = cleaned.replace(".", "").replace(",", ".")
     elif "." in cleaned and len(cleaned.split(".")[-1]) == 3:
@@ -96,24 +97,42 @@ def parse_id_amount(raw: str) -> Decimal:
 
 
 def parse_order_date(raw: str) -> str | None:
-    """Parse Indonesian order date (DD/MM/YYYY or YYYY-MM-DD) into ISO YYYY-MM-DD string."""
+    """Parse Indonesian order date (DD/MM/YYYY or YYYY-MM-DD) into ISO YYYY-MM-DD string with strict calendar validation."""
+    if not raw or not raw.strip():
+        return None
     raw = raw.strip()
     m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", raw)
     if m:
-        d, mth, y = m.groups()
-        return f"{int(y):04d}-{int(mth):02d}-{int(d):02d}"
+        d_str, mth_str, y_str = m.groups()
+        try:
+            d_val, mth_val, y_val = int(d_str), int(mth_str), int(y_str)
+            return datetime.date(y_val, mth_val, d_val).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
     m2 = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", raw)
     if m2:
-        y, mth, d = m2.groups()
-        return f"{int(y):04d}-{int(mth):02d}-{int(d):02d}"
+        y_str, mth_str, d_str = m2.groups()
+        try:
+            y_val, mth_val, d_val = int(y_str), int(mth_str), int(d_str)
+            return datetime.date(y_val, mth_val, d_val).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
     return None
 
 
 def build_natural_document_key(order_number: str | None) -> str | None:
-    """Deterministic natural document key for Shopee Orders: provider:receipt:<order_number>."""
+    """Deterministic natural document key for Shopee Orders:
+    shopee_orders:receipt:<order_identity_token>
+    where order_identity_token = SHA256("shopee_orders|receipt|" + normalized_order_id)
+    and normalized_order_id = trim + uppercase.
+    """
     if not order_number or not order_number.strip():
         return None
-    return f"{SHOPEE_ORDERS_SOURCE_REGISTRY_ID}:receipt:{order_number.strip()}"
+    normalized_order_id = order_number.strip().upper()
+    identity_token = sha256(
+        f"{SHOPEE_ORDERS_SOURCE_REGISTRY_ID}|receipt|{normalized_order_id}".encode("utf-8")
+    ).hexdigest()
+    return f"{SHOPEE_ORDERS_SOURCE_REGISTRY_ID}:receipt:{identity_token}"
 
 
 def extract_order_regions(lines: Sequence[str]) -> tuple[dict[str, list[str]], list[SafeDiagnostic]]:
@@ -342,13 +361,21 @@ def extract_order_identity(
         )
     if not parsed_order_date:
         review_required = True
-        if not review_reason:
-            review_reason = "MISSING_ORDER_DATE"
+        if order_date_raw:
+            code = "INVALID_ORDER_DATE"
+            msg = "Authoritative order date is invalid or impossible calendar date."
+            if not review_reason:
+                review_reason = "INVALID_ORDER_DATE"
+        else:
+            code = "MISSING_ORDER_DATE"
+            msg = "Authoritative order date missing from summary region."
+            if not review_reason:
+                review_reason = "MISSING_ORDER_DATE"
         diagnostics.append(
             SafeDiagnostic(
-                code="MISSING_ORDER_DATE",
+                code=code,
                 severity=DiagnosticSeverity.WARNING,
-                message="Authoritative order date missing from summary region.",
+                message=msg,
             )
         )
     if total_payment is None:
@@ -561,6 +588,11 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
             and identity.total_payment is not None
         ):
             # Emit preliminary CommerceOrderEvidence
+            normalized_order_id = identity.order_number.strip().upper()
+            order_token = sha256(
+                f"{SHOPEE_ORDERS_SOURCE_REGISTRY_ID}|receipt|{normalized_order_id}".encode("utf-8")
+            ).hexdigest()
+
             evidence = CommerceOrderEvidence(
                 order_native_id_raw=identity.order_number,
                 order_date=identity.order_date,
@@ -572,10 +604,12 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
                 recipient_raw=identity.recipient_name,
                 line_items=(),
                 amount_components=(),
+                canonical_match_required=True,
+                cash_movement_emitted=False,
             )
 
             row_fp = sha256(
-                f"{source.source_document_id}:order:{identity.order_number}".encode("utf-8")
+                f"{source.source_document_id}:order:{order_token}".encode("utf-8")
             ).hexdigest()
 
             events.append(
@@ -586,7 +620,7 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
                     parser_version=self.descriptor.parser_version,
                     source_channel=self.descriptor.source_channel,
                     event_role=EventRole.COMMERCE_ORDER,
-                    source_event_id=identity.order_number,
+                    source_event_id=order_token,
                     row_fingerprint=row_fp,
                     evidence_quality=ConfidenceLevel.HIGH,
                     parse_confidence=ConfidenceLevel.HIGH,

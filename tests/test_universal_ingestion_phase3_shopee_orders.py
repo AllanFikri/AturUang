@@ -1,6 +1,6 @@
 """Unit tests for Universal Ingestion Phase 3: Shopee Orders Receipt PDF Adapter Skeleton.
 
-Covers exactly 24 focused test methods:
+Covers exactly 30 focused test methods:
 1. Descriptor identity.
 2. Valid template recognition.
 3. Single marker cannot establish template.
@@ -25,6 +25,12 @@ Covers exactly 24 focused test methods:
 22. Commerce evidence uses neutral/non-cash behavior.
 23. Canonical matching is required.
 24. Diagnostics do not leak private fixture values.
+25. Real application catalog selects Shopee Orders adapter.
+26. Natural key does not expose raw order ID.
+27. Explicit canonical_match_required is True.
+28. CommerceOrderEvidence rejects cash_movement_emitted=True.
+29. Impossible calendar date fails closed.
+30. Valid leap date is accepted.
 """
 
 from __future__ import annotations
@@ -50,7 +56,10 @@ from aturuang.ingestion_contracts import (
     SourceChannel,
     TemplateMatchStatus,
 )
-from aturuang.ingestion_orchestration import AdapterCatalog
+from aturuang.ingestion_orchestration import (
+    AdapterCatalog,
+    build_default_adapter_catalog,
+)
 from aturuang.ingestion_preflight import (
     SOURCE_TEMPLATE_SIGNATURES_V1,
     detect_template,
@@ -241,15 +250,15 @@ class TestUniversalIngestionPhase3ShopeeOrders(unittest.TestCase):
 
     # 6. Universal adapter routing
     def test_06_universal_adapter_routing(self) -> None:
-        adapter = ShopeeOrdersReceiptAdapter()
-        catalog = AdapterCatalog((adapter,))
+        catalog = build_default_adapter_catalog()
         selected = catalog.select(
             source_registry_id=SHOPEE_ORDERS_SOURCE_REGISTRY_ID,
             template_id=SHOPEE_ORDERS_TEMPLATE_ID,
             parser_version=SHOPEE_ORDERS_PARSER_VERSION,
             source_channel=SourceChannel.PDF,
         )
-        self.assertIs(selected, adapter)
+        self.assertIsNotNone(selected)
+        self.assertIsInstance(selected, ShopeeOrdersReceiptAdapter)
         self.assertEqual(selected.descriptor.adapter_id, SHOPEE_ORDERS_ADAPTER_ID)
 
     # 7. Valid order ID extraction
@@ -321,10 +330,13 @@ Nota Pesanan
 
     # 12. Natural document key stability
     def test_12_natural_document_key_stability(self) -> None:
-        key1 = build_natural_document_key("260508SYNTH001")
-        key2 = build_natural_document_key("260508SYNTH001")
+        raw_order_id = "260508SYNTH001"
+        key1 = build_natural_document_key(raw_order_id)
+        key2 = build_natural_document_key(raw_order_id)
         self.assertEqual(key1, key2)
-        self.assertEqual(key1, "shopee_orders:receipt:260508SYNTH001")
+        expected_token = sha256(f"shopee_orders|receipt|{raw_order_id.upper()}".encode("utf-8")).hexdigest()
+        self.assertEqual(key1, f"shopee_orders:receipt:{expected_token}")
+        self.assertNotIn(raw_order_id, key1)
 
     # 13. Filename does not affect natural identity
     def test_13_filename_does_not_affect_natural_identity(self) -> None:
@@ -355,7 +367,10 @@ Nota Pesanan
         res1 = adapter.parse(inp1)
         res2 = adapter.parse(inp2)
         self.assertEqual(res1.natural_document_key_candidate, res2.natural_document_key_candidate)
-        self.assertEqual(res1.natural_document_key_candidate, "shopee_orders:receipt:260508SYNTH001")
+        raw_order_id = "260508SYNTH001"
+        expected_token = sha256(f"shopee_orders|receipt|{raw_order_id.upper()}".encode("utf-8")).hexdigest()
+        self.assertEqual(res1.natural_document_key_candidate, f"shopee_orders:receipt:{expected_token}")
+        self.assertNotIn(raw_order_id, res1.natural_document_key_candidate)
 
     # 16. Missing order ID requires review
     def test_16_missing_order_id_requires_review(self) -> None:
@@ -490,9 +505,11 @@ Nota Pesanan
         pdf_bytes = make_multipage_pdf([SYNTHETIC_RECEIPT_TEXT])
         inp = self._make_adapter_input(payload=pdf_bytes)
         res = adapter.parse(inp)
-        # Order skeleton evidence requires cross-source matching to determine financial ledger effects
-        self.assertTrue(any(d.code == "ORDER_DETAILS_NOT_PARSED" for d in res.diagnostics))
-        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertEqual(len(res.events), 1)
+        ev = res.events[0]
+        self.assertIsInstance(ev.payload, CommerceOrderEvidence)
+        self.assertIs(ev.payload.canonical_match_required, True)
+        self.assertIs(ev.payload.cash_movement_emitted, False)
 
     # 24. Diagnostics do not leak private fixture values
     def test_24_diagnostics_do_not_leak_private_values(self) -> None:
@@ -519,6 +536,156 @@ Nota Pesanan
             self.assertNotIn("260508SECRETID123", diag.code)
             self.assertNotIn("260508SECRETID123", diag.message)
             self.assertNotIn("999.999", diag.message)
+
+    # 25. Real application catalog selects Shopee Orders adapter
+    def test_25_real_application_catalog_selects_shopee_orders(self) -> None:
+        catalog = build_default_adapter_catalog()
+        selected = catalog.select(
+            source_registry_id="shopee_orders",
+            template_id="shopee_order_receipt_v1",
+            parser_version="parser-v1",
+            source_channel=SourceChannel.PDF,
+        )
+        self.assertIsNotNone(selected)
+        self.assertIsInstance(selected, ShopeeOrdersReceiptAdapter)
+        # Confirm existing adapters remain selectable
+        self.assertIsNotNone(
+            catalog.select(
+                source_registry_id="bca_statement",
+                template_id="bca_monthly_statement_v1",
+                parser_version="parser-v1",
+                source_channel=SourceChannel.PDF,
+            )
+        )
+        self.assertIsNotNone(
+            catalog.select(
+                source_registry_id="jago_statement",
+                template_id="jago_monthly_statement_v1",
+                parser_version="parser-v1",
+                source_channel=SourceChannel.PDF,
+            )
+        )
+        self.assertIsNotNone(
+            catalog.select(
+                source_registry_id="stockbit_soa",
+                template_id="stockbit_soa_v1",
+                parser_version="parser-v1",
+                source_channel=SourceChannel.PDF,
+            )
+        )
+
+    # 26. Natural key does not expose raw order ID
+    def test_26_natural_key_does_not_expose_raw_order_id(self) -> None:
+        raw_order_id = "260508SYNTH999SECRET"
+        key = build_natural_document_key(raw_order_id)
+        self.assertIsNotNone(key)
+        self.assertNotIn(raw_order_id, key)
+        self.assertNotIn(raw_order_id.lower(), key.lower())
+        # Check requirements:
+        # 1. same order ID produces the same natural key
+        self.assertEqual(key, build_natural_document_key(raw_order_id))
+        self.assertEqual(key, build_natural_document_key(f"  {raw_order_id}  "))
+        # 2. different order IDs produce different keys
+        key_other = build_natural_document_key("260508SYNTH999OTHER")
+        self.assertNotEqual(key, key_other)
+        # 3. raw order ID is not substring of key
+        self.assertFalse(raw_order_id in key)
+
+    # 27. Explicit canonical_match_required is True
+    def test_27_explicit_canonical_match_required_is_true(self) -> None:
+        adapter = ShopeeOrdersReceiptAdapter()
+        pdf_bytes = make_multipage_pdf([SYNTHETIC_RECEIPT_TEXT])
+        inp = self._make_adapter_input(payload=pdf_bytes)
+        res = adapter.parse(inp)
+        self.assertEqual(len(res.events), 1)
+        payload = res.events[0].payload
+        self.assertIsInstance(payload, CommerceOrderEvidence)
+        self.assertIs(payload.canonical_match_required, True)
+        self.assertIs(type(payload.canonical_match_required), bool)
+
+    # 28. CommerceOrderEvidence rejects cash_movement_emitted=True
+    def test_28_commerce_order_evidence_rejects_cash_movement_emitted_true(self) -> None:
+        with self.assertRaises(AdapterContractError):
+            CommerceOrderEvidence(
+                order_native_id_raw="ORD123",
+                order_date="2026-05-08",
+                order_total=Decimal("10000"),
+                currency="IDR",
+                cash_movement_emitted=True,
+            )
+        with self.assertRaises(AdapterContractError):
+            CommerceOrderEvidence(
+                order_native_id_raw="ORD123",
+                order_date="2026-05-08",
+                order_total=Decimal("10000"),
+                currency="IDR",
+                canonical_match_required="true",  # type: ignore
+            )
+
+    # 29. Impossible calendar date fails closed
+    def test_29_impossible_calendar_date_fails_closed(self) -> None:
+        impossible_dates = ["31/02/2026", "00/05/2026", "15/13/2026", "2026-02-30"]
+        for bad_date in impossible_dates:
+            text = f"""Nama Penjual:
+Toko Sintetis
+No. Pesanan
+Tanggal Transaksi
+Metode Pembayaran
+Jasa Kirim
+260508SYNTH001
+{bad_date}
+Saldo ShopeePay
+Reguler
+Subtotal
+Rp50.000
+Total Pembayaran
+Rp50.000
+Nama Pembeli:
+Pembeli
+Rincian Pesanan
+Barang A
+Nota Pesanan
+"""
+            adapter = ShopeeOrdersReceiptAdapter()
+            pdf_bytes = make_multipage_pdf([text])
+            inp = self._make_adapter_input(payload=pdf_bytes)
+            res = adapter.parse(inp)
+            self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+            self.assertTrue(
+                any(d.code in ("INVALID_ORDER_DATE", "MISSING_ORDER_DATE") for d in res.diagnostics),
+                f"Failed to catch invalid date: {bad_date}"
+            )
+
+    # 30. Valid leap date is accepted
+    def test_30_valid_leap_date_is_accepted(self) -> None:
+        leap_text = """Nama Penjual:
+Toko Sintetis
+No. Pesanan
+Tanggal Transaksi
+Metode Pembayaran
+Jasa Kirim
+260508SYNTHLEAP
+29/02/2024
+Saldo ShopeePay
+Reguler
+Subtotal
+Rp50.000
+Total Pembayaran
+Rp50.000
+Nama Pembeli:
+Pembeli
+Rincian Pesanan
+Barang A
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        pdf_bytes = make_multipage_pdf([leap_text])
+        inp = self._make_adapter_input(payload=pdf_bytes)
+        res = adapter.parse(inp)
+        self.assertEqual(len(res.events), 1)
+        self.assertEqual(res.events[0].payload.order_date, "2024-02-29")
+        self.assertEqual(res.period_start, "2024-02-29")
+        self.assertEqual(res.period_end, "2024-02-29")
 
 
 if __name__ == "__main__":
