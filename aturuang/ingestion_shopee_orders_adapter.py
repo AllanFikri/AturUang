@@ -1,8 +1,8 @@
 """Shopee Orders receipt PDF ingestion adapter for AturUang.
 
-Phase 3.8.2 Adapter Skeleton & Commerce Evidence Foundation.
-Extracts authoritative order identity, order summary fields, and emits
-preliminary CommerceOrderEvidence without cash movement.
+Phase 3.8.3 Full PDF Parser and Commerce Evidence Foundation.
+Extracts authoritative order identity, detailed commerce line items,
+complete payment breakdown components, and exact decimal reconciliation.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from .ingestion_adapter import (
     AdapterInput,
     AdapterParseStatus,
     AdapterResult,
+    AmountComponentEvidence,
+    CommerceLineItemEvidence,
     CommerceOrderEvidence,
     ConfidenceLevel,
     DiagnosticSeverity,
@@ -58,6 +60,10 @@ REQUIRED_TEMPLATE_MARKERS: tuple[str, ...] = (
     "total pembayaran",
 )
 
+TABLE_HEADER_KEYWORDS: frozenset[str] = frozenset(
+    {"no.", "produk", "variasi", "harga produk", "kuantitas", "subtotal", "rincian pesanan"}
+)
+
 
 class ShopeeOrderEvidenceRole(str, Enum):
     COMMERCE_ORDER = "COMMERCE_ORDER"
@@ -82,9 +88,18 @@ class ShopeeOrderDocumentIdentity:
     review_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ShopeeOrderAdapterResult(AdapterResult):
+    order_reconciliation_status: str = "MATCHED"
+    reconciliation_difference: Decimal = Decimal("0.00")
+    order_identity: ShopeeOrderDocumentIdentity | None = None
+
+
 def parse_id_amount(raw: str) -> Decimal:
-    """Parse Indonesian formatted currency string (e.g. 'Rp187.345' or 'Rp 187.345,00') into Decimal."""
-    cleaned = re.sub(r"[^\d,\.]", "", raw).strip()
+    """Parse Indonesian formatted currency string (e.g. 'Rp187.345', '-Rp10.000', or 'Rp 187.345,00') into Decimal."""
+    s = raw.strip()
+    is_neg = s.startswith("-")
+    cleaned = re.sub(r"[^\d,\.]", "", s).strip()
     if not cleaned:
         raise ValueError("Cannot parse nominal from invalid amount value")
     if "," in cleaned and "." in cleaned:
@@ -93,7 +108,8 @@ def parse_id_amount(raw: str) -> Decimal:
         cleaned = cleaned.replace(".", "")
     elif "," in cleaned and len(cleaned.split(",")[-1]) == 2:
         cleaned = cleaned.replace(",", ".")
-    return Decimal(cleaned)
+    val = Decimal(cleaned)
+    return -val if is_neg else val
 
 
 def parse_order_date(raw: str) -> str | None:
@@ -135,22 +151,41 @@ def build_natural_document_key(order_number: str | None) -> str | None:
     return f"{SHOPEE_ORDERS_SOURCE_REGISTRY_ID}:receipt:{identity_token}"
 
 
+def build_stable_line_key(
+    order_token: str,
+    product_name_raw: str,
+    variation_raw: str | None,
+    quantity: Decimal,
+    line_subtotal: Decimal,
+    occurrence_index: int,
+) -> str:
+    """Deterministic stable line key for CommerceLineItemEvidence.
+    Uses privacy-safe natural order token, normalized product, normalized variation,
+    quantity, line subtotal, and occurrence index.
+    """
+    norm_p = " ".join(product_name_raw.strip().lower().split())
+    norm_v = " ".join(variation_raw.strip().lower().split()) if variation_raw else ""
+    raw_sig = f"{order_token}|{norm_p}|{norm_v}|{quantity}|{line_subtotal}|{occurrence_index}"
+    token = sha256(raw_sig.encode("utf-8")).hexdigest()
+    return f"shopee_orders:line:{token}"
+
+
 def extract_order_regions(lines: Sequence[str]) -> tuple[dict[str, list[str]], list[SafeDiagnostic]]:
     """Extract bounded textual regions from Shopee order receipt lines."""
     diagnostics: list[SafeDiagnostic] = []
-    
+
     header_lines: list[str] = []
     summary_lines: list[str] = []
     payment_lines: list[str] = []
     buyer_lines: list[str] = []
     item_lines: list[str] = []
-    
+
     idx_seller = None
     idx_pesanan = None
     idx_payment = None
     idx_buyer = None
     idx_items = None
-    
+
     for i, line in enumerate(lines):
         ll = line.lower()
         if idx_seller is None and "nama penjual" in ll:
@@ -167,22 +202,22 @@ def extract_order_regions(lines: Sequence[str]) -> tuple[dict[str, list[str]], l
     n = len(lines)
     s_end = idx_pesanan if idx_pesanan is not None else n
     header_lines = list(lines[0:s_end])
-    
+
     if idx_pesanan is not None:
         p_end = idx_payment if idx_payment is not None else (idx_buyer if idx_buyer is not None else n)
         summary_lines = list(lines[idx_pesanan:p_end])
-        
+
     if idx_payment is not None:
         b_end = idx_buyer if idx_buyer is not None else (idx_items if idx_items is not None else n)
         payment_lines = list(lines[idx_payment:b_end])
-        
+
     if idx_buyer is not None:
         i_end = idx_items if idx_items is not None else n
         buyer_lines = list(lines[idx_buyer:i_end])
-        
+
     if idx_items is not None:
         item_lines = list(lines[idx_items:])
-        
+
     regions = {
         "header": header_lines,
         "summary": summary_lines,
@@ -202,12 +237,12 @@ def extract_order_identity(
     diagnostics: list[SafeDiagnostic] = []
     regions, region_diags = extract_order_regions(lines)
     diagnostics.extend(region_diags)
-    
+
     summary_lines = regions["summary"]
     header_lines = regions["header"]
     payment_lines = regions["payment"]
     buyer_lines = regions["buyer"]
-    
+
     # 1. Seller Extraction
     seller_name: str | None = None
     for i, l in enumerate(header_lines):
@@ -227,10 +262,10 @@ def extract_order_identity(
     order_date_raw: str | None = None
     payment_method: str | None = None
     shipping_service: str | None = None
-    
+
     candidate_order_ids: list[str] = []
     candidate_dates: list[str] = []
-    
+
     # Inline check
     for l in summary_lines:
         m_oid = re.search(r"no\.?\s*pesanan\s*[:]\s*([a-zA-Z0-9]+)", l, re.IGNORECASE)
@@ -245,7 +280,7 @@ def extract_order_identity(
         m_ss = re.search(r"jasa\s*kirim\s*[:]\s*([^\n\r]+)", l, re.IGNORECASE)
         if m_ss:
             shipping_service = m_ss.group(1).strip()
-            
+
     # Columnar table layout check
     if not candidate_order_ids or not candidate_dates:
         headers = ["no. pesanan", "tanggal transaksi", "metode pembayaran", "jasa kirim"]
@@ -273,10 +308,10 @@ def extract_order_identity(
     # Conflicting checks in order summary
     unique_candidate_oids = list(dict.fromkeys(candidate_order_ids))
     unique_candidate_dates = list(dict.fromkeys(candidate_dates))
-    
+
     review_required = False
     review_reason = None
-    
+
     if len(unique_candidate_oids) > 1:
         review_required = True
         review_reason = "CONFLICTING_ORDER_IDS"
@@ -292,7 +327,7 @@ def extract_order_identity(
         order_id = unique_candidate_oids[0]
     else:
         order_id = None
-        
+
     if len(unique_candidate_dates) > 1:
         review_required = True
         review_reason = "CONFLICTING_ORDER_DATES"
@@ -411,6 +446,284 @@ def extract_order_identity(
     return identity, diagnostics
 
 
+def extract_order_line_items(
+    lines: Sequence[str],
+    order_token: str,
+    page_elements: Sequence[Sequence[tuple[float, float, str]]] | None = None,
+) -> tuple[tuple[CommerceLineItemEvidence, ...], list[SafeDiagnostic], bool, str | None]:
+    """Extract physical line items from Rincian Pesanan section."""
+    diagnostics: list[SafeDiagnostic] = []
+    review_required = False
+    review_reason = None
+
+    idx_r = None
+    for i, l in enumerate(lines):
+        if l.lower() == "rincian pesanan":
+            idx_r = i
+            break
+
+    if idx_r is None:
+        return (), diagnostics, False, None
+
+    # Slice table lines up to section endings
+    table_lines: list[str] = []
+    for l in lines[idx_r + 1:]:
+        ll = l.lower()
+        if any(term in ll for term in ["nota pesanan", "pt shopee international", "catatan pembeli", "faktur pesanan"]):
+            break
+        table_lines.append(l)
+
+    clean_lines = [l for l in table_lines if l.lower() not in TABLE_HEADER_KEYWORDS]
+
+    # Coordinate lookup if available
+    all_pel: list[tuple[float, float, str]] = []
+    if page_elements:
+        for pel in page_elements:
+            all_pel.extend(pel)
+
+    items: list[CommerceLineItemEvidence] = []
+    occurrence_tracker: dict[tuple[str, str, str, str], int] = {}
+
+    i = 0
+    while i < len(clean_lines):
+        if i < len(clean_lines) and clean_lines[i].isdigit() and int(clean_lines[i]) == len(items) + 1:
+            ord_val = int(clean_lines[i])
+            i += 1
+            k = i
+            found = False
+            while k + 2 < len(clean_lines):
+                if (
+                    "rp" in clean_lines[k].lower()
+                    and clean_lines[k + 1].isdigit()
+                    and "rp" in clean_lines[k + 2].lower()
+                ):
+                    try:
+                        p_amt = parse_id_amount(clean_lines[k])
+                        q_amt = Decimal(clean_lines[k + 1])
+                        s_amt = parse_id_amount(clean_lines[k + 2])
+                        if p_amt * q_amt == s_amt:
+                            mid = clean_lines[i:k]
+                            prod_parts: list[str] = []
+                            var_parts: list[str] = []
+
+                            # Separate using coordinates when present
+                            if all_pel:
+                                for ml in mid:
+                                    # check if this line has variation prefix or tab
+                                    if "\t" in ml:
+                                        p_s, v_s = ml.split("\t", 1)
+                                        prod_parts.append(p_s.strip())
+                                        var_parts.append(v_s.strip())
+                                    elif ml.lower().startswith("variasi:"):
+                                        var_parts.append(ml[len("variasi:"):].strip())
+                                    else:
+                                        xs = [el[1] for el in all_pel if el[2] == ml]
+                                        if xs:
+                                            x_val = xs[0]
+                                            if 600 <= x_val < 750:
+                                                var_parts.append(ml)
+                                            else:
+                                                prod_parts.append(ml)
+                                        else:
+                                            prod_parts.append(ml)
+                            else:
+                                # Fallback when no coordinates (e.g. synthetic fixtures)
+                                for ml in mid:
+                                    if "\t" in ml:
+                                        p_s, v_s = ml.split("\t", 1)
+                                        prod_parts.append(p_s.strip())
+                                        var_parts.append(v_s.strip())
+                                    elif ml.lower().startswith("variasi:"):
+                                        var_parts.append(ml[len("variasi:"):].strip())
+                                    else:
+                                        prod_parts.append(ml)
+
+                            p_name = " ".join(prod_parts).strip()
+                            v_name = " ".join(var_parts).strip() if var_parts else None
+
+                            if not p_name:
+                                p_name = f"Item {ord_val}"
+
+                            # Stable line key calculation
+                            norm_p = " ".join(p_name.strip().lower().split())
+                            norm_v = " ".join(v_name.strip().lower().split()) if v_name else ""
+                            sig_tuple = (norm_p, norm_v, str(q_amt), str(s_amt))
+                            occurrence_tracker[sig_tuple] = occurrence_tracker.get(sig_tuple, 0) + 1
+                            occ_idx = occurrence_tracker[sig_tuple]
+
+                            line_key = build_stable_line_key(
+                                order_token=order_token,
+                                product_name_raw=p_name,
+                                variation_raw=v_name,
+                                quantity=q_amt,
+                                line_subtotal=s_amt,
+                                occurrence_index=occ_idx,
+                            )
+
+                            items.append(
+                                CommerceLineItemEvidence(
+                                    line_key=line_key,
+                                    product_name_raw=p_name,
+                                    quantity=q_amt,
+                                    line_subtotal=s_amt,
+                                    currency="IDR",
+                                    variation_raw=v_name,
+                                )
+                            )
+                            i = k + 3
+                            found = True
+                            break
+                    except Exception:
+                        pass
+                k += 1
+            if not found:
+                i += 1
+        else:
+            i += 1
+
+    return tuple(items), diagnostics, review_required, review_reason
+
+
+def extract_order_amount_components(
+    lines: Sequence[str],
+) -> tuple[tuple[AmountComponentEvidence, ...], list[SafeDiagnostic], bool, str | None]:
+    """Extract payment breakdown components and validate unknown items."""
+    diagnostics: list[SafeDiagnostic] = []
+    review_required = False
+    review_reason = None
+
+    idx_start = None
+    idx_end = None
+    for i, l in enumerate(lines):
+        ll = l.lower()
+        if idx_start is None and "total pembayaran" in ll:
+            idx_start = i
+        if idx_start is not None and i > idx_start:
+            if any(k in ll for k in ["biaya-biaya yang ditagihkan", "nama pembeli", "rincian pesanan"]):
+                idx_end = i
+                break
+
+    pay_lines = lines[idx_start:idx_end] if idx_start is not None and idx_end is not None else []
+    if not pay_lines and idx_start is not None:
+        pay_lines = list(lines[idx_start:])
+
+    raw_pairs: list[tuple[str, str]] = []
+    j = 0
+    while j < len(pay_lines):
+        line = pay_lines[j].strip()
+        m = re.match(r"^([^:\n]+)[:]\s*(.*(?:rp|-rp|[0-9]).*)$", line, re.IGNORECASE)
+        if m and "rp" in m.group(2).lower():
+            raw_pairs.append((m.group(1).strip(), m.group(2).strip()))
+            j += 1
+        elif j + 1 < len(pay_lines) and ("rp" in pay_lines[j + 1].lower() or "-rp" in pay_lines[j + 1].lower()):
+            raw_pairs.append((line, pay_lines[j + 1].strip()))
+            j += 2
+        else:
+            j += 1
+
+    components: list[AmountComponentEvidence] = []
+    for lbl, raw_amt_str in raw_pairs:
+        try:
+            raw_amt = parse_id_amount(raw_amt_str)
+            ll = lbl.lower()
+
+            # Classification
+            if any(k in ll for k in ["subtotal pesanan", "subtotal produk"]):
+                amt = abs(raw_amt)
+            elif any(k in ll for k in ["subtotal pengiriman"]):
+                amt = abs(raw_amt)
+            elif any(k in ll for k in ["biaya layanan", "biaya penanganan", "total proteksi produk"]):
+                amt = abs(raw_amt)
+            elif any(k in ll for k in ["voucher toko", "voucher penjual", "diskon voucher toko", "diskon penjual"]):
+                amt = -abs(raw_amt)
+            elif any(k in ll for k in ["voucher shopee", "diskon voucher shopee", "diskon shopee", "promosi metode pembayaran"]):
+                amt = -abs(raw_amt)
+            elif any(k in ll for k in ["diskon pengiriman", "potongan ongkir", "voucher diskon pengiriman"]):
+                amt = -abs(raw_amt)
+            elif "koin shopee" in ll:
+                amt = -abs(raw_amt)
+            elif "total pembayaran" in ll:
+                amt = abs(raw_amt)
+            else:
+                amt = raw_amt
+                review_required = True
+                review_reason = "UNKNOWN_ORDER_AMOUNT_COMPONENT"
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="UNKNOWN_ORDER_AMOUNT_COMPONENT",
+                        severity=DiagnosticSeverity.WARNING,
+                        message="Unknown order amount component encountered in payment breakdown.",
+                    )
+                )
+
+            components.append(
+                AmountComponentEvidence(
+                    label_raw=lbl,
+                    amount=amt,
+                    currency="IDR",
+                    direction_raw="CREDIT" if amt < 0 else "DEBIT",
+                )
+            )
+        except Exception:
+            pass
+
+    return tuple(components), diagnostics, review_required, review_reason
+
+
+def reconcile_order(
+    total_payment: Decimal | None,
+    components: Sequence[AmountComponentEvidence],
+) -> tuple[str, Decimal, list[SafeDiagnostic], bool, str | None]:
+    """Perform exact Decimal order reconciliation equation.
+    item subtotal + shipping fee + service fees - discounts - coins == total payment
+    """
+    diagnostics: list[SafeDiagnostic] = []
+
+    if total_payment is None:
+        return "INSUFFICIENT_SOURCE_DETAIL", Decimal("0.00"), diagnostics, True, "MISSING_TOTAL_PAYMENT"
+
+    # Find subtotal
+    subtotal = None
+    shipping = Decimal("0.00")
+    service_fees = Decimal("0.00")
+    discounts = Decimal("0.00")
+    coins = Decimal("0.00")
+
+    has_subtotal = False
+
+    for c in components:
+        ll = c.label_raw.lower()
+        if any(k in ll for k in ["subtotal pesanan", "subtotal produk"]):
+            subtotal = c.amount
+            has_subtotal = True
+        elif any(k in ll for k in ["subtotal pengiriman"]):
+            shipping += c.amount
+        elif any(k in ll for k in ["biaya layanan", "biaya penanganan", "total proteksi produk"]):
+            service_fees += c.amount
+        elif any(k in ll for k in ["voucher toko", "voucher penjual", "diskon voucher toko", "voucher shopee", "diskon voucher shopee", "diskon shopee", "promosi metode pembayaran", "diskon pengiriman", "potongan ongkir"]):
+            discounts += abs(c.amount)
+        elif "koin shopee" in ll:
+            coins += abs(c.amount)
+
+    if not has_subtotal or subtotal is None:
+        return "INSUFFICIENT_SOURCE_DETAIL", Decimal("0.00"), diagnostics, False, None
+
+    calculated_total = subtotal + shipping + service_fees - discounts - coins
+    diff = calculated_total - total_payment
+
+    if diff == Decimal("0.00"):
+        return "MATCHED", Decimal("0.00"), diagnostics, False, None
+    else:
+        diagnostics.append(
+            SafeDiagnostic(
+                code="ORDER_TOTAL_MISMATCH",
+                severity=DiagnosticSeverity.WARNING,
+                message="Order total does not match sum of breakdown components.",
+            )
+        )
+        return "MISMATCH", diff, diagnostics, True, "ORDER_TOTAL_MISMATCH"
+
+
 class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
     """Universal Source Adapter for Shopee Orders receipt PDFs."""
 
@@ -431,10 +744,11 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
             source_channel=SourceChannel.PDF,
         )
 
-    def parse(self, source: AdapterInput) -> AdapterResult:
+    def parse(self, source: AdapterInput) -> ShopeeOrderAdapterResult:
         validate_adapter_input(self.descriptor, source)
 
         diagnostics: list[SafeDiagnostic] = []
+        page_elements: list[list[tuple[float, float, str]]] = []
 
         # 1. PDF Parsing & Text Layer Extraction
         pages_text: list[str] = []
@@ -444,7 +758,7 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
             try:
                 reader = self._pdf_reader_factory(BytesIO(source.binary_payload))
                 if reader.is_encrypted:
-                    return AdapterResult(
+                    return ShopeeOrderAdapterResult(
                         descriptor=self.descriptor,
                         source_document_id=source.source_document_id,
                         parse_status=AdapterParseStatus.FAILED,
@@ -462,7 +776,7 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
                         ),
                     )
                 if not reader.pages:
-                    return AdapterResult(
+                    return ShopeeOrderAdapterResult(
                         descriptor=self.descriptor,
                         source_document_id=source.source_document_id,
                         parse_status=AdapterParseStatus.FAILED,
@@ -479,10 +793,22 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
                             ),
                         ),
                     )
-                pages_text = [p.extract_text() or "" for p in reader.pages]
+
+                for page in reader.pages:
+                    pel: list[tuple[float, float, str]] = []
+
+                    def visitor(text: str, cm: Sequence[float], tm: Sequence[float], font_dict: object, font_size: float) -> None:
+                        t = text.strip()
+                        if t:
+                            pel.append((tm[5], tm[4], t))
+
+                    page_txt = page.extract_text(visitor_text=visitor) or ""
+                    pages_text.append(page_txt)
+                    page_elements.append(pel)
+
                 full_text = "\n".join(pages_text)
             except Exception:
-                return AdapterResult(
+                return ShopeeOrderAdapterResult(
                     descriptor=self.descriptor,
                     source_document_id=source.source_document_id,
                     parse_status=AdapterParseStatus.FAILED,
@@ -503,7 +829,7 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
             pages_text = [source.text_payload]
             full_text = source.text_payload
         else:
-            return AdapterResult(
+            return ShopeeOrderAdapterResult(
                 descriptor=self.descriptor,
                 source_document_id=source.source_document_id,
                 parse_status=AdapterParseStatus.FAILED,
@@ -523,7 +849,7 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
 
         lines = [l.strip() for l in full_text.splitlines() if l.strip()]
         if not lines:
-            return AdapterResult(
+            return ShopeeOrderAdapterResult(
                 descriptor=self.descriptor,
                 source_document_id=source.source_document_id,
                 parse_status=AdapterParseStatus.FAILED,
@@ -546,7 +872,7 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
         matched_markers = [m for m in REQUIRED_TEMPLATE_MARKERS if m in lower_full_text]
         if len(matched_markers) < len(REQUIRED_TEMPLATE_MARKERS):
             code = "SHOPEE_UNKNOWN_TEMPLATE" if len(matched_markers) <= 1 else "SHOPEE_TEMPLATE_DRIFT"
-            return AdapterResult(
+            return ShopeeOrderAdapterResult(
                 descriptor=self.descriptor,
                 source_document_id=source.source_document_id,
                 parse_status=AdapterParseStatus.FAILED if code == "SHOPEE_UNKNOWN_TEMPLATE" else AdapterParseStatus.REVIEW_REQUIRED,
@@ -572,14 +898,29 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
         )
         diagnostics.extend(ident_diags)
 
-        # Temporary limitation indicator for skeleton stage:
-        diagnostics.append(
-            SafeDiagnostic(
-                code="ORDER_DETAILS_NOT_PARSED",
-                severity=DiagnosticSeverity.INFO,
-                message="Preliminary order skeleton parsed; detailed line items deferred to P3.8.3.",
-            )
+        # 4. Extract Amount Components
+        amt_components, amt_diags, amt_rev, amt_reason = extract_order_amount_components(lines)
+        diagnostics.extend(amt_diags)
+
+        # 5. Reconcile Order
+        recon_status, recon_diff, recon_diags, recon_rev, recon_reason = reconcile_order(
+            total_payment=identity.total_payment,
+            components=amt_components,
         )
+        diagnostics.extend(recon_diags)
+
+        # 6. Extract Line Items
+        normalized_order_id = identity.order_number.strip().upper() if identity.order_number else ""
+        order_token = sha256(
+            f"{SHOPEE_ORDERS_SOURCE_REGISTRY_ID}|receipt|{normalized_order_id}".encode("utf-8")
+        ).hexdigest()
+
+        line_items, item_diags, item_rev, item_reason = extract_order_line_items(
+            lines=lines,
+            order_token=order_token,
+            page_elements=page_elements if page_elements else None,
+        )
+        diagnostics.extend(item_diags)
 
         events: list[NormalizedEventEnvelope] = []
         if (
@@ -587,12 +928,6 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
             and identity.order_date
             and identity.total_payment is not None
         ):
-            # Emit preliminary CommerceOrderEvidence
-            normalized_order_id = identity.order_number.strip().upper()
-            order_token = sha256(
-                f"{SHOPEE_ORDERS_SOURCE_REGISTRY_ID}|receipt|{normalized_order_id}".encode("utf-8")
-            ).hexdigest()
-
             evidence = CommerceOrderEvidence(
                 order_native_id_raw=identity.order_number,
                 order_date=identity.order_date,
@@ -602,14 +937,15 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
                 payment_method_raw=identity.payment_method,
                 shipping_service_raw=identity.shipping_service,
                 recipient_raw=identity.recipient_name,
-                line_items=(),
-                amount_components=(),
+                line_items=line_items,
+                amount_components=amt_components,
                 canonical_match_required=True,
                 cash_movement_emitted=False,
             )
 
+            # Row fingerprint is stable across duplicate files (no source_document_id)
             row_fp = sha256(
-                f"{source.source_document_id}:order:{order_token}".encode("utf-8")
+                f"{SHOPEE_ORDERS_SOURCE_REGISTRY_ID}:order:{order_token}".encode("utf-8")
             ).hexdigest()
 
             events.append(
@@ -635,12 +971,17 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
             )
 
         # Determine final parse status
-        if identity.review_required or not events:
-            final_status = AdapterParseStatus.REVIEW_REQUIRED
-        else:
-            final_status = AdapterParseStatus.REVIEW_REQUIRED
+        has_review = (
+            identity.review_required
+            or amt_rev
+            or recon_rev
+            or item_rev
+            or not events
+            or recon_status != "MATCHED"
+        )
+        final_status = AdapterParseStatus.REVIEW_REQUIRED if has_review else AdapterParseStatus.COMPLETED
 
-        return AdapterResult(
+        return ShopeeOrderAdapterResult(
             descriptor=self.descriptor,
             source_document_id=source.source_document_id,
             parse_status=final_status,
@@ -650,22 +991,31 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
             natural_document_key_candidate=identity.natural_document_key_candidate,
             events=tuple(events),
             diagnostics=tuple(diagnostics),
+            order_reconciliation_status=recon_status,
+            reconciliation_difference=recon_diff,
+            order_identity=identity,
         )
 
 
 __all__ = [
+    "REQUIRED_TEMPLATE_MARKERS",
     "SHOPEE_ORDERS_ADAPTER_ID",
     "SHOPEE_ORDERS_PARSER_VERSION",
     "SHOPEE_ORDERS_SOURCE_REGISTRY_ID",
     "SHOPEE_ORDERS_TEMPLATE_FINGERPRINT",
     "SHOPEE_ORDERS_TEMPLATE_ID",
-    "REQUIRED_TEMPLATE_MARKERS",
+    "TABLE_HEADER_KEYWORDS",
+    "ShopeeOrderAdapterResult",
     "ShopeeOrderDocumentIdentity",
     "ShopeeOrderEvidenceRole",
     "ShopeeOrdersReceiptAdapter",
     "build_natural_document_key",
+    "build_stable_line_key",
+    "extract_order_amount_components",
     "extract_order_identity",
+    "extract_order_line_items",
     "extract_order_regions",
     "parse_id_amount",
     "parse_order_date",
+    "reconcile_order",
 ]

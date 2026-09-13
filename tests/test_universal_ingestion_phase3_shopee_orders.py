@@ -182,6 +182,7 @@ class TestUniversalIngestionPhase3ShopeeOrders(unittest.TestCase):
         self,
         payload: bytes | None = None,
         text_payload: str | None = None,
+        source_document_id: str = "test-shopee-doc-1",
         source_registry_id: str = SHOPEE_ORDERS_SOURCE_REGISTRY_ID,
         template_id: str = SHOPEE_ORDERS_TEMPLATE_ID,
         template_match_status: TemplateMatchStatus = TemplateMatchStatus.KNOWN,
@@ -191,7 +192,7 @@ class TestUniversalIngestionPhase3ShopeeOrders(unittest.TestCase):
             sha256(text_payload.encode()).hexdigest() if text_payload else "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         )
         return AdapterInput(
-            source_document_id="test-shopee-doc-1",
+            source_document_id=source_document_id,
             content_sha256=h,
             source_registry_id=source_registry_id,
             template_id=template_id,
@@ -686,6 +687,699 @@ Nota Pesanan
         self.assertEqual(res.events[0].payload.order_date, "2024-02-29")
         self.assertEqual(res.period_start, "2024-02-29")
         self.assertEqual(res.period_end, "2024-02-29")
+
+
+
+    # 31. Single line item
+    def test_31_single_line_item(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH031
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Tunggal
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 1)
+        item = ev.line_items[0]
+        self.assertEqual(item.product_name_raw, "Barang Tunggal")
+        self.assertIsNone(item.variation_raw)
+        self.assertEqual(item.quantity, Decimal("1"))
+        self.assertEqual(item.line_subtotal, Decimal("50000"))
+
+    # 32. Multiple line items
+    def test_32_multiple_line_items(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH032
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp80.000
+Subtotal Pesanan: Rp80.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Pertama
+Rp30.000
+1
+Rp30.000
+2
+Barang Kedua
+Rp25.000
+2
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 2)
+        self.assertEqual(ev.line_items[0].product_name_raw, "Barang Pertama")
+        self.assertEqual(ev.line_items[0].line_subtotal, Decimal("30000"))
+        self.assertEqual(ev.line_items[1].product_name_raw, "Barang Kedua")
+        self.assertEqual(ev.line_items[1].quantity, Decimal("2"))
+        self.assertEqual(ev.line_items[1].line_subtotal, Decimal("50000"))
+
+    # 33. Wrapped product name
+    def test_33_wrapped_product_name(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH033
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp40.000
+Subtotal Pesanan: Rp40.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Nama Produk Sangat Panjang Baris 1
+Nama Produk Lanjutan Baris 2
+Rp40.000
+1
+Rp40.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 1)
+        item = ev.line_items[0]
+        self.assertEqual(
+            item.product_name_raw,
+            "Nama Produk Sangat Panjang Baris 1 Nama Produk Lanjutan Baris 2",
+        )
+        self.assertIsNone(item.variation_raw)
+
+    # 34. Variation preservation
+    def test_34_variation_preservation(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH034
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp60.000
+Subtotal Pesanan: Rp60.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Baju Kaos Santai
+Variasi: Warna Biru, Ukuran L
+Rp60.000
+1
+Rp60.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 1)
+        item = ev.line_items[0]
+        self.assertEqual(item.product_name_raw, "Baju Kaos Santai")
+        self.assertEqual(item.variation_raw, "Warna Biru, Ukuran L")
+
+    # 35. Quantity parsing
+    def test_35_quantity_parsing(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH035
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp75.000
+Subtotal Pesanan: Rp75.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Buku Catatan
+Rp25.000
+3
+Rp75.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        item = ev.line_items[0]
+        self.assertEqual(item.quantity, Decimal("3"))
+        self.assertEqual(item.line_subtotal, Decimal("75000"))
+
+    # 36. Quantity 150 remains valid
+    def test_36_quantity_150_remains_valid(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH036
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp150.000
+Subtotal Pesanan: Rp150.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Komponen Baut
+Rp1.000
+150
+Rp150.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        item = ev.line_items[0]
+        self.assertEqual(item.quantity, Decimal("150"))
+        self.assertEqual(item.line_subtotal, Decimal("150000"))
+
+    # 37. Line subtotal parsing
+    def test_37_line_subtotal_parsing(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH037
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp123.456
+Subtotal Pesanan: Rp123.456
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Presisi
+Rp123.456
+1
+Rp123.456
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        item = res.events[0].payload.line_items[0]
+        self.assertEqual(item.line_subtotal, Decimal("123456"))
+
+    # 38. Multi-page item continuation
+    def test_38_multipage_item_continuation(self) -> None:
+        p1 = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH038
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp100.000
+Subtotal Pesanan: Rp100.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Halaman 1
+Rp50.000
+1
+Rp50.000
+"""
+        p2 = """Rincian Pesanan
+2
+Barang Halaman 2
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([p1, p2]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 2)
+        self.assertEqual(ev.line_items[0].product_name_raw, "Barang Halaman 1")
+        self.assertEqual(ev.line_items[1].product_name_raw, "Barang Halaman 2")
+
+    # 39. Repeated page header suppression
+    def test_39_repeated_page_header_suppression(self) -> None:
+        p1 = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH039
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp100.000
+Subtotal Pesanan: Rp100.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+No.
+Produk
+Variasi
+Harga Produk
+Kuantitas
+Subtotal
+1
+Barang P1
+Rp50.000
+1
+Rp50.000
+"""
+        p2 = """Rincian Pesanan
+No.
+Produk
+Variasi
+Harga Produk
+Kuantitas
+Subtotal
+2
+Barang P2
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([p1, p2]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 2)
+        for it in ev.line_items:
+            self.assertNotIn("No.", it.product_name_raw)
+            self.assertNotIn("Produk", it.product_name_raw)
+            self.assertNotIn("Subtotal", it.product_name_raw)
+
+    # 40. Payment rows are not products
+    def test_40_payment_rows_are_not_products(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH040
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp65.000
+Subtotal Pesanan: Rp50.000
+Subtotal Pengiriman: Rp10.000
+Biaya Layanan: Rp5.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Valid
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 1)
+        self.assertEqual(ev.line_items[0].product_name_raw, "Barang Valid")
+        prod_names = [it.product_name_raw.lower() for it in ev.line_items]
+        self.assertNotIn("biaya layanan", prod_names)
+        self.assertNotIn("subtotal pengiriman", prod_names)
+        self.assertNotIn("total pembayaran", prod_names)
+
+    # 41. Product subtotal component
+    def test_41_product_subtotal_component(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH041
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        subtotal_comps = [c for c in ev.amount_components if "subtotal pesanan" in c.label_raw.lower()]
+        self.assertEqual(len(subtotal_comps), 1)
+        self.assertEqual(subtotal_comps[0].amount, Decimal("50000"))
+        self.assertGreater(subtotal_comps[0].amount, Decimal("0"))
+
+    # 42. Shipping component
+    def test_42_shipping_component(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH042
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp62.000
+Subtotal Pesanan: Rp50.000
+Subtotal Pengiriman: Rp12.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        ship_comps = [c for c in ev.amount_components if "pengiriman" in c.label_raw.lower()]
+        self.assertEqual(len(ship_comps), 1)
+        self.assertEqual(ship_comps[0].amount, Decimal("12000"))
+        self.assertGreater(ship_comps[0].amount, Decimal("0"))
+
+    # 43. Service-fee component
+    def test_43_service_fee_component(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH043
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp52.000
+Subtotal Pesanan: Rp50.000
+Biaya Layanan: Rp2.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        fee_comps = [c for c in ev.amount_components if "layanan" in c.label_raw.lower()]
+        self.assertEqual(len(fee_comps), 1)
+        self.assertEqual(fee_comps[0].amount, Decimal("2000"))
+        self.assertGreater(fee_comps[0].amount, Decimal("0"))
+
+    # 44. Seller-voucher negative sign
+    def test_44_seller_voucher_negative_sign(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH044
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp45.000
+Subtotal Pesanan: Rp50.000
+Diskon Voucher Toko: -Rp5.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        seller_vouchers = [c for c in ev.amount_components if "toko" in c.label_raw.lower()]
+        self.assertEqual(len(seller_vouchers), 1)
+        self.assertEqual(seller_vouchers[0].amount, Decimal("-5000"))
+        self.assertLess(seller_vouchers[0].amount, Decimal("0"))
+
+    # 45. Shopee-voucher negative sign
+    def test_45_shopee_voucher_negative_sign(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH045
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp40.000
+Subtotal Pesanan: Rp50.000
+Diskon Voucher Shopee: -Rp10.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        shopee_vouchers = [c for c in ev.amount_components if "shopee" in c.label_raw.lower()]
+        self.assertEqual(len(shopee_vouchers), 1)
+        self.assertEqual(shopee_vouchers[0].amount, Decimal("-10000"))
+        self.assertLess(shopee_vouchers[0].amount, Decimal("0"))
+
+    # 46. Shipping-discount negative sign
+    def test_46_shipping_discount_negative_sign(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH046
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Subtotal Pengiriman: Rp10.000
+Diskon Pengiriman: -Rp10.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        ship_discs = [c for c in ev.amount_components if "diskon pengiriman" in c.label_raw.lower()]
+        self.assertEqual(len(ship_discs), 1)
+        self.assertEqual(ship_discs[0].amount, Decimal("-10000"))
+        self.assertLess(ship_discs[0].amount, Decimal("0"))
+
+    # 47. Shopee Coins negative sign
+    def test_47_shopee_coins_negative_sign(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH047
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp49.500
+Subtotal Pesanan: Rp50.000
+500 Koin Shopee Ditukarkan: -Rp500
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        coin_comps = [c for c in ev.amount_components if "koin" in c.label_raw.lower()]
+        self.assertEqual(len(coin_comps), 1)
+        self.assertEqual(coin_comps[0].amount, Decimal("-500"))
+        self.assertLess(coin_comps[0].amount, Decimal("0"))
+
+    # 48. Total payment remains summary evidence
+    def test_48_total_payment_remains_summary_evidence(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH048
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        self.assertEqual(ev.order_total, Decimal("50000"))
+        self.assertIs(ev.cash_movement_emitted, False)
+        self.assertIs(ev.canonical_match_required, True)
+
+    # 49. Exact order equation match
+    def test_49_exact_order_equation_match(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH049
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp78.000
+Subtotal Pesanan: Rp80.000
+Subtotal Pengiriman: Rp15.000
+Biaya Layanan: Rp3.000
+Diskon Voucher Toko: -Rp5.000
+Diskon Voucher Shopee: -Rp15.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp80.000
+1
+Rp80.000
+Nota Pesanan
+"""
+        # 80000 + 15000 + 3000 - 5000 - 15000 = 78000
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.order_reconciliation_status, "MATCHED")
+        self.assertEqual(res.reconciliation_difference, Decimal("0.00"))
+        self.assertEqual(res.parse_status, AdapterParseStatus.COMPLETED)
+
+    # 50. Order equation mismatch requires review
+    def test_50_order_equation_mismatch_requires_review(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH050
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp99.000
+Subtotal Pesanan: Rp80.000
+Biaya Layanan: Rp3.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp80.000
+1
+Rp80.000
+Nota Pesanan
+"""
+        # 80000 + 3000 = 83000 != 99000
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.order_reconciliation_status, "MISMATCH")
+        self.assertNotEqual(res.reconciliation_difference, Decimal("0.00"))
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "ORDER_TOTAL_MISMATCH" for d in res.diagnostics))
+
+    # 51. Unknown priced component fails safely
+    def test_51_unknown_priced_component_fails_safely(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH051
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp55.000
+Subtotal Pesanan: Rp50.000
+Biaya Misterius: Rp5.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "UNKNOWN_ORDER_AMOUNT_COMPONENT" for d in res.diagnostics))
+
+    # 52. Duplicate replay produces stable row and line keys
+    def test_52_duplicate_replay_produces_stable_keys(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH052
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang A
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp1 = self._make_adapter_input(payload=make_multipage_pdf([text]), source_document_id="file_one.pdf")
+        inp2 = self._make_adapter_input(payload=make_multipage_pdf([text]), source_document_id="file_two.pdf")
+        res1 = adapter.parse(inp1)
+        res2 = adapter.parse(inp2)
+
+        self.assertEqual(res1.events[0].row_fingerprint, res2.events[0].row_fingerprint)
+        self.assertEqual(
+            res1.events[0].payload.line_items[0].line_key,
+            res2.events[0].payload.line_items[0].line_key,
+        )
+
+    # 53. Identical physical item rows remain separate
+    def test_53_identical_physical_items_remain_separate(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH053
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp100.000
+Subtotal Pesanan: Rp100.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+Barang Kembar
+Rp50.000
+1
+Rp50.000
+2
+Barang Kembar
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        self.assertEqual(len(ev.line_items), 2)
+        # Both items have identical product name, quantity, subtotal
+        self.assertEqual(ev.line_items[0].product_name_raw, ev.line_items[1].product_name_raw)
+        # But distinct stable line keys
+        self.assertNotEqual(ev.line_items[0].line_key, ev.line_items[1].line_key)
+
+    # 54. CO Buku text does not assign ownership semantics
+    def test_54_co_buku_text_does_not_assign_ownership(self) -> None:
+        text = """Nama Penjual: Toko Sintetis
+No. Pesanan: 260508SYNTH054
+Tanggal Transaksi: 08/05/2026
+Metode Pembayaran: Saldo ShopeePay
+Total Pembayaran: Rp50.000
+Subtotal Pesanan: Rp50.000
+Nama Pembeli: Pembeli
+Rincian Pesanan
+1
+CO Buku Paket Sejarah
+Rp50.000
+1
+Rp50.000
+Nota Pesanan
+"""
+        adapter = ShopeeOrdersReceiptAdapter()
+        inp = self._make_adapter_input(payload=make_multipage_pdf([text]))
+        res = adapter.parse(inp)
+        ev = res.events[0].payload
+        self.assertEqual(ev.line_items[0].product_name_raw, "CO Buku Paket Sejarah")
+        self.assertIs(ev.cash_movement_emitted, False)
+        self.assertIs(ev.canonical_match_required, True)
+        self.assertFalse(hasattr(ev, "economic_owner"))
+        self.assertFalse(hasattr(ev, "payer_responsibility"))
 
 
 if __name__ == "__main__":
