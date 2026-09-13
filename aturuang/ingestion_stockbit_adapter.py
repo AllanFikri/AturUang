@@ -1,7 +1,7 @@
 """Stockbit Statement of Account (SOA) PDF ingestion adapter for AturUang.
 
-Phase 3.7 Source Contract Freeze and Adapter Skeleton.
-Defines deterministic identity behavior, evidence roles, and fail-closed handling.
+Phase 3.7 Full Table Parser and Evidence Extraction.
+Parses multi-page Cash Ledger, Trade Evidence, Portfolio Holdings, and Valuation Summaries.
 """
 
 from __future__ import annotations
@@ -23,11 +23,15 @@ from .ingestion_adapter import (
     AdapterInput,
     AdapterParseStatus,
     AdapterResult,
+    CashMovementEvidence,
     ConfidenceLevel,
     DiagnosticSeverity,
+    EventDirection,
     EventRole,
+    InvestmentTradeEvidence,
     NormalizedEventEnvelope,
     SafeDiagnostic,
+    SourceEventStatus,
     UniversalSourceAdapter,
     validate_adapter_input,
 )
@@ -152,21 +156,29 @@ class StockbitPortfolioValuation:
         return False
 
 
+@dataclass(frozen=True)
+class StockbitAdapterResult(AdapterResult):
+    cash_evidence: tuple[StockbitCashEvidence, ...] = ()
+    trade_evidence: tuple[StockbitTradeEvidence, ...] = ()
+    holding_snapshots: tuple[StockbitHoldingSnapshot, ...] = ()
+    portfolio_valuation: StockbitPortfolioValuation | None = None
+    opening_balance: Decimal | None = None
+    ending_balance: Decimal | None = None
+    total_debits: Decimal | None = None
+    total_credits: Decimal | None = None
+
+
 # ---------------------------------------------------------------------------
-# Identity and Privacy Helpers
+# Identity and Parsing Helpers
 # ---------------------------------------------------------------------------
 
 def normalize_account_string(value: str) -> str:
     """Normalizes an account or client code string by stripping whitespace and punctuation."""
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(value).strip().upper())
-    return cleaned
+    return re.sub(r"[^A-Za-z0-9]", "", str(value).strip().upper())
 
 
 def build_account_fingerprint(raw_account_or_client: str | None) -> str | None:
-    """Constructs a stable, private SHA-256 account fingerprint.
-
-    The raw account number or client code is never exposed in logs, git history, or public output.
-    """
+    """Constructs a stable, private SHA-256 account fingerprint."""
     if not raw_account_or_client:
         return None
     normalized = normalize_account_string(raw_account_or_client)
@@ -183,12 +195,7 @@ def build_natural_document_key(
     period_start: str | None,
     period_end: str | None,
 ) -> str | None:
-    """Constructs the deterministic natural document key for a Stockbit SOA.
-
-    Must contain: source_type, normalized statement_type, account_fingerprint,
-    period_start, period_end.
-    Does NOT depend on filename, local path, byte hash alone, or ingestion timestamp.
-    """
+    """Constructs the deterministic natural document key for a Stockbit SOA."""
     if not account_fingerprint or not period_start or not period_end:
         return None
     norm_source = str(source_type).strip().lower()
@@ -208,11 +215,7 @@ def build_row_evidence_key(
     running_balance: Decimal | None = None,
     source_row_ordinal: int | None = None,
 ) -> tuple[str, bool, str | None]:
-    """Constructs a deterministic row-level evidence key.
-
-    Row ordinal is used only as provenance and fallback when stable source fields
-    are insufficient, in which case review_required is set to True.
-    """
+    """Constructs a deterministic row-level evidence key."""
     has_stable_core = bool(
         transaction_date
         and source_description
@@ -236,7 +239,6 @@ def build_row_evidence_key(
         )
         return sha256(payload.encode("utf-8")).hexdigest(), False, None
 
-    # Fallback using row ordinal: requires review
     payload = "\x1f".join(
         (
             "stockbit-row-v1-fallback",
@@ -250,16 +252,37 @@ def build_row_evidence_key(
     return sha256(payload.encode("utf-8")).hexdigest(), True, "UNSTABLE_ROW_IDENTITY"
 
 
+def _parse_decimal_amount(value_str: str | None) -> Decimal:
+    """Parses currency/number strings supporting commas and parentheses for negative values."""
+    if not value_str:
+        return Decimal("0.00")
+    s = value_str.strip()
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1].strip()
+    elif s.startswith("-"):
+        neg = True
+        s = s[1:].strip()
+    s = s.replace(",", "")
+    val = Decimal(s)
+    return -val if neg else val
+
+
 # ---------------------------------------------------------------------------
 # Header Extraction and Parsing
 # ---------------------------------------------------------------------------
 
+_HEADER_BOUNDARY_RE = re.compile(
+    r"(?mi)^(?:.*?\bTr\.\s*Date\b|.*?\bDue\s*Date\b|.*?\bPORTFOLIO\s+STATEMENT\b|.*?\bShare\s+Code\b)"
+)
+
 _HEADER_PERIOD_RE = re.compile(
-    r"\bPeriod\s*[:\s]+(\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\b",
+    r"\b(?:Period|Date)\s*[:\s]+(\d{1,2}/\d{1,2}/\d{4})\s*-\s*(\d{1,2}/\d{1,2}/\d{4})\b",
     re.IGNORECASE,
 )
 _HEADER_BANK_SID_RE = re.compile(
-    r"\bBank\s*/\s*(?:Ccy|Currency)\s*/\s*SID\b[:\s]*[\r\n]*\s*([A-Za-z]+)\s+([A-Za-z0-9_.-]+)\s*/\s*([A-Za-z]+)\s+([A-Za-z0-9_.-]+)",
+    r"\bBank\s*/\s*(?:Ccy|Currency)\s*/?\s*SID\b[:\s]*[\r\n]*\s*([A-Za-z]+)\s+([A-Za-z0-9_.-]+)\s*/\s*([A-Za-z]+)\s+([A-Za-z0-9_.-]+)",
     re.IGNORECASE,
 )
 _HEADER_ACCOUNT_RE = re.compile(
@@ -267,8 +290,16 @@ _HEADER_ACCOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 _HEADER_CLIENT_CODE_RE = re.compile(
-    r"\bClient\s*Code\s*[:\s]+([A-Za-z0-9_.-]+)",
+    r"\bClient(?:\s*Code)?\s*[:\s]+([A-Za-z0-9_.-]+)",
     re.IGNORECASE,
+)
+
+_TRADE_DETAIL_RE = re.compile(
+    r"^\s*(\d{6,8})\s+([BS]):\s*RG\s+([A-Za-z0-9]+)\s+([\d,]+(?:\.\d+)?)\s*@\s*([\d,]+(?:\.\d+)?)\s*=\s*([\d,]+(?:\.\d+)?)"
+)
+
+_PORTFOLIO_NUM_RE = re.compile(
+    r"(?:([A-Z])\s+)?([\d,]+)\s+([\d,]+(?:\.\d+)?)\s+([\d,]+(?:\.\d+)?)\s+([-\(]?[\d,]+(?:\.\d+)?\)?)\s+([-\(]?[\d,]+(?:\.\d+)?\)?)\s+([-\(]?[\d,]+(?:\.\d+)?\)?)\s+([-\(]?[\d,]+(?:\.\d+)?\)?)$"
 )
 
 
@@ -284,15 +315,16 @@ def extract_header_metadata(
     source_file_name: str | None = None,
     statement_type: str = "statement_of_account",
 ) -> StockbitDocumentIdentity:
-    """Extracts authoritative document identity from header text only.
-
-    Invariable rule: dates in transaction body text must NOT establish document period.
-    """
+    """Extracts authoritative document identity from header text only."""
     review_required = False
     review_reason = None
 
+    # Strictly bound the header region before the first statement section / table marker
+    m_bound = _HEADER_BOUNDARY_RE.search(header_text)
+    bounded_header = header_text[:m_bound.start()] if m_bound else header_text
+
     # 1. Authoritative Period from Header
-    period_match = _HEADER_PERIOD_RE.search(header_text)
+    period_match = _HEADER_PERIOD_RE.search(bounded_header)
     if period_match:
         period_start = _format_date(period_match.group(1))
         period_end = _format_date(period_match.group(2))
@@ -307,19 +339,19 @@ def extract_header_metadata(
     rdn_bank: str | None = None
     currency: str = "IDR"
 
-    bank_match = _HEADER_BANK_SID_RE.search(header_text)
+    bank_match = _HEADER_BANK_SID_RE.search(bounded_header)
     if bank_match:
         rdn_bank = bank_match.group(1).upper()
         client_raw = bank_match.group(2)
         currency = bank_match.group(3).upper()
 
     if not client_raw:
-        client_match = _HEADER_CLIENT_CODE_RE.search(header_text)
+        client_match = _HEADER_CLIENT_CODE_RE.search(bounded_header)
         if client_match:
             client_raw = client_match.group(1)
 
     if not client_raw:
-        acc_match = _HEADER_ACCOUNT_RE.search(header_text)
+        acc_match = _HEADER_ACCOUNT_RE.search(bounded_header)
         if acc_match:
             client_raw = acc_match.group(1)
 
@@ -358,6 +390,45 @@ def extract_header_metadata(
     )
 
 
+def extract_portfolio_valuation(
+    bounded_header: str,
+    valuation_date: str | None = None,
+) -> StockbitPortfolioValuation | None:
+    """Extracts the portfolio valuation summary totals from the header block."""
+    patterns = {
+        "cash_investor": r"\bCash\s+Investor\s+([-\(]?[\d,]+(?:\.\d+)?\)?|\b0\b)",
+        "cash_balance": r"\bCash\s+([-\(]?[\d,]+(?:\.\d+)?\)?|\b0\b)",
+        "undue_trading": r"\bUndue\s+Trading\s+([-\(]?[\d,]+(?:\.\d+)?\)?|\b0\b)",
+        "short_sell": r"\bShort\s+Sell\s+([-\(]?[\d,]+(?:\.\d+)?\)?|\b0\b)",
+        "portfolio_value": r"\bPortfolio\s+([-\(]?[\d,]+(?:\.\d+)?\)?|\b0\b)",
+        "equity_or_nav": r"\bEquity\s+(?:NAB|NAV)\s+([-\(]?[\d,]+(?:\.\d+)?\)?|\b0\b)",
+        "available_limit": r"\bAvail(?:able)?\s+Limit\s+([-\(]?[\d,]+(?:\.\d+)?\)?|\b0\b)",
+    }
+    values: dict[str, Decimal | None] = {}
+    found_any = False
+    for k, pat in patterns.items():
+        m = re.search(pat, bounded_header, re.IGNORECASE)
+        if m:
+            values[k] = _parse_decimal_amount(m.group(1))
+            found_any = True
+        else:
+            values[k] = None
+
+    if not found_any:
+        return None
+
+    return StockbitPortfolioValuation(
+        valuation_date=valuation_date,
+        cash_investor=values["cash_investor"],
+        cash_balance=values["cash_balance"],
+        undue_trading=values["undue_trading"],
+        short_sell=values["short_sell"],
+        portfolio_value=values["portfolio_value"],
+        equity_or_nav=values["equity_or_nav"],
+        available_limit=values["available_limit"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fail-Closed Event Handling
 # ---------------------------------------------------------------------------
@@ -367,10 +438,7 @@ def handle_unrecognized_row(
     row_ordinal: int,
     natural_document_key: str,
 ) -> tuple[SafeDiagnostic, str]:
-    """Fail-closed handler for unrecognized events (e.g. corporate actions, dividends).
-
-    Emits no invented financial meaning, marks review required, preserves sanitized evidence.
-    """
+    """Fail-closed handler for unrecognized events (e.g. corporate actions, dividends)."""
     row_key, _, _ = build_row_evidence_key(
         natural_document_key=natural_document_key,
         evidence_role="UNRECOGNIZED_EVENT",
@@ -411,26 +479,22 @@ class StockbitStatementAdapter:
             source_channel=SourceChannel.PDF,
         )
 
-    def parse(self, source: AdapterInput) -> AdapterResult:
-        """Parses a Stockbit SOA document.
-
-        In the P3.7.2 skeleton stage, extracts authoritative header metadata and returns
-        deterministic document identity with empty evidence collections until P3.7.3.
-        """
+    def parse(self, source: AdapterInput) -> StockbitAdapterResult:
+        """Parses a Stockbit SOA document into full structured evidence."""
         validate_adapter_input(self.descriptor, source)
 
         diagnostics: list[SafeDiagnostic] = []
         review_reasons: list[str] = []
 
-        # 1. Extract text from PDF payload
-        header_text = ""
+        # 1. Extract text per page
+        pages_text: list[str] = []
         full_text = ""
 
         if source.binary_payload is not None:
             try:
                 reader = self._pdf_reader_factory(BytesIO(source.binary_payload))
                 if not reader.pages:
-                    return AdapterResult(
+                    return StockbitAdapterResult(
                         descriptor=self.descriptor,
                         source_document_id=source.source_document_id,
                         parse_status=AdapterParseStatus.FAILED,
@@ -443,12 +507,10 @@ class StockbitStatementAdapter:
                             ),
                         ),
                     )
-                header_text = reader.pages[0].extract_text() or ""
-                full_text = "\n".join(
-                    p.extract_text() or "" for p in reader.pages
-                )
+                pages_text = [p.extract_text() or "" for p in reader.pages]
+                full_text = "\n".join(pages_text)
             except Exception:
-                return AdapterResult(
+                return StockbitAdapterResult(
                     descriptor=self.descriptor,
                     source_document_id=source.source_document_id,
                     parse_status=AdapterParseStatus.FAILED,
@@ -462,10 +524,10 @@ class StockbitStatementAdapter:
                     ),
                 )
         elif source.text_payload is not None:
-            header_text = source.text_payload[:3000]
+            pages_text = [source.text_payload]
             full_text = source.text_payload
         else:
-            return AdapterResult(
+            return StockbitAdapterResult(
                 descriptor=self.descriptor,
                 source_document_id=source.source_document_id,
                 parse_status=AdapterParseStatus.FAILED,
@@ -487,9 +549,11 @@ class StockbitStatementAdapter:
             "Reference",
             "Db Amount",
             "Cr Amount",
-            "Ending Balance",
         )
         missing_markers = [m for m in required_markers if m not in full_text]
+        if "Ending Balance" not in full_text and "Balance" not in full_text:
+            missing_markers.append("Balance")
+
         if missing_markers:
             diagnostics.append(
                 SafeDiagnostic(
@@ -498,7 +562,7 @@ class StockbitStatementAdapter:
                     message="Required template markers are missing from text layer.",
                 )
             )
-            return AdapterResult(
+            return StockbitAdapterResult(
                 descriptor=self.descriptor,
                 source_document_id=source.source_document_id,
                 parse_status=AdapterParseStatus.FAILED,
@@ -506,9 +570,13 @@ class StockbitStatementAdapter:
                 diagnostics=tuple(diagnostics),
             )
 
-        # 3. Extract Document Identity (Header only)
+        # 3. Extract Document Identity (Header only, strictly bounded)
+        first_page = pages_text[0] if pages_text else ""
+        m_bound = _HEADER_BOUNDARY_RE.search(first_page)
+        bounded_header = first_page[:m_bound.start()] if m_bound else first_page
+
         identity = extract_header_metadata(
-            header_text,
+            bounded_header,
             content_sha256=source.content_sha256,
         )
 
@@ -523,27 +591,413 @@ class StockbitStatementAdapter:
                 )
             )
 
+        doc_key = identity.natural_document_key_candidate or f"stockbit_fallback:{source.content_sha256}"
+
+        # 4. Extract Portfolio Valuation Summary from Header
+        portfolio_valuation = extract_portfolio_valuation(
+            bounded_header,
+            valuation_date=identity.period_end,
+        )
+
+        # 5. Parse Cash Ledger across pages
+        idx_port = full_text.find("PORTFOLIO STATEMENT")
+        cash_text = full_text[:idx_port] if idx_port != -1 else full_text
+        port_text = full_text[idx_port:] if idx_port != -1 else ""
+
+        cash_lines = [l.strip() for l in cash_text.splitlines() if l.strip()]
+
+        cash_evidence_list: list[StockbitCashEvidence] = []
+        trade_evidence_list: list[StockbitTradeEvidence] = []
+        opening_balance: Decimal | None = None
+        source_ending_balance: Decimal | None = None
+
+        cur_trade_date: str | None = None
+        cur_due_date: str | None = None
+        row_ordinal = 0
+
+        for line in cash_lines:
+            if "Beginning Balance" in line:
+                m_tx = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+(.+)$", line)
+                rest_beg = m_tx.group(3) if m_tx else line
+                nums_beg = [x for x in rest_beg.split() if re.match(r"^[-\(]?[\d,]+(?:\.\d+)?\)?$", x)]
+                if len(nums_beg) >= 3:
+                    opening_balance = _parse_decimal_amount(nums_beg[2])
+                elif nums_beg:
+                    opening_balance = _parse_decimal_amount(nums_beg[-1])
+                continue
+
+            m_end_bal = re.search(r"Ending\s+Balance\s*[:\s]+\s*([-\(]?[\d,]+(?:\.\d+)?\)?)", line, re.I)
+            if m_end_bal and not line.startswith("Tr. Date"):
+                source_ending_balance = _parse_decimal_amount(m_end_bal.group(1))
+                continue
+
+            if line.startswith("Tr. Date") and "Due Date" in line:
+                continue
+
+            if line.startswith("T O T A L"):
+                m_t = re.findall(r"\(?[\d,]+(?:\.\d+)?\)?", line)
+                if len(m_t) >= 3 and source_ending_balance is None:
+                    source_ending_balance = _parse_decimal_amount(m_t[2])
+                continue
+
+            if line.startswith("Total - Interest"):
+                continue
+
+            m_tr = _TRADE_DETAIL_RE.match(line)
+            if m_tr:
+                ref, side, ticker, qty_str, price_str, net_str = m_tr.groups()
+                action = "BUY" if side == "B" else "SELL"
+                qty = _parse_decimal_amount(qty_str)
+                price = _parse_decimal_amount(price_str)
+                net_amount = _parse_decimal_amount(net_str)
+                gross_amount = (qty * price).quantize(Decimal("0.01"))
+
+                trade_ev = StockbitTradeEvidence(
+                    trade_date=cur_trade_date or (identity.period_start or ""),
+                    settlement_date=cur_due_date or cur_trade_date or (identity.period_end or ""),
+                    contract_reference=ref,
+                    source_action=action,
+                    ticker=ticker,
+                    quantity=qty,
+                    price=price,
+                    gross_amount=gross_amount,
+                    net_settlement_amount=net_amount,
+                )
+                trade_evidence_list.append(trade_ev)
+                continue
+
+            m_tx = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+(.+)$", line)
+            if m_tx:
+                tr_raw, due_raw, rest = m_tx.group(1), m_tx.group(2), m_tx.group(3).strip()
+                tr_date = _format_date(tr_raw)
+                due_date = _format_date(due_raw)
+                cur_trade_date = tr_date
+                cur_due_date = due_date
+                row_ordinal += 1
+
+                m_trx = re.match(r"^I\s+(Trx\s+on\s+\d{2}/\d{2}/\d{4})\s+([\d,\(\)\-\s]+)$", rest)
+                m_pay = re.match(r"^P\s+(\d+)\s+(Payment\s+to:\s*.+?)\s+([\d,\(\)\-\s]+)$", rest, re.I)
+                m_rec = re.match(r"^R\s+(\d+)\s+(Receipt\s+From:\s*.+?)\s+([\d,\(\)\-\s]+)$", rest, re.I)
+                m_inv = re.match(r"^([PR])\s+(\d+)\s+(Inv:\s*.*?)\.\s+([\d,\(\)\-\s]+)$", rest)
+                m_feed = re.match(r"^([MR])\s+(?:(\d+)\s+)?(Biaya\s+Datafeed\s+[A-Za-z]+\s+\d{4})\s+([\d,\(\)\-\s]+)$", rest)
+                m_int = re.match(r"^Z\s+Z\s+(Estimated\s+Interest)\s+([\d,\(\)\-\s]+)$", rest)
+
+                ref_val: str | None = None
+                desc_val: str = rest
+                db_val = Decimal("0.00")
+                cr_val = Decimal("0.00")
+                bal_val: Decimal | None = None
+
+                if m_trx:
+                    ref_val = "I"
+                    desc_val = m_trx.group(1)
+                    nums = [_parse_decimal_amount(x) for x in m_trx.group(2).split()]
+                    if len(nums) >= 3:
+                        db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                elif m_pay:
+                    ref_val = f"P {m_pay.group(1)}"
+                    desc_val = m_pay.group(2).strip()
+                    nums = [_parse_decimal_amount(x) for x in m_pay.group(3).split()]
+                    if len(nums) >= 3:
+                        db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                elif m_rec:
+                    ref_val = f"R {m_rec.group(1)}"
+                    desc_val = m_rec.group(2).strip()
+                    nums = [_parse_decimal_amount(x) for x in m_rec.group(3).split()]
+                    if len(nums) >= 3:
+                        db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                elif m_inv:
+                    ref_val = f"{m_inv.group(1)} {m_inv.group(2)}"
+                    desc_val = m_inv.group(3).strip() + "."
+                    nums = [_parse_decimal_amount(x) for x in m_inv.group(4).split()]
+                    if len(nums) >= 3:
+                        db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                elif m_feed:
+                    feed_ref_num = m_feed.group(2) or ""
+                    ref_val = f"{m_feed.group(1)} {feed_ref_num}".strip()
+                    desc_val = m_feed.group(3).strip()
+                    nums = [_parse_decimal_amount(x) for x in m_feed.group(4).split()]
+                    if len(nums) >= 3:
+                        db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                elif m_int:
+                    ref_val = "Z"
+                    desc_val = m_int.group(1)
+                    nums = [_parse_decimal_amount(x) for x in m_int.group(2).split()]
+                    if len(nums) >= 3:
+                        db_val, cr_val, bal_val = nums[0], nums[1], nums[2]
+                else:
+                    diag, row_key = handle_unrecognized_row(line, row_ordinal, doc_key)
+                    diagnostics.append(diag)
+                    review_reasons.append("UNRECOGNIZED_STOCKBIT_EVENT")
+                    continue
+
+                signed_amount = cr_val - db_val
+                row_key, is_fallback, r_reason = build_row_evidence_key(
+                    natural_document_key=doc_key,
+                    evidence_role="CASH_EVIDENCE",
+                    transaction_date=tr_date,
+                    due_date=due_date,
+                    source_reference=ref_val,
+                    source_description=desc_val,
+                    signed_amount=signed_amount,
+                    running_balance=bal_val,
+                    source_row_ordinal=row_ordinal,
+                )
+
+                cash_ev = StockbitCashEvidence(
+                    transaction_date=tr_date,
+                    due_date=due_date,
+                    source_reference=ref_val,
+                    source_description=desc_val,
+                    source_debit=db_val if db_val > 0 else None,
+                    source_credit=cr_val if cr_val > 0 else None,
+                    signed_amount=signed_amount,
+                    running_balance=bal_val,
+                    source_row_ordinal=row_ordinal,
+                    row_evidence_key=row_key,
+                    requires_cross_source_match=True,
+                    review_reason=r_reason,
+                )
+                cash_evidence_list.append(cash_ev)
+
+        # 6. Parse Portfolio Statement Holdings
+        holding_snapshots_list: list[StockbitHoldingSnapshot] = []
+        if port_text:
+            m_start = re.search(r"Stocks\s+Special\s+Notes.*?\n", port_text, re.I)
+            if m_start:
+                tbl = port_text[m_start.end():]
+                m_end = re.search(r"T\s+O\s+T\s+A\s+L", tbl)
+                if m_end:
+                    tbl = tbl[:m_end.start()]
+                p_lines = [l.strip() for l in tbl.splitlines() if l.strip()]
+                filt = [
+                    l for l in p_lines
+                    if "Stocks Special Notes" not in l
+                    and "PRICE UNREAL" not in l
+                    and "PORTFOLIO STATEMENT" not in l
+                ]
+                cur_text: list[str] = []
+                for l in filt:
+                    m_n = _PORTFOLIO_NUM_RE.search(l)
+                    if m_n:
+                        prefix = l[:m_n.start()].strip()
+                        if prefix:
+                            cur_text.append(prefix)
+                        qty = _parse_decimal_amount(m_n.group(2))
+                        buy_p = _parse_decimal_amount(m_n.group(3))
+                        close_p = _parse_decimal_amount(m_n.group(4))
+                        buy_v = _parse_decimal_amount(m_n.group(5))
+                        mkt_v = _parse_decimal_amount(m_n.group(6))
+                        unreal_v = _parse_decimal_amount(m_n.group(7))
+                        unreal_p = _parse_decimal_amount(m_n.group(8))
+
+                        full_desc = " ".join(cur_text)
+                        tokens = full_desc.split()
+                        if not tokens:
+                            ticker = "UNKNOWN"
+                            name_str = None
+                        elif len(tokens) > 1 and len(tokens[0]) <= 5 and len(tokens[1]) <= 5 and tokens[1].isupper() and tokens[0].isupper() and "ARTOB" in tokens[0]:
+                            ticker = tokens[0] + tokens[1]
+                            name_str = " ".join(tokens[2:])
+                        else:
+                            ticker = tokens[0]
+                            name_str = " ".join(tokens[1:]) if len(tokens) > 1 else None
+
+                        snap = StockbitHoldingSnapshot(
+                            snapshot_date=identity.period_end or "",
+                            ticker=ticker,
+                            source_security_name=name_str,
+                            quantity=qty,
+                            average_price=buy_p,
+                            closing_price=close_p,
+                            market_value=mkt_v,
+                            source_unrealized_gain_loss=unreal_v,
+                            source_unrealized_percentage=unreal_p,
+                        )
+                        holding_snapshots_list.append(snap)
+                        cur_text = []
+                    else:
+                        cur_text.append(l)
+
+        # 7. Cash Equation Validation
+        total_debits = sum((c.source_debit or Decimal("0.00")) for c in cash_evidence_list)
+        total_credits = sum((c.source_credit or Decimal("0.00")) for c in cash_evidence_list)
+        equation_mismatch = False
+
+        if cash_evidence_list and source_ending_balance is not None:
+            opening = opening_balance if opening_balance is not None else Decimal("0.00")
+            calculated_ending = opening + total_credits - total_debits
+            if calculated_ending != source_ending_balance:
+                equation_mismatch = True
+                review_reasons.append("CASH_EQUATION_MISMATCH")
+                diagnostics.append(
+                    SafeDiagnostic(
+                        code="CASH_EQUATION_MISMATCH",
+                        severity=DiagnosticSeverity.WARNING,
+                        message=(
+                            f"Cash equation mismatch: opening ({opening}) + credits ({total_credits}) "
+                            f"- debits ({total_debits}) = {calculated_ending} != source ({source_ending_balance})"
+                        ),
+                        review_required=True,
+                    )
+                )
+                updated_cash = []
+                for c in cash_evidence_list:
+                    updated_cash.append(
+                        StockbitCashEvidence(
+                            transaction_date=c.transaction_date,
+                            due_date=c.due_date,
+                            source_reference=c.source_reference,
+                            source_description=c.source_description,
+                            source_debit=c.source_debit,
+                            source_credit=c.source_credit,
+                            signed_amount=c.signed_amount,
+                            running_balance=c.running_balance,
+                            source_row_ordinal=c.source_row_ordinal,
+                            row_evidence_key=c.row_evidence_key,
+                            requires_cross_source_match=c.requires_cross_source_match,
+                            review_reason="CASH_EQUATION_MISMATCH",
+                        )
+                    )
+                cash_evidence_list = updated_cash
+
+        # 8. Build Normalized Event Envelopes
+        events: list[NormalizedEventEnvelope] = []
+        for c in cash_evidence_list:
+            if c.signed_amount > 0:
+                direction = EventDirection.INFLOW
+                amt = c.signed_amount
+            elif c.signed_amount < 0:
+                direction = EventDirection.OUTFLOW
+                amt = abs(c.signed_amount)
+            else:
+                direction = EventDirection.NEUTRAL
+                amt = Decimal("0.00")
+
+            payload = CashMovementEvidence(
+                amount=amt,
+                currency="IDR",
+                direction=direction,
+                status=SourceEventStatus.POSTED,
+                occurred_at=c.transaction_date,
+                posted_at=c.transaction_date,
+                settlement_date=c.due_date,
+                direction_raw="CR" if c.signed_amount > 0 else ("DB" if c.signed_amount < 0 else None),
+                description_raw=c.source_description,
+                reference_raw=c.source_reference,
+                balance_after=c.running_balance,
+            )
+            provenance = SourceProvenanceContract(
+                source_document_id=source.source_document_id,
+                raw_locator=f"stockbit:cash:ord:{c.source_row_ordinal}",
+                row_index=c.source_row_ordinal,
+                raw_text=c.source_description,
+                raw_reference=c.source_reference or "",
+                raw_description=c.source_description,
+            )
+            envelope = NormalizedEventEnvelope(
+                source_document_id=source.source_document_id,
+                source_registry_id=self.descriptor.source_registry_id,
+                template_id=self.descriptor.template_id,
+                parser_version=self.descriptor.parser_version,
+                source_channel=self.descriptor.source_channel,
+                event_role=EventRole.CASH_MOVEMENT,
+                source_event_id=None,
+                row_fingerprint=c.row_evidence_key,
+                evidence_quality=ConfidenceLevel.HIGH,
+                parse_confidence=ConfidenceLevel.HIGH,
+                provenance=provenance,
+                payload=payload,
+            )
+            events.append(envelope)
+
+        for t in trade_evidence_list:
+            t_payload = InvestmentTradeEvidence(
+                instrument_raw=t.ticker,
+                trade_date=t.trade_date,
+                settlement_date=t.settlement_date or t.trade_date,
+                side_raw=t.source_action,
+                quantity=t.quantity,
+                unit_price=t.price,
+                currency="IDR",
+                gross_amount=t.gross_amount,
+                net_amount=t.net_settlement_amount,
+                reference_raw=t.contract_reference,
+            )
+            t_key = sha256(
+                "\x1f".join(
+                    (
+                        "stockbit-trade-v1",
+                        doc_key,
+                        "TRADE_EVIDENCE",
+                        t.trade_date,
+                        t.settlement_date or "",
+                        t.contract_reference or "",
+                        t.source_action,
+                        t.ticker,
+                        str(t.quantity),
+                        str(t.price),
+                        str(t.net_settlement_amount),
+                    )
+                ).encode("utf-8")
+            ).hexdigest()
+            t_provenance = SourceProvenanceContract(
+                source_document_id=source.source_document_id,
+                raw_locator=f"stockbit:trade:ref:{t.contract_reference or 'unknown'}",
+                raw_text=f"{t.source_action} {t.ticker} {t.quantity} @ {t.price}",
+                raw_reference=t.contract_reference or "",
+            )
+            t_envelope = NormalizedEventEnvelope(
+                source_document_id=source.source_document_id,
+                source_registry_id=self.descriptor.source_registry_id,
+                template_id=self.descriptor.template_id,
+                parser_version=self.descriptor.parser_version,
+                source_channel=self.descriptor.source_channel,
+                event_role=EventRole.INVESTMENT_TRADE,
+                source_event_id=None,
+                row_fingerprint=t_key,
+                evidence_quality=ConfidenceLevel.HIGH,
+                parse_confidence=ConfidenceLevel.HIGH,
+                provenance=t_provenance,
+                payload=t_payload,
+            )
+            events.append(t_envelope)
+
         period_status = (
             PeriodStatus.CLOSED
             if (identity.period_start and identity.period_end)
             else PeriodStatus.UNKNOWN
         )
 
+        has_review = bool(
+            identity.review_required
+            or equation_mismatch
+            or any(d.review_required for d in diagnostics)
+        )
+
         parse_status = (
             AdapterParseStatus.REVIEW_REQUIRED
-            if identity.review_required
+            if has_review
             else AdapterParseStatus.COMPLETED
         )
 
-        return AdapterResult(
+        return StockbitAdapterResult(
             descriptor=self.descriptor,
             source_document_id=source.source_document_id,
             parse_status=parse_status,
             period_status=period_status,
-            events=(),
+            events=tuple(events),
             diagnostics=tuple(diagnostics),
-            review_reasons=tuple(review_reasons),
+            review_reasons=tuple(dict.fromkeys(review_reasons)),
             period_start=identity.period_start,
             period_end=identity.period_end,
             natural_document_key_candidate=identity.natural_document_key_candidate,
+            cash_evidence=tuple(cash_evidence_list),
+            trade_evidence=tuple(trade_evidence_list),
+            holding_snapshots=tuple(holding_snapshots_list),
+            portfolio_valuation=portfolio_valuation,
+            opening_balance=opening_balance,
+            ending_balance=source_ending_balance,
+            total_debits=total_debits,
+            total_credits=total_credits,
         )

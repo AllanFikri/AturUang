@@ -36,6 +36,7 @@ from aturuang.ingestion_adapter import (
     AdapterInput,
     AdapterParseStatus,
     ConfidenceLevel,
+    EventDirection,
     DiagnosticSeverity,
     EventRole,
     SafeDiagnostic,
@@ -481,6 +482,353 @@ Period : 01/10/2025 - 31/10/2025
         self.assertEqual(diag.severity, DiagnosticSeverity.WARNING)
         self.assertTrue(diag.review_required)
         self.assertIsNotNone(row_key)
+
+
+
+    # 21. Actual bounded-header extraction
+    def test_21_actual_bounded_header_extraction(self) -> None:
+        header = """PT. STOCKBIT SEKURITAS DIGITAL
+Statement of Account
+Bank / Ccy / SID : JAGO 11223344 / IDR SID1234
+Period : 01/10/2025 - 31/10/2025
+Account / Sub Account : 11223344 1 / SYNTH_CLIENT_001
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 100,000 0 100,000 1 0
+"""
+        meta = extract_header_metadata(header)
+        self.assertEqual(meta.period_start, "2025-10-01")
+        self.assertEqual(meta.period_end, "2025-10-31")
+        self.assertFalse(meta.review_required)
+        self.assertNotIn("15/10/2025", meta.period_start)
+
+    # 22. Body period cannot establish period
+    def test_22_body_period_cannot_establish_period(self) -> None:
+        text = """PT. STOCKBIT SEKURITAS DIGITAL
+Statement of Account
+Bank / Ccy / SID : JAGO 11223344 / IDR SID1234
+Account / Sub Account : 11223344 1 / SYNTH_CLIENT_001
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Period : 01/01/2026 - 31/01/2026 100,000 0 100,000 1 0
+"""
+        pdf = make_multipage_pdf([text])
+        adapter = StockbitStatementAdapter()
+        inp = self._make_adapter_input(payload=pdf)
+        res = adapter.parse(inp)
+        self.assertEqual(res.period_status, PeriodStatus.UNKNOWN)
+        self.assertIsNone(res.period_start)
+        self.assertIsNone(res.period_end)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertIsNone(res.natural_document_key_candidate)
+
+    # 23. Body account-like value cannot establish identity
+    def test_23_body_account_cannot_establish_identity(self) -> None:
+        text = """PT. STOCKBIT SEKURITAS DIGITAL
+Statement of Account
+Period : 01/10/2025 - 31/10/2025
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 R 123456 Receipt From: Account 9988776655 0 100,000 0 0
+"""
+        pdf = make_multipage_pdf([text])
+        adapter = StockbitStatementAdapter()
+        inp = self._make_adapter_input(payload=pdf)
+        res = adapter.parse(inp)
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "MISSING_ACCOUNT_IDENTITY" for d in res.diagnostics))
+        self.assertIsNone(res.natural_document_key_candidate)
+
+    # 24. Universal adapter routing
+    def test_24_universal_adapter_routing(self) -> None:
+        from aturuang.ingestion_orchestration import AdapterCatalog
+        adapter = StockbitStatementAdapter()
+        catalog = AdapterCatalog((adapter,))
+        selected = catalog.select(
+            source_registry_id=STOCKBIT_SOURCE_REGISTRY_ID,
+            template_id=STOCKBIT_TEMPLATE_ID,
+            parser_version=STOCKBIT_PARSER_VERSION,
+            source_channel=SourceChannel.PDF,
+        )
+        self.assertIs(selected, adapter)
+        self.assertEqual(selected.descriptor.adapter_id, STOCKBIT_ADAPTER_ID)
+
+    # 25. Multi-page cash ledger ordering
+    def test_25_multipage_cash_ledger_ordering(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 100,000 0 100,000 1 0
+"""
+        p2 = """Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+16/10/2025 18/10/2025 I Trx on 16/10/2025 200,000 0 300,000 1 0
+"""
+        pdf = make_multipage_pdf([p1, p2])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 2)
+        self.assertEqual(res.cash_evidence[0].transaction_date, "2025-10-15")
+        self.assertEqual(res.cash_evidence[0].source_row_ordinal, 1)
+        self.assertEqual(res.cash_evidence[1].transaction_date, "2025-10-16")
+        self.assertEqual(res.cash_evidence[1].source_row_ordinal, 2)
+
+    # 26. Repeated header suppression
+    def test_26_repeated_header_suppression(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 100,000 0 100,000 1 0
+"""
+        p2 = """Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+16/10/2025 18/10/2025 I Trx on 16/10/2025 200,000 0 300,000 1 0
+"""
+        pdf = make_multipage_pdf([p1, p2])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 2)
+
+    # 27. Wrapped-description joining
+    def test_27_wrapped_description_joining(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 100,000 0 100,000 1 0
+0111111   B: RG TLKM  100 @ 3,000=300,450.00
+"""
+        p2 = """Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+0111112   S: RG ASII  100 @ 5,000=498,500.00
+"""
+        pdf = make_multipage_pdf([p1, p2])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.trade_evidence), 2)
+        self.assertEqual(res.trade_evidence[0].ticker, "TLKM")
+        self.assertEqual(res.trade_evidence[1].ticker, "ASII")
+        self.assertEqual(res.trade_evidence[1].trade_date, "2025-10-15")
+        self.assertEqual(res.trade_evidence[1].settlement_date, "2025-10-17")
+
+    # 28. Debit sign
+    def test_28_debit_produces_negative_signed_amount(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 500,000 0 500,000 1 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 1)
+        cash = res.cash_evidence[0]
+        self.assertEqual(cash.source_debit, Decimal("500000.00"))
+        self.assertIsNone(cash.source_credit)
+        self.assertEqual(cash.signed_amount, Decimal("-500000.00"))
+        self.assertEqual(len(res.events), 1)
+        self.assertEqual(res.events[0].payload.direction, EventDirection.OUTFLOW)
+        self.assertEqual(res.events[0].payload.amount, Decimal("500000.00"))
+
+    # 29. Credit sign
+    def test_29_credit_produces_positive_signed_amount(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 15/10/2025 R 832025 Receipt From: SYNTH_CLIENT_001 0 750,000 0 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 1)
+        cash = res.cash_evidence[0]
+        self.assertIsNone(cash.source_debit)
+        self.assertEqual(cash.source_credit, Decimal("750000.00"))
+        self.assertEqual(cash.signed_amount, Decimal("750000.00"))
+        self.assertEqual(len(res.events), 1)
+        self.assertEqual(res.events[0].payload.direction, EventDirection.INFLOW)
+        self.assertEqual(res.events[0].payload.amount, Decimal("750000.00"))
+
+    # 30. Parenthesized negative balance
+    def test_30_parenthesized_negative_balance(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 0 609,006 (609,006) 1 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.cash_evidence), 1)
+        self.assertEqual(res.cash_evidence[0].running_balance, Decimal("-609006.00"))
+
+    # 31. Beginning balance is not an event
+    def test_31_beginning_balance_is_not_an_event(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+01/10/2025 01/10/2025 Beginning Balance 0 0 1,500,000 0 0
+15/10/2025 17/10/2025 I Trx on 15/10/2025 100,000 0 1,600,000 1 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(res.opening_balance, Decimal("1500000.00"))
+        self.assertEqual(len(res.cash_evidence), 1)
+        self.assertEqual(res.cash_evidence[0].transaction_date, "2025-10-15")
+
+    # 32. Ending balance is not an event
+    def test_32_ending_balance_is_not_an_event(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 100,000 0 100,000 1 0
+T O T A L 100,000 0 100,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(res.ending_balance, Decimal("100000.00"))
+        self.assertEqual(len(res.cash_evidence), 1)
+        self.assertEqual(res.cash_evidence[0].source_description, "Trx on 15/10/2025")
+
+    # 33. BUY evidence
+    def test_33_buy_trade_evidence(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 375,562 0 375,562 1 0
+0567845   B: RG BUMI  1,500 @ 250=375,562.50
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.trade_evidence), 1)
+        t = res.trade_evidence[0]
+        self.assertEqual(t.source_action, "BUY")
+        self.assertEqual(t.ticker, "BUMI")
+        self.assertEqual(t.quantity, Decimal("1500"))
+        self.assertEqual(t.price, Decimal("250.00"))
+        self.assertEqual(t.gross_amount, Decimal("375000.00"))
+        self.assertEqual(t.net_settlement_amount, Decimal("375562.50"))
+        self.assertEqual(t.contract_reference, "0567845")
+
+    # 34. SELL evidence
+    def test_34_sell_trade_evidence(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 0 476,805 (476,805) 1 0
+1150042   S: RG FAST  1,000 @ 478=476,805.01
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.trade_evidence), 1)
+        t = res.trade_evidence[0]
+        self.assertEqual(t.source_action, "SELL")
+        self.assertEqual(t.ticker, "FAST")
+        self.assertEqual(t.quantity, Decimal("1000"))
+        self.assertEqual(t.price, Decimal("478.00"))
+        self.assertEqual(t.gross_amount, Decimal("478000.00"))
+        self.assertEqual(t.net_settlement_amount, Decimal("476805.01"))
+        self.assertEqual(t.contract_reference, "1150042")
+
+    # 35. Trade and settlement dates remain separate
+    def test_35_trade_and_settlement_dates_remain_separate(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+13/02/2026 19/02/2026 I Trx on 13/02/2026 100,000 0 100,000 1 0
+0287326   B: RG BELL  100 @ 187=18,728.06
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.trade_evidence), 1)
+        t = res.trade_evidence[0]
+        self.assertEqual(t.trade_date, "2026-02-13")
+        self.assertEqual(t.settlement_date, "2026-02-19")
+        self.assertNotEqual(t.trade_date, t.settlement_date)
+
+    # 36. Holding snapshot parsing
+    def test_36_holding_snapshot_parsing(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+PORTFOLIO STATEMENT
+PRICE UNREAL. GAIN/LOSS
+Stocks Special Notes Margin Quantity Buying Close Buying Value Market Value (Rp.) %
+BUMI Bumi Resources Tbk.  1,500 250.00 258 375,000 387,000 12,000 3.20
+T O T A L 375,000 387,000 12,000
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(len(res.holding_snapshots), 1)
+        h = res.holding_snapshots[0]
+        self.assertEqual(h.ticker, "BUMI")
+        self.assertEqual(h.quantity, Decimal("1500"))
+        self.assertEqual(h.average_price, Decimal("250.00"))
+        self.assertEqual(h.closing_price, Decimal("258.00"))
+        self.assertEqual(h.market_value, Decimal("387000.00"))
+        self.assertEqual(h.source_unrealized_gain_loss, Decimal("12000.00"))
+        self.assertEqual(h.source_unrealized_percentage, Decimal("3.20"))
+
+    # 37. Valuation summary parsing
+    def test_37_valuation_summary_parsing(self) -> None:
+        header = SYNTHETIC_HEADER + """Cash Investor 15,507.75
+Cash 4,408
+Undue Trading -11,100
+Short Sell 0
+Portfolio 584,700
+Equity NAB 573,600
+Avail Limit 4,408
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+Ending Balance : 15,000,000.00
+"""
+        pdf = make_multipage_pdf([header])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        val = res.portfolio_valuation
+        self.assertIsNotNone(val)
+        self.assertEqual(val.cash_investor, Decimal("15507.75"))
+        self.assertEqual(val.cash_balance, Decimal("4408.00"))
+        self.assertEqual(val.undue_trading, Decimal("-11100.00"))
+        self.assertEqual(val.short_sell, Decimal("0.00"))
+        self.assertEqual(val.portfolio_value, Decimal("584700.00"))
+        self.assertEqual(val.equity_or_nav, Decimal("573600.00"))
+        self.assertEqual(val.available_limit, Decimal("4408.00"))
+
+    # 38. Unrealized gain/loss emits no cash/income
+    def test_38_unrealized_gain_loss_emits_no_cash_or_income(self) -> None:
+        snap = StockbitHoldingSnapshot(
+            snapshot_date="2025-10-31",
+            ticker="BUMI",
+            source_security_name="Bumi Resources Tbk.",
+            quantity=Decimal("1500"),
+            average_price=Decimal("250.00"),
+            closing_price=Decimal("258.00"),
+            market_value=Decimal("387000.00"),
+            source_unrealized_gain_loss=Decimal("12000.00"),
+            source_unrealized_percentage=Decimal("3.20"),
+        )
+        val = StockbitPortfolioValuation(
+            valuation_date="2025-10-31",
+            portfolio_value=Decimal("584700.00"),
+        )
+        self.assertFalse(snap.emits_cash_movement)
+        self.assertFalse(snap.is_income_or_expense)
+        self.assertFalse(val.emits_cash_movement)
+
+    # 39. Duplicate replay produces identical keys
+    def test_39_duplicate_replay_produces_identical_keys(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 I Trx on 15/10/2025 375,562 0 375,562 1 0
+0567845   B: RG BUMI  1,500 @ 250=375,562.50
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res1 = adapter.parse(self._make_adapter_input(payload=pdf))
+        res2 = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(res1.natural_document_key_candidate, res2.natural_document_key_candidate)
+        self.assertEqual([c.row_evidence_key for c in res1.cash_evidence], [c.row_evidence_key for c in res2.cash_evidence])
+        self.assertEqual([e.row_fingerprint for e in res1.events], [e.row_fingerprint for e in res2.events])
+
+    # 40. Unknown corporate action fails closed
+    def test_40_unknown_corporate_action_fails_closed(self) -> None:
+        p1 = SYNTHETIC_HEADER + """
+Tr. Date Due Date Reference Description Db Amount Cr Amount Balance
+15/10/2025 17/10/2025 X RIGHTS ISSUE EXERCISE BBCA 100 0 100,000 0
+"""
+        pdf = make_multipage_pdf([p1])
+        adapter = StockbitStatementAdapter()
+        res = adapter.parse(self._make_adapter_input(payload=pdf))
+        self.assertEqual(res.parse_status, AdapterParseStatus.REVIEW_REQUIRED)
+        self.assertTrue(any(d.code == "UNRECOGNIZED_STOCKBIT_EVENT" for d in res.diagnostics))
 
 
 if __name__ == "__main__":
