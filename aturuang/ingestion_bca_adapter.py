@@ -28,8 +28,11 @@ from .ingestion_adapter import (
     SourceSummaryEvidence,
     validate_adapter_input,
 )
+from .ingestion_account_discovery import AccountDiscoveryObservation
 from .ingestion_contracts import (
+    AccountType,
     ConfidenceLevel,
+    OwnershipState,
     PeriodStatus,
     SourceChannel,
     SourceProvenanceContract,
@@ -1199,8 +1202,99 @@ class BCAMonthlyStatementAdapter:
         return events, diagnostics
 
 
+    def extract_account_observations(
+        self,
+        source_or_result: Any,
+    ) -> list[AccountDiscoveryObservation]:
+        if isinstance(source_or_result, AdapterInput):
+            result = self.parse(source_or_result)
+        else:
+            result = source_or_result
+
+        if result is None or result.parse_status == AdapterParseStatus.FAILED:
+            return []
+
+        effective_date = result.period_start or "2026-01-01"
+
+        # Locate root account key from events
+        root_key: str | None = None
+        for e in (result.events or ()):
+            if e.event_role == EventRole.CASH_MOVEMENT and getattr(e.payload, "source_account_key_raw", None):
+                root_key = e.payload.source_account_key_raw
+                break
+            if e.event_role == EventRole.ACCOUNT_OBSERVATION and getattr(e.payload, "parent_observed_key", None):
+                root_key = e.payload.parent_observed_key
+                break
+
+        # Check for ambiguous or missing root identity
+        ambiguous = any(
+            d.code in {"BCA_ACCOUNT_IDENTITY_AMBIGUOUS", "BCA_HEADER_INCOMPLETE"}
+            for d in (result.diagnostics or ())
+        )
+
+        if not root_key or ambiguous:
+            return [
+                AccountDiscoveryObservation(
+                    institution_id="bca",
+                    source_registry_id=self.descriptor.source_registry_id,
+                    raw_account_key="",
+                    display_name_safe="BCA Tahapan",
+                    account_type=AccountType.TRANSACTIONAL,
+                    effective_date=effective_date,
+                    ownership_state=OwnershipState.UNKNOWN,
+                    ownership_confidence=ConfidenceLevel.UNKNOWN,
+                    parent_raw_account_key=None,
+                )
+            ]
+
+        observations: list[AccountDiscoveryObservation] = [
+            AccountDiscoveryObservation(
+                institution_id="bca",
+                source_registry_id=self.descriptor.source_registry_id,
+                raw_account_key=root_key,
+                display_name_safe="BCA Tahapan",
+                account_type=AccountType.TRANSACTIONAL,
+                effective_date=effective_date,
+                ownership_state=OwnershipState.OWNED,
+                ownership_confidence=ConfidenceLevel.HIGH,
+                parent_raw_account_key=None,
+            )
+        ]
+
+        seen_pokets: set[str] = set()
+        for e in (result.events or ()):
+            if e.event_role == EventRole.ACCOUNT_OBSERVATION:
+                poket_payload = e.payload
+                poket_key = getattr(poket_payload, "observed_provider_account_key", None)
+                if poket_key and poket_key not in seen_pokets and poket_key != root_key:
+                    seen_pokets.add(poket_key)
+                    observations.append(
+                        AccountDiscoveryObservation(
+                            institution_id="bca",
+                            source_registry_id=self.descriptor.source_registry_id,
+                            raw_account_key=poket_key,
+                            display_name_safe="BCA Poket",
+                            account_type=AccountType.SAVINGS,
+                            effective_date=effective_date,
+                            ownership_state=OwnershipState.OWNED,
+                            ownership_confidence=ConfidenceLevel.HIGH,
+                            parent_raw_account_key=root_key,
+                            parent_account_type=AccountType.TRANSACTIONAL,
+                        )
+                    )
+
+        return observations
+
+
+def extract_account_observations(
+    source_or_result: Any,
+) -> list[AccountDiscoveryObservation]:
+    return BCAMonthlyStatementAdapter().extract_account_observations(source_or_result)
+
+
 __all__ = [
     "BCA_DESCRIPTOR",
     "BCA_TEMPLATE_FINGERPRINT",
     "BCAMonthlyStatementAdapter",
+    "extract_account_observations",
 ]

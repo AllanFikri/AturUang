@@ -33,7 +33,11 @@ from .ingestion_adapter import (
     UniversalSourceAdapter,
     validate_adapter_input,
 )
+from .ingestion_account_discovery import AccountDiscoveryObservation
 from .ingestion_contracts import (
+    AccountType,
+    ConfidenceLevel,
+    OwnershipState,
     PeriodStatus,
     SourceChannel,
     SourceProvenanceContract,
@@ -483,6 +487,33 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
             natural_document_key_candidate=natural_key,
         )
 
+    def extract_account_observations(
+        self,
+        source_or_result: Any,
+    ) -> list[AccountDiscoveryObservation]:
+        if isinstance(source_or_result, AdapterInput):
+            result = self.parse(source_or_result)
+        else:
+            result = source_or_result
+
+        effective_date = getattr(result, "period_start", None) if result else None or "2026-01-01"
+        # Screenshot evidence lacks stable wallet account key.
+        # Retains BLOCKED / fail-closed behavior (raw_account_key="").
+        # Never derives identity from screenshots, filenames, owner names, display text, balances, or transaction rows.
+        return [
+            AccountDiscoveryObservation(
+                institution_id="shopeepay",
+                source_registry_id=self.descriptor.source_registry_id,
+                raw_account_key="",
+                display_name_safe="ShopeePay",
+                account_type=AccountType.WALLET,
+                effective_date=effective_date,
+                ownership_state=OwnershipState.UNKNOWN,
+                ownership_confidence=ConfidenceLevel.UNKNOWN,
+                parent_raw_account_key=None,
+            )
+        ]
+
     def _parse_transaction_cards(
         self,
         lines: Sequence[ImageOcrLine],
@@ -659,3 +690,20 @@ class ShopeePayTransactionHistoryImageAdapter(UniversalSourceAdapter):
 
         cards.sort(key=lambda c: c.y)
         return cards
+
+
+def extract_account_observations(
+    source_or_result: Any,
+) -> list[AccountDiscoveryObservation]:
+    return ShopeePayTransactionHistoryImageAdapter().extract_account_observations(source_or_result)
+
+
+__all__ = [
+    "SHOPEEPAY_ADAPTER_ID",
+    "SHOPEEPAY_PARSER_VERSION",
+    "SHOPEEPAY_SOURCE_REGISTRY_ID",
+    "SHOPEEPAY_TEMPLATE_FINGERPRINT",
+    "SHOPEEPAY_TEMPLATE_ID",
+    "ShopeePayTransactionHistoryImageAdapter",
+    "extract_account_observations",
+]

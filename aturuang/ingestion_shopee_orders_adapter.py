@@ -36,6 +36,7 @@ from .ingestion_adapter import (
     UniversalSourceAdapter,
     validate_adapter_input,
 )
+from .ingestion_account_discovery import AccountDiscoveryObservation
 from .ingestion_contracts import (
     PeriodStatus,
     SourceChannel,
@@ -1057,6 +1058,21 @@ class ShopeeOrdersReceiptAdapter(UniversalSourceAdapter):
             order_identity=identity,
         )
 
+    def extract_account_observations(
+        self,
+        source_or_result: Any = None,
+    ) -> list[AccountDiscoveryObservation]:
+        """Shopee Orders is a commerce receipt document, not an account statement.
+        Always returns empty observations list (NOT_APPLICABLE).
+        """
+        return []
+
+
+def extract_account_observations(
+    source_or_result: Any = None,
+) -> list[AccountDiscoveryObservation]:
+    return ShopeeOrdersReceiptAdapter().extract_account_observations(source_or_result)
+
 
 __all__ = [
     "REQUIRED_TEMPLATE_MARKERS",
@@ -1072,6 +1088,7 @@ __all__ = [
     "ShopeeOrdersReceiptAdapter",
     "build_natural_document_key",
     "build_stable_line_key",
+    "extract_account_observations",
     "extract_order_amount_components",
     "extract_order_identity",
     "extract_order_line_items",

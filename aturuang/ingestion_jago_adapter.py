@@ -26,8 +26,11 @@ from .ingestion_adapter import (
     SourceSummaryEvidence,
     validate_adapter_input,
 )
+from .ingestion_account_discovery import AccountDiscoveryObservation
 from .ingestion_contracts import (
+    AccountType,
     ConfidenceLevel,
+    OwnershipState,
     PeriodStatus,
     SourceChannel,
     SourceProvenanceContract,
@@ -754,6 +757,73 @@ class JagoMonthlyStatementAdapter:
             return candidates[0]
         return None
 
+    def extract_account_observations(
+        self,
+        source_or_result: Any,
+    ) -> list[AccountDiscoveryObservation]:
+        if isinstance(source_or_result, AdapterInput):
+            result = self.parse(source_or_result)
+        else:
+            result = source_or_result
+
+        if result is None or result.parse_status == AdapterParseStatus.FAILED or not result.events:
+            return []
+
+        effective_date = result.period_start or "2026-01-01"
+        obs_events = [
+            e for e in result.events if e.event_role == EventRole.ACCOUNT_OBSERVATION
+        ]
+        if not obs_events:
+            return []
+
+        root_key = obs_events[0].payload.parent_observed_key
+        observations: list[AccountDiscoveryObservation] = []
+
+        if root_key:
+            observations.append(
+                AccountDiscoveryObservation(
+                    institution_id="jago",
+                    source_registry_id=self.descriptor.source_registry_id,
+                    raw_account_key=root_key,
+                    display_name_safe="Kantong Utama",
+                    account_type=AccountType.TRANSACTIONAL,
+                    effective_date=effective_date,
+                    ownership_state=OwnershipState.OWNED,
+                    ownership_confidence=ConfidenceLevel.HIGH,
+                    parent_raw_account_key=None,
+                    parent_account_type=None,
+                )
+            )
+
+        seen_pocket_keys: set[str] = set()
+        for e in obs_events:
+            pkt_payload = e.payload
+            pkt_key = pkt_payload.observed_provider_account_key
+            if pkt_key and pkt_key not in seen_pocket_keys and pkt_key != root_key:
+                seen_pocket_keys.add(pkt_key)
+                observations.append(
+                    AccountDiscoveryObservation(
+                        institution_id="jago",
+                        source_registry_id=self.descriptor.source_registry_id,
+                        raw_account_key=pkt_key,
+                        display_name_safe="Jago Kantong",
+                        account_type=AccountType.SAVINGS,
+                        effective_date=effective_date,
+                        ownership_state=OwnershipState.OWNED,
+                        ownership_confidence=ConfidenceLevel.HIGH,
+                        parent_raw_account_key=root_key,
+                        parent_account_type=AccountType.TRANSACTIONAL,
+                    )
+                )
+
+        return observations
+
+
+def extract_account_observations(
+    source_or_result: Any,
+) -> list[AccountDiscoveryObservation]:
+    return JagoMonthlyStatementAdapter().extract_account_observations(source_or_result)
+
 
 __all__ = [
     "JAGO_ADAPTER_ID",
@@ -762,4 +832,5 @@ __all__ = [
     "JAGO_TEMPLATE_FINGERPRINT",
     "JAGO_TEMPLATE_ID",
     "JagoMonthlyStatementAdapter",
+    "extract_account_observations",
 ]

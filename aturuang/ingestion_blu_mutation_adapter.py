@@ -28,8 +28,11 @@ from .ingestion_adapter import (
     UniversalSourceAdapter,
     validate_adapter_input,
 )
+from .ingestion_account_discovery import AccountDiscoveryObservation
 from .ingestion_contracts import (
+    AccountType,
     ConfidenceLevel,
+    OwnershipState,
     PeriodStatus,
     SourceChannel,
     SourceProvenanceContract,
@@ -724,6 +727,61 @@ class BluAccountMutationAdapter(UniversalSourceAdapter):
             diagnostics=(),
         )
 
+    def extract_account_observations(
+        self,
+        source_or_result: Any,
+    ) -> list[AccountDiscoveryObservation]:
+        if isinstance(source_or_result, AdapterInput):
+            result = self.parse(source_or_result)
+        else:
+            result = source_or_result
+
+        if result is None or result.parse_status == AdapterParseStatus.FAILED:
+            return []
+
+        effective_date = result.period_start or "2026-01-01"
+        obs_events = [
+            e for e in (result.events or ()) if e.event_role == EventRole.ACCOUNT_OBSERVATION
+        ]
+
+        if obs_events and obs_events[0].payload.observed_provider_account_key:
+            acc_key = obs_events[0].payload.observed_provider_account_key
+            return [
+                AccountDiscoveryObservation(
+                    institution_id="blu",
+                    source_registry_id=self.descriptor.source_registry_id,
+                    raw_account_key=acc_key,
+                    display_name_safe="blu Account",
+                    account_type=AccountType.SAVINGS,
+                    effective_date=effective_date,
+                    ownership_state=OwnershipState.OWNED,
+                    ownership_confidence=ConfidenceLevel.HIGH,
+                    parent_raw_account_key=None,
+                )
+            ]
+
+        # Explicit account key absent: fail closed with empty raw_account_key
+        # Never fall back to display text, owner text, filename, or transaction content.
+        return [
+            AccountDiscoveryObservation(
+                institution_id="blu",
+                source_registry_id=self.descriptor.source_registry_id,
+                raw_account_key="",
+                display_name_safe="blu Account",
+                account_type=AccountType.SAVINGS,
+                effective_date=effective_date,
+                ownership_state=OwnershipState.UNKNOWN,
+                ownership_confidence=ConfidenceLevel.UNKNOWN,
+                parent_raw_account_key=None,
+            )
+        ]
+
+
+def extract_account_observations(
+    source_or_result: Any,
+) -> list[AccountDiscoveryObservation]:
+    return BluAccountMutationAdapter().extract_account_observations(source_or_result)
+
 
 __all__ = [
     "BluAccountMutationAdapter",
@@ -733,4 +791,5 @@ __all__ = [
     "BLU_MUTATION_ADAPTER_ID",
     "BLU_MUTATION_TEMPLATE_FINGERPRINT",
     "BLU_PORTFOLIO_SUBACCOUNT_IDENTITY_UNRESOLVED",
+    "extract_account_observations",
 ]

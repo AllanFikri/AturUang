@@ -35,7 +35,11 @@ from .ingestion_adapter import (
     UniversalSourceAdapter,
     validate_adapter_input,
 )
+from .ingestion_account_discovery import AccountDiscoveryObservation
 from .ingestion_contracts import (
+    AccountType,
+    ConfidenceLevel,
+    OwnershipState,
     PeriodStatus,
     SourceChannel,
     SourceProvenanceContract,
@@ -78,6 +82,7 @@ class StockbitDocumentIdentity:
     source_file_name: str | None = None  # Provenance only, never identity authority
     review_required: bool = False
     review_reason: str | None = None
+    client_code_raw: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, init=False)
@@ -222,6 +227,7 @@ class StockbitAdapterResult(AdapterResult):
     detail_difference: Decimal = Decimal("0.00")
     source_total_control_matched: bool = True
     undue_trading_control_matched: bool = True
+    document_identity: StockbitDocumentIdentity | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +452,7 @@ def extract_header_metadata(
         source_file_name=source_file_name,
         review_required=review_required,
         review_reason=review_reason,
+        client_code_raw=client_raw,
     )
 
 
@@ -1149,4 +1156,57 @@ class StockbitStatementAdapter:
             detail_difference=detail_diff,
             source_total_control_matched=source_total_control_matched,
             undue_trading_control_matched=undue_trading_control_matched,
+            document_identity=identity,
         )
+
+    def extract_account_observations(
+        self,
+        source_or_result: Any,
+    ) -> list[AccountDiscoveryObservation]:
+        if isinstance(source_or_result, AdapterInput):
+            result = self.parse(source_or_result)
+        else:
+            result = source_or_result
+
+        if result is None or result.parse_status == AdapterParseStatus.FAILED:
+            return []
+
+        effective_date = result.period_start or "2026-01-01"
+        doc_ident = getattr(result, "document_identity", None)
+        client_code = getattr(doc_ident, "client_code_raw", None)
+
+        if client_code:
+            return [
+                AccountDiscoveryObservation(
+                    institution_id="stockbit",
+                    source_registry_id=self.descriptor.source_registry_id,
+                    raw_account_key=client_code,
+                    display_name_safe="Stockbit Securities",
+                    account_type=AccountType.INVESTMENT,
+                    effective_date=effective_date,
+                    ownership_state=OwnershipState.OWNED,
+                    ownership_confidence=ConfidenceLevel.HIGH,
+                    parent_raw_account_key=None,
+                )
+            ]
+
+        # Missing document identity fails closed
+        return [
+            AccountDiscoveryObservation(
+                institution_id="stockbit",
+                source_registry_id=self.descriptor.source_registry_id,
+                raw_account_key="",
+                display_name_safe="Stockbit Securities",
+                account_type=AccountType.INVESTMENT,
+                effective_date=effective_date,
+                ownership_state=OwnershipState.UNKNOWN,
+                ownership_confidence=ConfidenceLevel.UNKNOWN,
+                parent_raw_account_key=None,
+            )
+        ]
+
+
+def extract_account_observations(
+    source_or_result: Any,
+) -> list[AccountDiscoveryObservation]:
+    return StockbitStatementAdapter().extract_account_observations(source_or_result)
