@@ -127,8 +127,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="1000-0001-0001",
-                parent_observed_key="1000-0001-0001",
+                observed_provider_account_key="SYNTHETIC-JAGO-ROOT-001",
+                parent_observed_key="SYNTHETIC-JAGO-ROOT-001",
                 display_name_raw="Kantong Utama",
             ),
         )
@@ -147,7 +147,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         root = obs_list[0]
         self.assertEqual(root.institution_id, "jago")
         self.assertEqual(root.source_registry_id, adapter.descriptor.source_registry_id)
-        self.assertEqual(root.raw_account_key, "1000-0001-0001")
+        self.assertEqual(root.raw_account_key, "SYNTHETIC-JAGO-ROOT-001")
         self.assertEqual(root.account_type, AccountType.TRANSACTIONAL)
         self.assertIsNone(root.parent_raw_account_key)
         self.assertEqual(root.display_name_safe, "Kantong Utama")
@@ -165,8 +165,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 source_channel=adapter.descriptor.source_channel,
                 event_role=EventRole.ACCOUNT_OBSERVATION,
                 payload=ObservedAccountEvidence(
-                    observed_provider_account_key="1000-0001-0001",
-                    parent_observed_key="1000-0001-0001",
+                    observed_provider_account_key="SYNTHETIC-JAGO-ROOT-001",
+                    parent_observed_key="SYNTHETIC-JAGO-ROOT-001",
                     display_name_raw="Kantong Utama",
                 ),
                 source_event_id="evt-root",
@@ -179,8 +179,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 source_channel=adapter.descriptor.source_channel,
                 event_role=EventRole.ACCOUNT_OBSERVATION,
                 payload=ObservedAccountEvidence(
-                    observed_provider_account_key="1000-0001-0002",
-                    parent_observed_key="1000-0001-0001",
+                    observed_provider_account_key="SYNTHETIC-JAGO-PKT-001",
+                    parent_observed_key="SYNTHETIC-JAGO-ROOT-001",
                     display_name_raw="Kantong Tabungan",
                 ),
                 source_event_id="evt-pkt",
@@ -199,7 +199,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         obs_list = jago_mod.extract_account_observations(res)
         self.assertEqual(len(obs_list), 2)
         root, child = obs_list[0], obs_list[1]
-        self.assertEqual(child.raw_account_key, "1000-0001-0002")
+        self.assertEqual(child.raw_account_key, "SYNTHETIC-JAGO-PKT-001")
         self.assertEqual(child.parent_raw_account_key, root.raw_account_key)
         self.assertEqual(child.account_type, AccountType.SAVINGS)
         self.assertEqual(child.parent_account_type, AccountType.TRANSACTIONAL)
@@ -215,8 +215,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 source_channel=adapter.descriptor.source_channel,
                 event_role=EventRole.ACCOUNT_OBSERVATION,
                 payload=ObservedAccountEvidence(
-                    observed_provider_account_key="1000-0001-0001",
-                    parent_observed_key="1000-0001-0001",
+                    observed_provider_account_key="SYNTHETIC-JAGO-ROOT-001",
+                    parent_observed_key="SYNTHETIC-JAGO-ROOT-001",
                     display_name_raw="Kantong Utama",
                 ),
                 source_event_id="evt-1",
@@ -229,8 +229,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 source_channel=adapter.descriptor.source_channel,
                 event_role=EventRole.ACCOUNT_OBSERVATION,
                 payload=ObservedAccountEvidence(
-                    observed_provider_account_key="1000-0001-0002",
-                    parent_observed_key="1000-0001-0001",
+                    observed_provider_account_key="SYNTHETIC-JAGO-PKT-001",
+                    parent_observed_key="SYNTHETIC-JAGO-ROOT-001",
                     display_name_raw="Kantong Rahasia Si Budi",
                 ),
                 source_event_id="evt-2",
@@ -262,8 +262,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="1000-0001-0001",
-                parent_observed_key="1000-0001-0001",
+                observed_provider_account_key="SYNTHETIC-JAGO-ROOT-001",
+                parent_observed_key="SYNTHETIC-JAGO-ROOT-001",
                 display_name_raw="Kantong Utama",
             ),
         )
@@ -298,7 +298,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
 
     def test_06_jago_zero_leakage_check_on_personal_identities(self) -> None:
         sentinel_name = "SENTINEL_NASABAH_BUDI_SANTOSO"
-        sentinel_nik = "3171012345678901"
+        sentinel_nik = "SYNTHETIC-SENTINEL-NIK-001"
         sentinel_addr = "SENTINEL_JL_SUDIRMAN_JAKARTA"
 
         adapter = jago_mod.JagoMonthlyStatementAdapter()
@@ -310,8 +310,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="1000-0001-0001",
-                parent_observed_key="1000-0001-0001",
+                observed_provider_account_key="SYNTHETIC-JAGO-ROOT-001",
+                parent_observed_key="SYNTHETIC-JAGO-ROOT-001",
                 display_name_raw=f"Kantong {sentinel_name}",
             ),
         )
@@ -345,7 +345,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="901234567890",
+                observed_provider_account_key="SYNTHETIC-SEABANK-ACC-001",
                 display_name_raw="SeaBank Account",
             ),
         )
@@ -376,7 +376,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="901234567890",
+                observed_provider_account_key="SYNTHETIC-SEABANK-ACC-001",
                 display_name_raw="SeaBank Account",
             ),
         )
@@ -391,7 +391,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             events=(obs_event,),
         )
         obs_list = seabank_mod.extract_account_observations(res)
-        self.assertEqual(obs_list[0].raw_account_key, "901234567890")
+        self.assertEqual(obs_list[0].raw_account_key, "SYNTHETIC-SEABANK-ACC-001")
 
     def test_09_seabank_neutral_display_name(self) -> None:
         adapter = seabank_mod.SeaBankMonthlyStatementAdapter()
@@ -403,7 +403,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="901234567890",
+                observed_provider_account_key="SYNTHETIC-SEABANK-ACC-001",
                 display_name_raw="SeaBank Account",
             ),
         )
@@ -431,7 +431,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="901234567890",
+                observed_provider_account_key="SYNTHETIC-SEABANK-ACC-001",
                 display_name_raw="SeaBank Account",
             ),
         )
@@ -464,7 +464,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         self.assertEqual(obs_list, [])
 
     def test_12_seabank_zero_counterparty_account_leakage(self) -> None:
-        sentinel_cp = "SENTINEL_CP_ACCOUNT_88887777"
+        sentinel_cp = "SYNTHETIC-CP-SEABANK-001"
         adapter = seabank_mod.SeaBankMonthlyStatementAdapter()
         obs_event = _make_envelope(
             source_document_id="doc-sea-5",
@@ -474,7 +474,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="901234567890",
+                observed_provider_account_key="SYNTHETIC-SEABANK-ACC-001",
                 display_name_raw="SeaBank Account",
             ),
             source_event_id="evt-sea-obs",
@@ -491,7 +491,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 currency="IDR",
                 direction=EventDirection.OUTFLOW,
                 status=SourceEventStatus.POSTED,
-                source_account_key_raw="901234567890",
+                source_account_key_raw="SYNTHETIC-SEABANK-ACC-001",
                 destination_account_key_raw=sentinel_cp,
                 occurred_at="2026-03-05T10:00:00+07:00",
             ),
@@ -525,7 +525,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="0011223344",
+                observed_provider_account_key="SYNTHETIC-BLU-ACC-001",
                 display_name_raw="blu Account",
             ),
         )
@@ -543,7 +543,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         self.assertEqual(len(obs_list), 1)
         obs = obs_list[0]
         self.assertEqual(obs.institution_id, "blu")
-        self.assertEqual(obs.raw_account_key, "0011223344")
+        self.assertEqual(obs.raw_account_key, "SYNTHETIC-BLU-ACC-001")
         self.assertEqual(obs.ownership_state, OwnershipState.OWNED)
         self.assertEqual(obs.ownership_confidence, ConfidenceLevel.HIGH)
 
@@ -576,7 +576,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="0011223344",
+                observed_provider_account_key="SYNTHETIC-BLU-ACC-001",
                 display_name_raw="blu Account",
             ),
         )
@@ -594,7 +594,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         self.assertEqual(obs_list[0].display_name_safe, "blu Account")
 
     def test_16_blu_counterparty_accounts_excluded(self) -> None:
-        sentinel_cp = "SENTINEL_CP_ACCOUNT_99990000"
+        sentinel_cp = "SYNTHETIC-CP-BLU-001"
         adapter = blu_mod.BluAccountMutationAdapter()
         obs_event = _make_envelope(
             source_document_id="doc-blu-4",
@@ -604,7 +604,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="0011223344",
+                observed_provider_account_key="SYNTHETIC-BLU-ACC-001",
                 display_name_raw="blu Account",
             ),
             source_event_id="evt-blu-obs",
@@ -621,7 +621,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 currency="IDR",
                 direction=EventDirection.OUTFLOW,
                 status=SourceEventStatus.POSTED,
-                source_account_key_raw="0011223344",
+                source_account_key_raw="SYNTHETIC-BLU-ACC-001",
                 destination_account_key_raw=sentinel_cp,
                 occurred_at="2026-03-05T10:00:00+07:00",
             ),
@@ -651,7 +651,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="0011223344",
+                observed_provider_account_key="SYNTHETIC-BLU-ACC-001",
                 display_name_raw="blu Account",
             ),
             source_event_id="evt-blu-obs",
@@ -668,7 +668,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 currency="IDR",
                 direction=EventDirection.INFLOW,
                 status=SourceEventStatus.POSTED,
-                destination_account_key_raw="0011223344",
+                destination_account_key_raw="SYNTHETIC-BLU-ACC-001",
                 occurred_at="2026-03-02T10:00:00+07:00",
             ),
             source_event_id="tx1",
@@ -685,7 +685,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 currency="IDR",
                 direction=EventDirection.OUTFLOW,
                 status=SourceEventStatus.POSTED,
-                source_account_key_raw="0011223344",
+                source_account_key_raw="SYNTHETIC-BLU-ACC-001",
                 occurred_at="2026-03-03T11:00:00+07:00",
             ),
             source_event_id="tx2",
@@ -702,7 +702,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         )
         obs_list = blu_mod.extract_account_observations(res)
         self.assertEqual(len(obs_list), 1)
-        self.assertEqual(obs_list[0].raw_account_key, "0011223344")
+        self.assertEqual(obs_list[0].raw_account_key, "SYNTHETIC-BLU-ACC-001")
 
     def test_18_blu_fail_closed_on_unparseable_payload(self) -> None:
         adapter = blu_mod.BluAccountMutationAdapter()
@@ -733,7 +733,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="08123456789",
+                observed_provider_account_key="SYNTHETIC-GOPAY-WALLET-001",
                 display_name_raw="GoPay Wallet",
             ),
         )
@@ -751,13 +751,13 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         self.assertEqual(len(obs_list), 1)
         obs = obs_list[0]
         self.assertEqual(obs.institution_id, "gopay")
-        self.assertEqual(obs.raw_account_key, "08123456789")
+        self.assertEqual(obs.raw_account_key, "SYNTHETIC-GOPAY-WALLET-001")
         self.assertEqual(obs.account_type, AccountType.WALLET)
         self.assertEqual(obs.ownership_state, OwnershipState.OWNED)
         self.assertEqual(obs.ownership_confidence, ConfidenceLevel.HIGH)
 
     def test_20_gopay_counterparty_phone_numbers_excluded(self) -> None:
-        sentinel_cp = "SENTINEL_CP_PHONE_08999999999"
+        sentinel_cp = "SYNTHETIC-CP-GOPAY-001"
         adapter = gopay_mod.GoPayEStatementAdapter()
         obs_event = _make_envelope(
             source_document_id="doc-gp-2",
@@ -767,7 +767,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="08123456789",
+                observed_provider_account_key="SYNTHETIC-GOPAY-WALLET-001",
                 display_name_raw="GoPay Wallet",
             ),
             source_event_id="evt-gp-obs",
@@ -784,7 +784,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 currency="IDR",
                 direction=EventDirection.OUTFLOW,
                 status=SourceEventStatus.POSTED,
-                source_account_key_raw="08123456789",
+                source_account_key_raw="SYNTHETIC-GOPAY-WALLET-001",
                 destination_account_key_raw=sentinel_cp,
                 occurred_at="2026-03-05T10:00:00+07:00",
             ),
@@ -814,7 +814,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="08123456789",
+                observed_provider_account_key="SYNTHETIC-GOPAY-WALLET-001",
                 display_name_raw="GoPay Wallet",
             ),
         )
@@ -841,7 +841,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="08123456789",
+                observed_provider_account_key="SYNTHETIC-GOPAY-WALLET-001",
                 display_name_raw="GoPay Wallet",
             ),
         )
@@ -888,7 +888,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="08123456789",
+                observed_provider_account_key="SYNTHETIC-GOPAY-WALLET-001",
                 display_name_raw="GoPay Wallet",
             ),
             source_event_id="evt-gp-obs5",
@@ -905,7 +905,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 currency="IDR",
                 direction=EventDirection.OUTFLOW,
                 status=SourceEventStatus.POSTED,
-                source_account_key_raw="08123456789",
+                source_account_key_raw="SYNTHETIC-GOPAY-WALLET-001",
                 destination_account_key_raw=sentinel_merchant,
                 occurred_at="2026-03-05T10:00:00+07:00",
             ),
@@ -939,8 +939,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="1234567890",
-                parent_observed_key="1234567890",
+                observed_provider_account_key="SYNTHETIC-BCA-ROOT-001",
+                parent_observed_key="SYNTHETIC-BCA-ROOT-001",
                 display_name_raw="BCA Tahapan",
             ),
         )
@@ -958,7 +958,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         self.assertEqual(len(obs_list), 1)
         root = obs_list[0]
         self.assertEqual(root.institution_id, "bca")
-        self.assertEqual(root.raw_account_key, "1234567890")
+        self.assertEqual(root.raw_account_key, "SYNTHETIC-BCA-ROOT-001")
         self.assertEqual(root.account_type, AccountType.TRANSACTIONAL)
         self.assertIsNone(root.parent_raw_account_key)
         self.assertEqual(root.display_name_safe, "BCA Tahapan")
@@ -974,8 +974,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 source_channel=adapter.descriptor.source_channel,
                 event_role=EventRole.ACCOUNT_OBSERVATION,
                 payload=ObservedAccountEvidence(
-                    observed_provider_account_key="1234567890",
-                    parent_observed_key="1234567890",
+                    observed_provider_account_key="SYNTHETIC-BCA-ROOT-001",
+                    parent_observed_key="SYNTHETIC-BCA-ROOT-001",
                     display_name_raw="BCA Tahapan",
                 ),
                 source_event_id="evt-bca-root",
@@ -988,8 +988,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 source_channel=adapter.descriptor.source_channel,
                 event_role=EventRole.ACCOUNT_OBSERVATION,
                 payload=ObservedAccountEvidence(
-                    observed_provider_account_key="9876543210",
-                    parent_observed_key="1234567890",
+                    observed_provider_account_key="SYNTHETIC-BCA-PKT-001",
+                    parent_observed_key="SYNTHETIC-BCA-ROOT-001",
                     display_name_raw="BCA Poket",
                 ),
                 source_event_id="evt-bca-poket",
@@ -1008,7 +1008,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         obs_list = bca_mod.extract_account_observations(res)
         self.assertEqual(len(obs_list), 2)
         root, poket = obs_list[0], obs_list[1]
-        self.assertEqual(poket.raw_account_key, "9876543210")
+        self.assertEqual(poket.raw_account_key, "SYNTHETIC-BCA-PKT-001")
         self.assertEqual(poket.parent_raw_account_key, root.raw_account_key)
         self.assertEqual(poket.account_type, AccountType.SAVINGS)
         self.assertEqual(poket.parent_account_type, AccountType.TRANSACTIONAL)
@@ -1024,8 +1024,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 source_channel=adapter.descriptor.source_channel,
                 event_role=EventRole.ACCOUNT_OBSERVATION,
                 payload=ObservedAccountEvidence(
-                    observed_provider_account_key="1234567890",
-                    parent_observed_key="1234567890",
+                    observed_provider_account_key="SYNTHETIC-BCA-ROOT-001",
+                    parent_observed_key="SYNTHETIC-BCA-ROOT-001",
                     display_name_raw="BCA Tahapan",
                 ),
                 source_event_id="evt-bca-root3",
@@ -1038,8 +1038,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 source_channel=adapter.descriptor.source_channel,
                 event_role=EventRole.ACCOUNT_OBSERVATION,
                 payload=ObservedAccountEvidence(
-                    observed_provider_account_key="9876543210",
-                    parent_observed_key="1234567890",
+                    observed_provider_account_key="SYNTHETIC-BCA-PKT-001",
+                    parent_observed_key="SYNTHETIC-BCA-ROOT-001",
                     display_name_raw="Poket Pribadi Budi",
                 ),
                 source_event_id="evt-bca-poket3",
@@ -1061,7 +1061,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         self.assertNotIn("Budi", obs_list[1].display_name_safe)
 
     def test_28_bca_counterparty_accounts_excluded(self) -> None:
-        sentinel_cp = "SENTINEL_CP_ACCOUNT_55554444"
+        sentinel_cp = "SYNTHETIC-CP-BCA-001"
         adapter = bca_mod.BCAMonthlyStatementAdapter()
         obs_event = _make_envelope(
             source_document_id="doc-bca-4",
@@ -1071,8 +1071,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="1234567890",
-                parent_observed_key="1234567890",
+                observed_provider_account_key="SYNTHETIC-BCA-ROOT-001",
+                parent_observed_key="SYNTHETIC-BCA-ROOT-001",
                 display_name_raw="BCA Tahapan",
             ),
             source_event_id="evt-bca-obs4",
@@ -1089,7 +1089,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 currency="IDR",
                 direction=EventDirection.OUTFLOW,
                 status=SourceEventStatus.POSTED,
-                source_account_key_raw="1234567890",
+                source_account_key_raw="SYNTHETIC-BCA-ROOT-001",
                 destination_account_key_raw=sentinel_cp,
                 occurred_at="2026-03-05T10:00:00+07:00",
             ),
@@ -1146,8 +1146,8 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             source_channel=adapter.descriptor.source_channel,
             event_role=EventRole.ACCOUNT_OBSERVATION,
             payload=ObservedAccountEvidence(
-                observed_provider_account_key="1234567890",
-                parent_observed_key="1234567890",
+                observed_provider_account_key="SYNTHETIC-BCA-ROOT-001",
+                parent_observed_key="SYNTHETIC-BCA-ROOT-001",
                 display_name_raw="BCA Tahapan",
             ),
             source_event_id="evt-bca-obs5",
@@ -1164,7 +1164,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
                 currency="IDR",
                 direction=EventDirection.OUTFLOW,
                 status=SourceEventStatus.POSTED,
-                source_account_key_raw="1234567890",
+                source_account_key_raw="SYNTHETIC-BCA-ROOT-001",
                 description_raw=f"TRSF E-BANKING KE {sentinel_recipient}",
                 occurred_at="2026-03-06T10:00:00+07:00",
             ),
@@ -1191,7 +1191,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
     def test_31_stockbit_investment_observation_from_valid_report(self) -> None:
         adapter = stockbit_mod.StockbitStatementAdapter()
         identity = stockbit_mod.StockbitDocumentIdentity(
-            client_code_raw="XL1234",
+            client_code_raw="SYNTHETIC-STOCKBIT-CLIENT-001",
             period_start="2026-03-01",
             period_end="2026-03-31",
         )
@@ -1210,7 +1210,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         self.assertEqual(len(obs_list), 1)
         obs = obs_list[0]
         self.assertEqual(obs.institution_id, "stockbit")
-        self.assertEqual(obs.raw_account_key, "XL1234")
+        self.assertEqual(obs.raw_account_key, "SYNTHETIC-STOCKBIT-CLIENT-001")
         self.assertEqual(obs.account_type, AccountType.INVESTMENT)
         self.assertEqual(obs.ownership_state, OwnershipState.OWNED)
         self.assertEqual(obs.ownership_confidence, ConfidenceLevel.HIGH)
@@ -1218,7 +1218,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
     def test_32_stockbit_rdn_cash_account_distinct_evidence(self) -> None:
         adapter = stockbit_mod.StockbitStatementAdapter()
         identity = stockbit_mod.StockbitDocumentIdentity(
-            client_code_raw="XL1234",
+            client_code_raw="SYNTHETIC-STOCKBIT-CLIENT-001",
             rdn_bank="BCA",
             period_start="2026-03-01",
             period_end="2026-03-31",
@@ -1245,7 +1245,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         sb_obs = AccountDiscoveryObservation(
             institution_id="stockbit",
             source_registry_id="stockbit_statement",
-            raw_account_key="XL1234",
+            raw_account_key="SYNTHETIC-STOCKBIT-CLIENT-001",
             display_name_safe="Stockbit Securities",
             account_type=AccountType.INVESTMENT,
             effective_date="2026-03-01",
@@ -1255,7 +1255,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         bca_obs = AccountDiscoveryObservation(
             institution_id="bca",
             source_registry_id="bca_statement",
-            raw_account_key="XL1234",
+            raw_account_key="SYNTHETIC-STOCKBIT-CLIENT-001",
             display_name_safe="BCA Tahapan",
             account_type=AccountType.TRANSACTIONAL,
             effective_date="2026-03-01",
@@ -1271,7 +1271,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
     def test_34_stockbit_neutral_display_name(self) -> None:
         adapter = stockbit_mod.StockbitStatementAdapter()
         identity = stockbit_mod.StockbitDocumentIdentity(
-            client_code_raw="XL1234",
+            client_code_raw="SYNTHETIC-STOCKBIT-CLIENT-001",
             period_start="2026-03-01",
             period_end="2026-03-31",
         )
@@ -1318,7 +1318,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         sentinel_ticker = "BBCA"
         adapter = stockbit_mod.StockbitStatementAdapter()
         identity = stockbit_mod.StockbitDocumentIdentity(
-            client_code_raw="XL1234",
+            client_code_raw="SYNTHETIC-STOCKBIT-CLIENT-001",
             period_start="2026-03-01",
             period_end="2026-03-31",
         )
@@ -1336,7 +1336,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         obs_list = stockbit_mod.extract_account_observations(res)
         self.assertEqual(len(obs_list), 1)
         self.assertNotEqual(obs_list[0].raw_account_key, sentinel_ticker)
-        self.assertEqual(obs_list[0].raw_account_key, "XL1234")
+        self.assertEqual(obs_list[0].raw_account_key, "SYNTHETIC-STOCKBIT-CLIENT-001")
 
     # =========================================================================
     # SHOPEEPAY (Tests 37-42)
@@ -1391,7 +1391,7 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
         self.assert_sentinel_absent(obs_list[0], sentinel_merchant)
 
     def test_41_shopeepay_order_ids_not_treated_as_accounts(self) -> None:
-        sentinel_order_id = "SENTINEL_ORDER_260301ABCDEF"
+        sentinel_order_id = "SYNTHETIC-ORDER-260301-001"
         obs_list = shopeepay_mod.extract_account_observations(None)
         self.assertEqual(obs_list[0].raw_account_key, "")
         self.assert_sentinel_absent(obs_list[0], sentinel_order_id)
@@ -1406,21 +1406,19 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
     # SHOPEE ORDERS (Tests 43-48)
     # =========================================================================
 
-    def test_43_shopee_orders_verified_not_applicable_status(self) -> None:
+    def test_43_shopee_orders_verified_commerce_receipt_status(self) -> None:
         adapter = shopee_orders_mod.ShopeeOrdersReceiptAdapter()
         self.assertEqual(adapter.descriptor.source_registry_id, "shopee_orders")
         self.assertEqual(adapter.descriptor.source_channel, SourceChannel.PDF)
 
-    def test_44_shopee_orders_returns_empty_observations_list(self) -> None:
+    def test_44_shopee_orders_requires_no_extraction_method(self) -> None:
         adapter = shopee_orders_mod.ShopeeOrdersReceiptAdapter()
-        obs_list = adapter.extract_account_observations(None)
-        self.assertEqual(obs_list, [])
-        obs_list_mod = shopee_orders_mod.extract_account_observations(None)
-        self.assertEqual(obs_list_mod, [])
+        self.assertFalse(hasattr(adapter, "extract_account_observations"))
+        self.assertFalse(hasattr(shopee_orders_mod, "extract_account_observations"))
 
-    def test_45_shopee_orders_no_order_seller_accounts_created(self) -> None:
+    def test_45_shopee_orders_order_and_seller_metadata_emits_no_account_observations(self) -> None:
         sentinel_seller = "SENTINEL_TOKO_BUDI_OFFICIAL"
-        sentinel_order = "SENTINEL_SHOPEE_ORDER_998877"
+        sentinel_order = "SYNTHETIC-SHOPEE-ORDER-001"
         identity = shopee_orders_mod.ShopeeOrderDocumentIdentity(
             order_number=sentinel_order,
             seller_name=sentinel_seller,
@@ -1440,27 +1438,26 @@ class TestUniversalIngestionPhase4ProviderObservations(unittest.TestCase):
             reconciliation_difference=Decimal("0.00"),
             order_identity=identity,
         )
-        obs_list = shopee_orders_mod.extract_account_observations(res)
-        self.assertEqual(obs_list, [])
+        account_obs_events = [
+            evt for evt in res.events if evt.event_role == EventRole.ACCOUNT_OBSERVATION
+        ]
+        self.assertEqual(account_obs_events, [])
+        self.assertEqual(res.order_identity.order_number, sentinel_order)
+        self.assertEqual(res.order_identity.seller_name, sentinel_seller)
 
     def test_46_shopee_orders_payment_method_metadata_not_converted_to_account(self) -> None:
         adapter = shopee_orders_mod.ShopeeOrdersReceiptAdapter()
-        obs_list = adapter.extract_account_observations(None)
-        self.assertEqual(obs_list, [])
+        self.assertEqual(adapter.descriptor.source_registry_id, "shopee_orders")
+        self.assertFalse(hasattr(adapter, "extract_account_observations"))
 
-    def test_47_shopee_orders_shipping_metadata_excluded(self) -> None:
+    def test_47_shopee_orders_shipping_metadata_excluded_from_accounts(self) -> None:
         adapter = shopee_orders_mod.ShopeeOrdersReceiptAdapter()
-        obs_list = adapter.extract_account_observations(None)
-        self.assertEqual(obs_list, [])
+        self.assertFalse(hasattr(adapter, "extract_account_observations"))
 
-    def test_48_shopee_orders_idempotent_empty_result(self) -> None:
-        adapter = shopee_orders_mod.ShopeeOrdersReceiptAdapter()
-        res1 = adapter.extract_account_observations(None)
-        res2 = adapter.extract_account_observations(None)
-        res3 = shopee_orders_mod.extract_account_observations("dummy")
-        self.assertEqual(res1, [])
-        self.assertEqual(res2, [])
-        self.assertEqual(res3, [])
+    def test_48_shopee_orders_invents_no_accounts_in_resolver(self) -> None:
+        plan = self.resolver.resolve([])
+        self.assertEqual(plan.resolutions, ())
+        self.assertEqual(plan.diagnostics, ())
 
 
 if __name__ == "__main__":
