@@ -7,7 +7,21 @@ from hashlib import sha256
 import json
 import sqlite3
 import unicodedata
-from typing import Callable, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
+
+from .ingestion_matching import (
+    DeterministicEvidenceMatcher,
+    EconomicEventGroup,
+    EvidenceMatchDecision,
+    EvidenceMatchPlan,
+    MatchReasonCode,
+    MatchRelation,
+    MatchTier,
+    MatchingContext,
+    ProtectedAccountBinding,
+    SafeEvidenceRecord,
+    make_evidence_record_from_envelope,
+)
 
 from .ingestion_adapter import (
     AdapterContractError,
@@ -88,6 +102,7 @@ class DryRunStage(str, Enum):
     ADAPTER = "ADAPTER"
     IDENTITY = "IDENTITY"
     ACCOUNT_DISCOVERY = "ACCOUNT_DISCOVERY"
+    MATCHING = "MATCHING"
     BATCH = "BATCH"
 
 
@@ -144,6 +159,7 @@ class DryRunBatchResult:
     documents: tuple[DryRunDocumentResult, ...]
     diagnostics: tuple[DryRunDiagnostic, ...]
     overall_status: DryRunBatchStatus
+    match_plan: EvidenceMatchPlan | None = None
 
 
 class ReadOnlyRegistryAuthority(Protocol):
@@ -1237,6 +1253,8 @@ SEMANTIC_DOCUMENT_VERSION = "semantic-document-v1"
 
 _CASEFOLD_SEMANTIC_FIELDS = {"currency"}
 _NON_SEMANTIC_PAYLOAD_FIELDS = {"event_hint"}
+DIAGNOSTIC_MATCHER_CONTRACT_FAILURE = "MATCHER_CONTRACT_FAILURE"
+
 _BATCH_FATAL_CODES = {
     "EXACT_SHA_AMBIGUOUS",
     "EXACT_SHA_LOOKUP_FAILED",
@@ -1258,6 +1276,7 @@ _BATCH_FATAL_CODES = {
     "ACCOUNT_OBSERVATION_RESULT_INVALID",
     "ACCOUNT_OBSERVATION_EXTRACTION_FAILED",
     "ACCOUNT_DISCOVERY_RESOLUTION_FAILED",
+    "MATCHER_CONTRACT_FAILURE",
 }
 
 
@@ -1560,34 +1579,164 @@ def safe_dry_run_document_view(
     }
 
 
+def _extract_account_binding_for_event(
+    envelope: NormalizedEventEnvelope,
+    doc_result: DryRunDocumentResult,
+) -> ProtectedAccountBinding | None:
+    plan = doc_result.account_discovery_plan
+    if plan is None or not plan.resolutions:
+        return None
+
+    valid_res = [
+        r for r in plan.resolutions
+        if r.protected_account_key
+        and r.lifecycle_state != LifecycleState.UNVERIFIED
+        and len(r.diagnostics) == 0
+    ]
+    if not valid_res:
+        return None
+
+    if len(valid_res) == 1:
+        res = valid_res[0]
+        return ProtectedAccountBinding(
+            protected_account_key=res.protected_account_key,
+            institution_id=res.institution_id,
+            account_type=res.account_type,
+            ownership_state=res.ownership_state,
+            ownership_confidence=res.ownership_confidence,
+            lifecycle_state=res.lifecycle_state,
+            persistence_eligible=res.persistence_eligible,
+        )
+
+    payload = envelope.payload
+    account_id = getattr(payload, "account_id", None)
+    if account_id:
+        matching = [r for r in valid_res if r.protected_account_key == account_id]
+        if len(matching) == 1:
+            res = matching[0]
+            return ProtectedAccountBinding(
+                protected_account_key=res.protected_account_key,
+                institution_id=res.institution_id,
+                account_type=res.account_type,
+                ownership_state=res.ownership_state,
+                ownership_confidence=res.ownership_confidence,
+                lifecycle_state=res.lifecycle_state,
+                persistence_eligible=res.persistence_eligible,
+            )
+
+    return None
+
+
+def _validate_evidence_match_plan(
+    plan: Any, expected_keys: set[str]
+) -> EvidenceMatchPlan:
+    if plan is None:
+        raise ValueError("Matcher returned None")
+    if not isinstance(plan, EvidenceMatchPlan):
+        raise TypeError("Matcher returned foreign object")
+    if not isinstance(plan.decisions, (tuple, list)):
+        raise TypeError("Plan decisions must be a sequence")
+    if not isinstance(plan.groups, (tuple, list)):
+        raise TypeError("Plan groups must be a sequence")
+
+    seen_decisions: set[str] = set()
+    for d in plan.decisions:
+        if not isinstance(d, EvidenceMatchDecision):
+            raise TypeError("Decision entry is not an EvidenceMatchDecision")
+        if d.evidence_key not in expected_keys:
+            raise ValueError(f"Decision references unknown evidence key: {d.evidence_key}")
+        seen_decisions.add(d.evidence_key)
+
+    auto_groups_by_key: dict[str, list[str]] = {}
+    for g in plan.groups:
+        if not isinstance(g, EconomicEventGroup):
+            raise TypeError("Group entry is not an EconomicEventGroup")
+        if len(g.member_evidence_keys) != len(set(g.member_evidence_keys)):
+            raise ValueError("Group contains duplicate member keys")
+        for mk in g.member_evidence_keys:
+            if mk not in expected_keys:
+                raise ValueError(f"Group references unknown evidence key: {mk}")
+            if g.is_auto_link_eligible:
+                auto_groups_by_key.setdefault(mk, []).append(g.group_key)
+
+    for mk, g_keys in auto_groups_by_key.items():
+        if len(g_keys) > 1:
+            raise ValueError(f"Evidence key assigned to multiple automatic match groups: {mk}")
+
+    return plan
+
+
 def safe_dry_run_batch_json(result: DryRunBatchResult) -> str:
-    return _canonical_json(
-        {
-            "diagnostics": [
+    matching_dict = None
+    if result.match_plan is not None:
+        p = result.match_plan
+        matching_dict = {
+            "counts_by_relation": {
+                "COMMERCE_PAYMENT": len(p.commerce_payment_groups),
+                "DUPLICATE_EVIDENCE": len(p.duplicate_evidence_groups),
+                "INTERNAL_TRANSFER_PAIR": len(p.internal_transfer_groups),
+                "INVESTMENT_SETTLEMENT": len(p.investment_settlement_groups),
+            },
+            "counts_by_tier": {
+                "AMBIGUOUS": len(p.ambiguous_evidence),
+                "EXACT": len(p.exact_groups),
+                "INELIGIBLE": len(p.ineligible_evidence),
+                "STRONG": len(p.strong_groups),
+                "UNMATCHED": len(p.unmatched_evidence),
+            },
+            "decisions": [
                 {
-                    "code": item.code,
-                    "locator_token": item.locator_token,
-                    "message": item.message,
-                    "severity": item.severity.value,
-                    "source_document_id": item.source_document_id,
-                    "stage": item.stage.value,
+                    "auto_link_eligible": d.is_auto_link_eligible,
+                    "evidence_key": d.evidence_key,
+                    "group_key": d.group_key,
+                    "reason_codes": [r.value for r in d.reason_codes],
+                    "relation": d.match_relation.value if d.match_relation else None,
+                    "tier": d.match_tier.value,
                 }
-                for item in result.diagnostics
+                for d in sorted(p.decisions, key=lambda x: x.evidence_key)
             ],
-            "documents": [
-                safe_dry_run_document_view(item)
-                for item in result.documents
+            "groups": [
+                {
+                    "auto_link_eligible": g.is_auto_link_eligible,
+                    "group_key": g.group_key,
+                    "member_evidence_keys": list(g.member_evidence_keys),
+                    "reason_codes": [r.value for r in g.reason_codes],
+                    "relation": g.match_relation.value,
+                    "tier": g.match_tier.value,
+                }
+                for g in sorted(p.groups, key=lambda x: x.group_key)
             ],
-            "exact_duplicate_count": result.exact_duplicate_count,
-            "failed_count": result.failed_count,
-            "occurrence_count": result.occurrence_count,
-            "overall_status": result.overall_status.value,
-            "ready_for_staging_count": result.ready_for_staging_count,
-            "review_required_count": result.review_required_count,
-            "semantic_duplicate_count": result.semantic_duplicate_count,
-            "unique_artifact_count": result.unique_artifact_count,
+            "matcher_contract_version": p.matcher_contract_version,
         }
-    )
+
+    batch_dict: dict[str, Any] = {
+        "diagnostics": [
+            {
+                "code": item.code,
+                "locator_token": item.locator_token,
+                "message": item.message,
+                "severity": item.severity.value,
+                "source_document_id": item.source_document_id,
+                "stage": item.stage.value,
+            }
+            for item in result.diagnostics
+        ],
+        "documents": [
+            safe_dry_run_document_view(item)
+            for item in result.documents
+        ],
+        "exact_duplicate_count": result.exact_duplicate_count,
+        "failed_count": result.failed_count,
+        "occurrence_count": result.occurrence_count,
+        "overall_status": result.overall_status.value,
+        "ready_for_staging_count": result.ready_for_staging_count,
+        "review_required_count": result.review_required_count,
+        "semantic_duplicate_count": result.semantic_duplicate_count,
+        "unique_artifact_count": result.unique_artifact_count,
+    }
+    if matching_dict is not None:
+        batch_dict["matching"] = matching_dict
+    return _canonical_json(batch_dict)
 
 
 def _diagnostic_sort_key(
@@ -1613,6 +1762,8 @@ def dry_run_batch(
     preflight_func: PreflightFunction = preflight_bytes,
     account_resolver: AccountDiscoveryResolver | None = None,
     existing_accounts: Sequence[ExistingAccountState] | None = None,
+    evidence_matcher: Any = None,
+    matching_context: MatchingContext | None = None,
 ) -> DryRunBatchResult:
     claims = dict(claimed_source_registry_ids or {})
     documents = tuple(
@@ -1648,6 +1799,42 @@ def dry_run_batch(
     ]
     for document in documents:
         diagnostics.extend(document.diagnostics)
+
+    # Collect matchable evidence from eligible documents
+    evidence_records: list[SafeEvidenceRecord] = []
+    for document in documents:
+        is_doc_eligible = document.disposition is DryRunDisposition.READY_FOR_STAGING
+        if is_doc_eligible and document.adapter_result is not None:
+            for env in document.adapter_result.events:
+                binding = _extract_account_binding_for_event(env, document)
+                rec = make_evidence_record_from_envelope(
+                    env,
+                    account_binding=binding,
+                    document_disposition_eligible=is_doc_eligible,
+                    document_requires_review=False,
+                )
+                evidence_records.append(rec)
+
+    expected_keys = {r.evidence_key for r in evidence_records}
+    match_plan: EvidenceMatchPlan | None = None
+    matcher_failure_diag: DryRunDiagnostic | None = None
+
+    matcher = evidence_matcher if evidence_matcher is not None else DeterministicEvidenceMatcher()
+    try:
+        raw_plan = matcher.match(evidence_records, context=matching_context)
+        match_plan = _validate_evidence_match_plan(raw_plan, expected_keys)
+    except Exception:
+        matcher_failure_diag = _diagnostic(
+            DIAGNOSTIC_MATCHER_CONTRACT_FAILURE,
+            DryRunStage.MATCHING,
+            DiagnosticSeverity.ERROR,
+            "Evidence matching execution failed.",
+        )
+        match_plan = None
+
+    if matcher_failure_diag is not None:
+        diagnostics.append(matcher_failure_diag)
+
     ordered_diagnostics = tuple(
         sorted(diagnostics, key=_diagnostic_sort_key)
     )
@@ -1696,6 +1883,7 @@ def dry_run_batch(
         documents=documents,
         diagnostics=ordered_diagnostics,
         overall_status=overall_status,
+        match_plan=match_plan,
     )
 
 
@@ -1710,6 +1898,7 @@ __all__ = [
     "DIAGNOSTIC_ACCOUNT_OBSERVATION_EXTRACTION_FAILED",
     "DIAGNOSTIC_ACCOUNT_OBSERVATION_EXTRACTOR_MISSING",
     "DIAGNOSTIC_ACCOUNT_OBSERVATION_RESULT_INVALID",
+    "DIAGNOSTIC_MATCHER_CONTRACT_FAILURE",
     "DryRunBatchResult",
     "DryRunBatchStatus",
     "DryRunDiagnostic",
