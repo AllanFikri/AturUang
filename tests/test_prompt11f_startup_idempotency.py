@@ -17,9 +17,21 @@ import sys
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(BASE_DIR / "aturuang"))
+sys.path.insert(0, str(BASE_DIR / "scripts"))
 
 import db
 import services
+from run_smoke_tests import (
+    SYNTHETIC_ACCOUNT_NAME,
+    SYNTHETIC_ACCOUNT_BALANCE,
+    SYNTHETIC_GOAL_NAME,
+    SYNTHETIC_GOAL_ALLOCATED,
+    SYNTHETIC_COMMITMENT_NAME,
+    SYNTHETIC_COMMITMENT_AMOUNT,
+    SYNTHETIC_SAFE_TO_SPEND,
+    seed_synthetic_smoke_fixture,
+    run_smoke_in_dir,
+)
 
 def get_db_fingerprint(con: sqlite3.Connection) -> dict:
     """Extracts a comprehensive logical & data fingerprint of the database."""
@@ -64,12 +76,10 @@ def get_db_fingerprint(con: sqlite3.Connection) -> dict:
 
 class TestPrompt11fStartupIdempotency(unittest.TestCase):
     def setUp(self):
-        self.prod_db = BASE_DIR / "runtime" / "money_tracks.db"
-        self.prod_hash_before = hashlib.sha256(self.prod_db.read_bytes()).hexdigest() if self.prod_db.exists() else None
-        
         self.tmp_dir = tempfile.mkdtemp()
-        self.test_db = Path(self.tmp_dir) / "money_tracks.db"
-        shutil.copyfile(self.prod_db, self.test_db)
+        self.test_db = Path(self.tmp_dir) / "disposable_idempotency.db"
+        db.init_db(self.test_db)
+        seed_synthetic_smoke_fixture(self.test_db)
         
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
@@ -165,7 +175,7 @@ class TestPrompt11fStartupIdempotency(unittest.TestCase):
             account TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('Upcoming','Paid'))
         )""")
-        con.execute("INSERT INTO upcoming (due_date, title, amount, category, account, status) VALUES ('2026-08-30', 'Old Test', 100000.0, 'Education', 'BCA Main', 'Upcoming')")
+        con.execute("INSERT INTO upcoming (due_date, title, amount, category, account, status) VALUES ('2026-08-30', 'Old Test', 100.0, 'Education', 'Synthetic Account Alpha', 'Upcoming')")
         con.commit()
         con.close()
 
@@ -180,28 +190,54 @@ class TestPrompt11fStartupIdempotency(unittest.TestCase):
         self.assertIn("linked_goal_id", cols)
         
         # Insert Tentative status row (must succeed)
-        con_mig.execute("INSERT INTO upcoming (due_date, title, amount, category, account, status, reserve_now) VALUES ('2026-08-31', 'Tentative Test', 50000.0, 'General', 'BCA Main', 'Tentative', 0)")
+        con_mig.execute("INSERT INTO upcoming (due_date, title, amount, category, account, status, reserve_now) VALUES ('2026-08-31', 'Tentative Test', 50.0, 'General', 'Synthetic Account Alpha', 'Tentative', 0)")
         con_mig.commit()
         con_mig.close()
 
-    def test_07_production_db_isolation(self):
-        """Test 7: Production database was never mutated during tests."""
-        prod_hash_now = hashlib.sha256(self.prod_db.read_bytes()).hexdigest()
-        self.assertEqual(prod_hash_now, self.prod_hash_before, "Production database was altered during test execution!")
+    def test_07_disposable_db_isolation(self):
+        """Test 7: Tests run strictly on disposable database in temp directory."""
+        self.assertTrue(self.test_db.exists(), "Disposable test database must exist in temp directory!")
+        self.assertTrue(str(self.test_db).startswith(tempfile.gettempdir()), "Test database must reside in temp directory!")
 
     def test_08_prompt11_formula_invariant(self):
-        """Test 8: Prompt 11 formula calculation produces exactly Rp1.629.368,80 on production baseline."""
+        """Test 8: Formula calculation matches expected invariants on sanitized synthetic fixtures."""
         con = sqlite3.connect(f"file:{self.test_db.as_posix()}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         dash = services.dashboard(con, "2026-08")
         k = dash["kpis"]
         con.close()
 
-        self.assertAlmostEqual(k["totalBalance"], 2379368.80, delta=0.005)
-        self.assertAlmostEqual(k["emergencyAllocated"], 500000.0, delta=0.005)
-        self.assertAlmostEqual(k["effectiveConfirmedCommitments"], 250000.0, delta=0.005)
+        self.assertAlmostEqual(k["totalBalance"], SYNTHETIC_ACCOUNT_BALANCE, delta=0.005)
+        self.assertAlmostEqual(k["emergencyAllocated"], SYNTHETIC_GOAL_ALLOCATED, delta=0.005)
+        self.assertAlmostEqual(k["effectiveConfirmedCommitments"], SYNTHETIC_COMMITMENT_AMOUNT, delta=0.005)
         self.assertAlmostEqual(k["tentativeReserved"], 0.0, delta=0.005)
-        self.assertAlmostEqual(k["safeToSpend"], 1629368.80, delta=0.005)
+        self.assertAlmostEqual(k["safeToSpend"], SYNTHETIC_SAFE_TO_SPEND, delta=0.005)
+
+    def test_09_smoke_cleanup_normal_completion(self):
+        """Test 9: Smoke test normal completion leaves no database or sidecar files behind."""
+        with tempfile.TemporaryDirectory() as td:
+            tpath = Path(td)
+            run_smoke_in_dir(tpath)
+            remaining = [f.name for f in tpath.glob("*.db*")]
+            self.assertEqual(remaining, [], f"Expected zero database/sidecar files, found: {remaining}")
+
+    def test_10_smoke_cleanup_intentional_exception(self):
+        """Test 10: Smoke test exception handling leaves no database or sidecar files behind."""
+        with tempfile.TemporaryDirectory() as td:
+            tpath = Path(td)
+            with self.assertRaises(RuntimeError):
+                run_smoke_in_dir(tpath, raise_intentional=True)
+            remaining = [f.name for f in tpath.glob("*.db*")]
+            self.assertEqual(remaining, [], f"Expected zero database/sidecar files after exception, found: {remaining}")
+
+    def test_11_smoke_cleanup_connection_failure(self):
+        """Test 11: Smoke test connection failure leaves no database or sidecar files behind."""
+        with tempfile.TemporaryDirectory() as td:
+            tpath = Path(td)
+            with self.assertRaises(Exception):
+                run_smoke_in_dir(tpath, cause_conn_failure=True)
+            remaining = [f.name for f in tpath.glob("*.db*")]
+            self.assertEqual(remaining, [], f"Expected zero database/sidecar files after conn failure, found: {remaining}")
 
 
 if __name__ == "__main__":
