@@ -8,7 +8,7 @@ normalized evidence without merging, modifying, or deleting original records.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
@@ -34,12 +34,22 @@ from .ingestion_account_discovery import (
     AccountDiscoveryPlan,
     AccountResolution,
 )
+from .ingestion_identity_privacy import (
+    is_valid_protected_key,
+    validate_protected_key,
+)
 
 
 MATCHER_CONTRACT_VERSION: str = "truth-loop-matching-v1"
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class RelationshipKind(str, Enum):
+    COMMERCE_PAYMENT = "COMMERCE_PAYMENT"
+    BROKER_SETTLEMENT = "BROKER_SETTLEMENT"
+    INVESTMENT_SETTLEMENT = "INVESTMENT_SETTLEMENT"
 
 
 class MatchTier(str, Enum):
@@ -98,11 +108,17 @@ def _optional_finite_decimal(value: Any, field_name: str) -> Decimal | None:
 def _parse_iso_date(val: str | None) -> date | None:
     if not val or not isinstance(val, str):
         return None
-    d_str = val[:10]
-    if not _DATE_RE.fullmatch(d_str):
+    val_clean = val.strip()
+    if not val_clean:
         return None
     try:
-        return date.fromisoformat(d_str)
+        if len(val_clean) == 10:
+            if not _DATE_RE.fullmatch(val_clean):
+                return None
+            return date.fromisoformat(val_clean)
+        dt_str = val_clean.replace("Z", "+00:00") if val_clean.endswith("Z") else val_clean
+        dt = datetime.fromisoformat(dt_str)
+        return dt.date()
     except ValueError:
         return None
 
@@ -144,13 +160,14 @@ class ProtectedAccountBinding:
     persistence_eligible: bool = True
 
     def __post_init__(self) -> None:
-        if not isinstance(self.protected_account_key, str) or not self.protected_account_key.strip():
-            raise ValueError("protected_account_key must not be empty")
+        validate_protected_key(self.protected_account_key)
         if not isinstance(self.institution_id, str) or not self.institution_id.strip():
             raise ValueError("institution_id must not be empty")
 
     @property
     def is_explicitly_owned(self) -> bool:
+        if not is_valid_protected_key(self.protected_account_key):
+            return False
         try:
             state = OwnershipState(self.ownership_state)
             conf = ConfidenceLevel(self.ownership_confidence)
@@ -167,15 +184,26 @@ class ProtectedAccountBinding:
 class AccountRelationship:
     source_key: str
     target_key: str
-    relationship_kind: str
+    relationship_kind: RelationshipKind | str
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_key, str) or not self.source_key.strip():
             raise ValueError("source_key must not be empty")
         if not isinstance(self.target_key, str) or not self.target_key.strip():
             raise ValueError("target_key must not be empty")
-        if not isinstance(self.relationship_kind, str) or not self.relationship_kind.strip():
-            raise ValueError("relationship_kind must not be empty")
+        if isinstance(self.relationship_kind, RelationshipKind):
+            pass
+        elif isinstance(self.relationship_kind, str):
+            try:
+                object.__setattr__(
+                    self, "relationship_kind", RelationshipKind(self.relationship_kind)
+                )
+            except ValueError:
+                raise ValueError(
+                    f"Invalid relationship_kind: {self.relationship_kind}. Must be one of {[k.value for k in RelationshipKind]}"
+                )
+        else:
+            raise TypeError("relationship_kind must be RelationshipKind or str")
 
 
 @dataclass(frozen=True)
@@ -192,21 +220,41 @@ class MatchingContext:
             cleaned.append(r)
         object.__setattr__(self, "relationships", tuple(cleaned))
 
-    def has_relationship(
+    def has_commerce_payment(
         self,
-        key_a: str | None,
-        key_b: str | None,
-        relationship_kind: str | None = None,
+        commerce_registry_id: str,
+        payment_account_key: str,
     ) -> bool:
-        if not key_a or not key_b:
+        if not commerce_registry_id or not payment_account_key:
+            return False
+        if not is_valid_protected_key(payment_account_key):
             return False
         for r in self.relationships:
-            if relationship_kind and r.relationship_kind != relationship_kind:
-                continue
-            if (r.source_key == key_a and r.target_key == key_b) or (
-                r.source_key == key_b and r.target_key == key_a
+            if r.relationship_kind is RelationshipKind.COMMERCE_PAYMENT:
+                if (r.source_key == commerce_registry_id and r.target_key == payment_account_key) or (
+                    r.source_key == payment_account_key and r.target_key == commerce_registry_id
+                ):
+                    return True
+        return False
+
+    def has_investment_settlement(
+        self,
+        broker_key: str,
+        settlement_account_key: str,
+    ) -> bool:
+        if not broker_key or not settlement_account_key:
+            return False
+        if not is_valid_protected_key(settlement_account_key):
+            return False
+        for r in self.relationships:
+            if r.relationship_kind in (
+                RelationshipKind.BROKER_SETTLEMENT,
+                RelationshipKind.INVESTMENT_SETTLEMENT,
             ):
-                return True
+                if (r.source_key == broker_key and r.target_key == settlement_account_key) or (
+                    r.source_key == settlement_account_key and r.target_key == broker_key
+                ):
+                    return True
         return False
 
 
@@ -572,50 +620,40 @@ class DeterministicEvidenceMatcher:
                     groups,
                 )
 
-        # 2c. By document reference (inside same document)
-        doc_ref_groups: dict[tuple[str, str], list[SafeEvidenceRecord]] = {}
-        for r in eligible_records:
-            if r.evidence_key not in handled_keys and r.reference_raw:
-                token = (r.source_document_id, r.reference_raw)
-                doc_ref_groups.setdefault(token, []).append(r)
-
-        for token, cluster in doc_ref_groups.items():
-            if len(cluster) > 1:
-                self._evaluate_exact_cluster(
-                    cluster,
-                    MatchReasonCode.SAME_DOCUMENT_REFERENCE,
-                    handled_keys,
-                    decisions,
-                    groups,
-                )
-
         # Step 3: STRONG Matching
         remaining_eligible = [r for r in records if r.evidence_key not in handled_keys]
 
         # Evaluate candidate compatibility pairs for STRONG relations
-        transfer_pairs = self._find_transfer_pairs(remaining_eligible)
-        commerce_pairs = self._find_commerce_pairs(remaining_eligible, context)
-        investment_pairs = self._find_investment_pairs(remaining_eligible, context)
+        candidate_pairs: dict[tuple[str, str], tuple[MatchRelation, list[MatchReasonCode]]] = {}
 
-        # Combine candidate pairings per relation and check unique mutual pairing
-        all_relations = [
-            (MatchRelation.INTERNAL_TRANSFER_PAIR, MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT, transfer_pairs),
-            (MatchRelation.COMMERCE_PAYMENT, MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION, commerce_pairs),
-            (MatchRelation.INVESTMENT_SETTLEMENT, MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION, investment_pairs),
-        ]
+        def _add_pair(k_a: str, k_b: str, rel: MatchRelation, code: MatchReasonCode) -> None:
+            pk = (min(k_a, k_b), max(k_a, k_b))
+            if pk in candidate_pairs:
+                existing_rel, existing_codes = candidate_pairs[pk]
+                if existing_rel == rel:
+                    if code not in existing_codes:
+                        existing_codes.append(code)
+            else:
+                candidate_pairs[pk] = (rel, [code])
+
+        for k1, k2 in self._find_transfer_pairs(remaining_eligible):
+            _add_pair(k1, k2, MatchRelation.INTERNAL_TRANSFER_PAIR, MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT)
+
+        for k1, k2 in self._find_commerce_pairs(remaining_eligible, context):
+            _add_pair(k1, k2, MatchRelation.COMMERCE_PAYMENT, MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION)
+
+        for k1, k2 in self._find_investment_pairs(remaining_eligible, context):
+            _add_pair(k1, k2, MatchRelation.INVESTMENT_SETTLEMENT, MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION)
+
+        for k1, k2, rel, reasons in self._find_same_document_reference_pairs(remaining_eligible):
+            for rc in reasons:
+                _add_pair(k1, k2, rel, rc)
 
         # Global adjacency across all strong relations to prevent ambiguous cross-relation matching
         global_adj: dict[str, set[str]] = {}
-        rel_adj: dict[MatchRelation, dict[str, set[str]]] = {}
-
-        for relation, reason_code, pairs in all_relations:
-            radj: dict[str, set[str]] = {}
-            for k1, k2 in pairs:
-                radj.setdefault(k1, set()).add(k2)
-                radj.setdefault(k2, set()).add(k1)
-                global_adj.setdefault(k1, set()).add(k2)
-                global_adj.setdefault(k2, set()).add(k1)
-            rel_adj[relation] = radj
+        for (k1, k2) in candidate_pairs:
+            global_adj.setdefault(k1, set()).add(k2)
+            global_adj.setdefault(k2, set()).add(k1)
 
         # Find keys that have degree > 1 in global adjacency
         ambiguous_keys: set[str] = set()
@@ -638,41 +676,39 @@ class DeterministicEvidenceMatcher:
                 handled_keys.add(k)
 
         # Form unique mutual pairs
-        for relation, reason_code, pairs in all_relations:
-            radj = rel_adj[relation]
-            for k1, k2 in pairs:
-                if k1 in handled_keys or k2 in handled_keys:
-                    continue
-                if radj.get(k1) == {k2} and radj.get(k2) == {k1}:
-                    member_keys = (min(k1, k2), max(k1, k2))
-                    g_key = compute_group_key(relation, member_keys, self.version)
-                    group = EconomicEventGroup(
-                        group_key=g_key,
-                        match_tier=MatchTier.STRONG,
-                        match_relation=relation,
-                        member_evidence_keys=member_keys,
-                        reason_codes=(reason_code,),
-                        is_auto_link_eligible=True,
-                    )
-                    groups.append(group)
-                    decisions[k1] = EvidenceMatchDecision(
-                        evidence_key=k1,
-                        match_tier=MatchTier.STRONG,
-                        match_relation=relation,
-                        group_key=g_key,
-                        reason_codes=(reason_code,),
-                        is_auto_link_eligible=True,
-                    )
-                    decisions[k2] = EvidenceMatchDecision(
-                        evidence_key=k2,
-                        match_tier=MatchTier.STRONG,
-                        match_relation=relation,
-                        group_key=g_key,
-                        reason_codes=(reason_code,),
-                        is_auto_link_eligible=True,
-                    )
-                    handled_keys.add(k1)
-                    handled_keys.add(k2)
+        for (k1, k2), (relation, reasons) in sorted(candidate_pairs.items()):
+            if k1 in handled_keys or k2 in handled_keys:
+                continue
+            if global_adj.get(k1) == {k2} and global_adj.get(k2) == {k1}:
+                member_keys = (k1, k2)
+                g_key = compute_group_key(relation, member_keys, self.version)
+                group = EconomicEventGroup(
+                    group_key=g_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=relation,
+                    member_evidence_keys=member_keys,
+                    reason_codes=tuple(reasons),
+                    is_auto_link_eligible=True,
+                )
+                groups.append(group)
+                decisions[k1] = EvidenceMatchDecision(
+                    evidence_key=k1,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=relation,
+                    group_key=g_key,
+                    reason_codes=tuple(reasons),
+                    is_auto_link_eligible=True,
+                )
+                decisions[k2] = EvidenceMatchDecision(
+                    evidence_key=k2,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=relation,
+                    group_key=g_key,
+                    reason_codes=tuple(reasons),
+                    is_auto_link_eligible=True,
+                )
+                handled_keys.add(k1)
+                handled_keys.add(k2)
 
         # Step 4: Any remaining records are UNMATCHED
         for r in records:
@@ -713,8 +749,10 @@ class DeterministicEvidenceMatcher:
             return MatchReasonCode.AMOUNT_MISMATCH
         if not r.currency:
             return MatchReasonCode.CURRENCY_MISMATCH
-        if not _parse_iso_date(r.event_date):
+        if not r.event_date:
             return MatchReasonCode.MISSING_REQUIRED_DATE
+        if not _parse_iso_date(r.event_date):
+            return MatchReasonCode.INVALID_DATE
         return MatchReasonCode.STATUS_NOT_ELIGIBLE
 
     def _unmatched_reason(self, r: SafeEvidenceRecord) -> MatchReasonCode | None:
@@ -895,24 +933,12 @@ class DeterministicEvidenceMatcher:
         cash: SafeEvidenceRecord,
         context: MatchingContext,
     ) -> bool:
-        order_keys = [order.source_registry_id, order.source_document_id, order.evidence_key]
-        if order.account_binding:
-            order_keys.append(order.account_binding.protected_account_key)
-
-        cash_keys = [cash.source_registry_id, cash.source_document_id, cash.evidence_key]
-        if cash.account_binding:
-            cash_keys.extend([
-                cash.account_binding.protected_account_key,
-                cash.account_binding.institution_id,
-            ])
-
-        for ok in order_keys:
-            for ck in cash_keys:
-                if context.has_relationship(ok, ck, "COMMERCE_PAYMENT"):
-                    return True
-                if context.has_relationship(ok, ck):
-                    return True
-        return False
+        if not cash.account_binding:
+            return False
+        return context.has_commerce_payment(
+            order.source_registry_id,
+            cash.account_binding.protected_account_key,
+        )
 
     def _find_investment_pairs(
         self,
@@ -977,23 +1003,118 @@ class DeterministicEvidenceMatcher:
         cash: SafeEvidenceRecord,
         context: MatchingContext,
     ) -> bool:
-        trade_keys = [trade.source_registry_id, trade.source_document_id, trade.evidence_key]
-        if trade.account_binding:
-            trade_keys.append(trade.account_binding.protected_account_key)
+        if not cash.account_binding:
+            return False
+        return context.has_investment_settlement(
+            trade.source_registry_id,
+            cash.account_binding.protected_account_key,
+        )
 
-        cash_keys = [cash.source_registry_id, cash.source_document_id, cash.evidence_key]
-        if cash.account_binding:
-            cash_keys.extend([
-                cash.account_binding.protected_account_key,
-                cash.account_binding.institution_id,
-            ])
+    def _find_same_document_reference_pairs(
+        self,
+        records: list[SafeEvidenceRecord],
+    ) -> list[tuple[str, str, MatchRelation, tuple[MatchReasonCode, ...]]]:
+        doc_ref_map: dict[tuple[str, str], list[SafeEvidenceRecord]] = {}
+        for r in records:
+            if r.source_document_id and r.reference_raw:
+                token = (r.source_document_id, r.reference_raw)
+                doc_ref_map.setdefault(token, []).append(r)
 
-        for tk in trade_keys:
-            for ck in cash_keys:
-                if (
-                    context.has_relationship(tk, ck, "BROKER_SETTLEMENT")
-                    or context.has_relationship(tk, ck, "INVESTMENT_SETTLEMENT")
-                    or context.has_relationship(tk, ck)
-                ):
-                    return True
-        return False
+        pairs: list[tuple[str, str, MatchRelation, tuple[MatchReasonCode, ...]]] = []
+
+        for token, cluster in doc_ref_map.items():
+            if len(cluster) < 2:
+                continue
+
+            for i in range(len(cluster)):
+                for j in range(i + 1, len(cluster)):
+                    a = cluster[i]
+                    b = cluster[j]
+
+                    # Same-role rows sharing a reference are skipped (never duplicates)
+                    if a.event_role == b.event_role:
+                        continue
+
+                    # Case A: INVESTMENT_TRADE + CASH_MOVEMENT
+                    trade: SafeEvidenceRecord | None = None
+                    cash: SafeEvidenceRecord | None = None
+                    if a.event_role is EventRole.INVESTMENT_TRADE and b.event_role is EventRole.CASH_MOVEMENT:
+                        trade, cash = a, b
+                    elif b.event_role is EventRole.INVESTMENT_TRADE and a.event_role is EventRole.CASH_MOVEMENT:
+                        trade, cash = b, a
+
+                    if trade is not None and cash is not None:
+                        if trade.net_amount is None or cash.amount is None:
+                            continue
+                        if trade.currency != cash.currency or trade.net_amount != cash.amount:
+                            continue
+                        # Directions
+                        if trade.trade_side == "BUY" and cash.direction != EventDirection.OUTFLOW:
+                            continue
+                        if trade.trade_side == "SELL" and cash.direction != EventDirection.INFLOW:
+                            continue
+                        # Non-conflicting dates
+                        d_t = _parse_iso_date(trade.settlement_date or trade.event_date)
+                        d_c = _parse_iso_date(cash.event_date)
+                        if d_t is not None and d_c is not None and calendar_days_between(d_t, d_c) > 2:
+                            continue
+
+                        k1, k2 = min(trade.evidence_key, cash.evidence_key), max(trade.evidence_key, cash.evidence_key)
+                        pairs.append((
+                            k1,
+                            k2,
+                            MatchRelation.INVESTMENT_SETTLEMENT,
+                            (MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION, MatchReasonCode.SAME_DOCUMENT_REFERENCE),
+                        ))
+                        continue
+
+                    # Case B: COMMERCE_ORDER + CASH_MOVEMENT
+                    order: SafeEvidenceRecord | None = None
+                    if a.event_role is EventRole.COMMERCE_ORDER and b.event_role is EventRole.CASH_MOVEMENT:
+                        order, cash = a, b
+                    elif b.event_role is EventRole.COMMERCE_ORDER and a.event_role is EventRole.CASH_MOVEMENT:
+                        order, cash = b, a
+
+                    if order is not None and cash is not None:
+                        if order.amount is None or cash.amount is None:
+                            continue
+                        if order.currency != cash.currency or order.amount != cash.amount:
+                            continue
+                        if cash.direction != EventDirection.OUTFLOW:
+                            continue
+                        # Non-conflicting dates
+                        d_o = _parse_iso_date(order.event_date)
+                        d_c = _parse_iso_date(cash.event_date)
+                        if d_o is not None and d_c is not None and calendar_days_between(d_o, d_c) > 3:
+                            continue
+
+                        k1, k2 = min(order.evidence_key, cash.evidence_key), max(order.evidence_key, cash.evidence_key)
+                        pairs.append((
+                            k1,
+                            k2,
+                            MatchRelation.COMMERCE_PAYMENT,
+                            (MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION, MatchReasonCode.SAME_DOCUMENT_REFERENCE),
+                        ))
+                        continue
+
+        return pairs
+
+
+__all__ = [
+    "MATCHER_CONTRACT_VERSION",
+    "RelationshipKind",
+    "MatchTier",
+    "MatchRelation",
+    "MatchReasonCode",
+    "ProtectedAccountBinding",
+    "AccountRelationship",
+    "MatchingContext",
+    "SafeEvidenceRecord",
+    "EvidenceMatchDecision",
+    "EconomicEventGroup",
+    "EvidenceMatchPlan",
+    "DeterministicEvidenceMatcher",
+    "compute_evidence_key",
+    "compute_group_key",
+    "make_evidence_record_from_envelope",
+]

@@ -5,6 +5,7 @@ from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 import json
+import re
 import sqlite3
 import unicodedata
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
@@ -20,8 +21,16 @@ from .ingestion_matching import (
     MatchingContext,
     ProtectedAccountBinding,
     SafeEvidenceRecord,
+    compute_evidence_key,
+    compute_group_key,
     make_evidence_record_from_envelope,
+    MATCHER_CONTRACT_VERSION,
 )
+from .ingestion_identity_privacy import (
+    is_valid_protected_key,
+)
+
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 from .ingestion_adapter import (
     AdapterContractError,
@@ -1587,33 +1596,19 @@ def _extract_account_binding_for_event(
     if plan is None or not plan.resolutions:
         return None
 
-    valid_res = [
-        r for r in plan.resolutions
-        if r.protected_account_key
-        and r.lifecycle_state != LifecycleState.UNVERIFIED
-        and len(r.diagnostics) == 0
-    ]
-    if not valid_res:
-        return None
+    try:
+        valid_res = [
+            r for r in plan.resolutions
+            if r.protected_account_key
+            and is_valid_protected_key(r.protected_account_key)
+            and r.lifecycle_state != LifecycleState.UNVERIFIED
+            and len(r.diagnostics) == 0
+        ]
+        if not valid_res:
+            return None
 
-    if len(valid_res) == 1:
-        res = valid_res[0]
-        return ProtectedAccountBinding(
-            protected_account_key=res.protected_account_key,
-            institution_id=res.institution_id,
-            account_type=res.account_type,
-            ownership_state=res.ownership_state,
-            ownership_confidence=res.ownership_confidence,
-            lifecycle_state=res.lifecycle_state,
-            persistence_eligible=res.persistence_eligible,
-        )
-
-    payload = envelope.payload
-    account_id = getattr(payload, "account_id", None)
-    if account_id:
-        matching = [r for r in valid_res if r.protected_account_key == account_id]
-        if len(matching) == 1:
-            res = matching[0]
+        if len(valid_res) == 1:
+            res = valid_res[0]
             return ProtectedAccountBinding(
                 protected_account_key=res.protected_account_key,
                 institution_id=res.institution_id,
@@ -1623,6 +1618,24 @@ def _extract_account_binding_for_event(
                 lifecycle_state=res.lifecycle_state,
                 persistence_eligible=res.persistence_eligible,
             )
+
+        payload = envelope.payload
+        account_id = getattr(payload, "account_id", None)
+        if account_id and is_valid_protected_key(account_id):
+            matching = [r for r in valid_res if r.protected_account_key == account_id]
+            if len(matching) == 1:
+                res = matching[0]
+                return ProtectedAccountBinding(
+                    protected_account_key=res.protected_account_key,
+                    institution_id=res.institution_id,
+                    account_type=res.account_type,
+                    ownership_state=res.ownership_state,
+                    ownership_confidence=res.ownership_confidence,
+                    lifecycle_state=res.lifecycle_state,
+                    persistence_eligible=res.persistence_eligible,
+                )
+    except Exception:
+        return None
 
     return None
 
@@ -1634,34 +1647,121 @@ def _validate_evidence_match_plan(
         raise ValueError("Matcher returned None")
     if not isinstance(plan, EvidenceMatchPlan):
         raise TypeError("Matcher returned foreign object")
+    if plan.matcher_contract_version != MATCHER_CONTRACT_VERSION:
+        raise ValueError(
+            f"Invalid matcher_contract_version: {plan.matcher_contract_version!r}, expected {MATCHER_CONTRACT_VERSION!r}"
+        )
     if not isinstance(plan.decisions, (tuple, list)):
         raise TypeError("Plan decisions must be a sequence")
     if not isinstance(plan.groups, (tuple, list)):
         raise TypeError("Plan groups must be a sequence")
 
-    seen_decisions: set[str] = set()
+    seen_decisions: dict[str, EvidenceMatchDecision] = {}
     for d in plan.decisions:
         if not isinstance(d, EvidenceMatchDecision):
             raise TypeError("Decision entry is not an EvidenceMatchDecision")
         if d.evidence_key not in expected_keys:
             raise ValueError(f"Decision references unknown evidence key: {d.evidence_key}")
-        seen_decisions.add(d.evidence_key)
+        if d.evidence_key in seen_decisions:
+            raise ValueError(f"Duplicate decision for evidence key: {d.evidence_key}")
+        seen_decisions[d.evidence_key] = d
 
-    auto_groups_by_key: dict[str, list[str]] = {}
+    if set(seen_decisions.keys()) != expected_keys:
+        missing = expected_keys - set(seen_decisions.keys())
+        raise ValueError(f"Missing decisions for expected keys: {missing}")
+
+    seen_group_keys: set[str] = set()
+    groups_by_key: dict[str, EconomicEventGroup] = {}
+    member_to_group: dict[str, str] = {}
+
     for g in plan.groups:
         if not isinstance(g, EconomicEventGroup):
             raise TypeError("Group entry is not an EconomicEventGroup")
+        if not isinstance(g.group_key, str) or not _HEX64_RE.fullmatch(g.group_key):
+            raise ValueError(f"Invalid group key format: {g.group_key}")
+        if g.group_key in seen_group_keys:
+            raise ValueError(f"Duplicate group key: {g.group_key}")
+        seen_group_keys.add(g.group_key)
+        groups_by_key[g.group_key] = g
+
+        if len(g.member_evidence_keys) < 2:
+            raise ValueError(f"Group must have at least 2 members: {g.group_key}")
         if len(g.member_evidence_keys) != len(set(g.member_evidence_keys)):
-            raise ValueError("Group contains duplicate member keys")
+            raise ValueError(f"Group contains duplicate member keys: {g.group_key}")
+
+        expected_group_key = compute_group_key(
+            g.match_relation, g.member_evidence_keys, plan.matcher_contract_version
+        )
+        if g.group_key != expected_group_key:
+            raise ValueError(
+                f"Group key recomputation mismatch: expected {expected_group_key}, got {g.group_key}"
+            )
+
+        # Tier and relation constraints
+        if g.match_tier == MatchTier.EXACT:
+            if g.match_relation != MatchRelation.DUPLICATE_EVIDENCE:
+                raise ValueError(
+                    f"EXACT group relation must be DUPLICATE_EVIDENCE, got {g.match_relation}"
+                )
+        elif g.match_tier == MatchTier.STRONG:
+            if g.match_relation not in (
+                MatchRelation.INTERNAL_TRANSFER_PAIR,
+                MatchRelation.COMMERCE_PAYMENT,
+                MatchRelation.INVESTMENT_SETTLEMENT,
+            ):
+                raise ValueError(
+                    f"STRONG group relation must be INTERNAL_TRANSFER_PAIR, COMMERCE_PAYMENT, or INVESTMENT_SETTLEMENT, got {g.match_relation}"
+                )
+        else:
+            raise ValueError(f"Group match tier must be EXACT or STRONG, got {g.match_tier}")
+
         for mk in g.member_evidence_keys:
             if mk not in expected_keys:
                 raise ValueError(f"Group references unknown evidence key: {mk}")
-            if g.is_auto_link_eligible:
-                auto_groups_by_key.setdefault(mk, []).append(g.group_key)
+            if mk in member_to_group:
+                raise ValueError(
+                    f"Evidence key {mk} assigned to multiple match groups: {member_to_group[mk]} and {g.group_key}"
+                )
+            member_to_group[mk] = g.group_key
 
-    for mk, g_keys in auto_groups_by_key.items():
-        if len(g_keys) > 1:
-            raise ValueError(f"Evidence key assigned to multiple automatic match groups: {mk}")
+            # Consistency with decision
+            dec = seen_decisions.get(mk)
+            if dec is None:
+                raise ValueError(f"Group member {mk} has no decision in plan")
+            if dec.group_key != g.group_key:
+                raise ValueError(
+                    f"Decision group_key {dec.group_key} does not match group {g.group_key} for {mk}"
+                )
+            if dec.match_tier != g.match_tier:
+                raise ValueError(
+                    f"Decision match_tier {dec.match_tier} does not match group {g.match_tier} for {mk}"
+                )
+            if dec.match_relation != g.match_relation:
+                raise ValueError(
+                    f"Decision match_relation {dec.match_relation} does not match group {g.match_relation} for {mk}"
+                )
+            if dec.is_auto_link_eligible != g.is_auto_link_eligible:
+                raise ValueError(
+                    f"Decision auto_link {dec.is_auto_link_eligible} does not match group {g.is_auto_link_eligible} for {mk}"
+                )
+
+    # Check decisions for consistency and orphan groups
+    for k, d in seen_decisions.items():
+        if d.group_key is not None:
+            if d.group_key not in groups_by_key:
+                raise ValueError(f"Decision references non-existent group {d.group_key}")
+            grp = groups_by_key[d.group_key]
+            if k not in grp.member_evidence_keys:
+                raise ValueError(f"Decision references group {d.group_key} which does not contain {k}")
+        else:
+            if d.match_relation is not None:
+                raise ValueError(
+                    f"Decision without group_key must have match_relation=None, got {d.match_relation}"
+                )
+            if d.is_auto_link_eligible:
+                raise ValueError(f"Decision without group_key cannot be auto_link_eligible: {k}")
+            if d.match_tier in (MatchTier.EXACT, MatchTier.STRONG):
+                raise ValueError(f"Decision without group_key cannot have tier {d.match_tier}: {k}")
 
     return plan
 
@@ -1800,37 +1900,62 @@ def dry_run_batch(
     for document in documents:
         diagnostics.extend(document.diagnostics)
 
-    # Collect matchable evidence from eligible documents
+    # Collect matchable evidence within fail-closed boundary
     evidence_records: list[SafeEvidenceRecord] = []
-    for document in documents:
-        is_doc_eligible = document.disposition is DryRunDisposition.READY_FOR_STAGING
-        if is_doc_eligible and document.adapter_result is not None:
-            for env in document.adapter_result.events:
-                binding = _extract_account_binding_for_event(env, document)
-                rec = make_evidence_record_from_envelope(
-                    env,
-                    account_binding=binding,
-                    document_disposition_eligible=is_doc_eligible,
-                    document_requires_review=False,
-                )
-                evidence_records.append(rec)
+    evidence_collection_failed = False
+
+    try:
+        for document in documents:
+            if document.adapter_result is not None:
+                if document.disposition is DryRunDisposition.READY_FOR_STAGING:
+                    for env in document.adapter_result.events:
+                        binding = _extract_account_binding_for_event(env, document)
+                        rec = make_evidence_record_from_envelope(
+                            env,
+                            account_binding=binding,
+                            document_disposition_eligible=True,
+                            document_requires_review=False,
+                        )
+                        evidence_records.append(rec)
+                elif document.disposition is DryRunDisposition.REVIEW_REQUIRED:
+                    for env in document.adapter_result.events:
+                        binding = _extract_account_binding_for_event(env, document)
+                        rec = make_evidence_record_from_envelope(
+                            env,
+                            account_binding=binding,
+                            document_disposition_eligible=False,
+                            document_requires_review=True,
+                        )
+                        evidence_records.append(rec)
+    except Exception:
+        evidence_collection_failed = True
+        evidence_records.clear()
 
     expected_keys = {r.evidence_key for r in evidence_records}
     match_plan: EvidenceMatchPlan | None = None
     matcher_failure_diag: DryRunDiagnostic | None = None
 
-    matcher = evidence_matcher if evidence_matcher is not None else DeterministicEvidenceMatcher()
-    try:
-        raw_plan = matcher.match(evidence_records, context=matching_context)
-        match_plan = _validate_evidence_match_plan(raw_plan, expected_keys)
-    except Exception:
+    if evidence_collection_failed:
         matcher_failure_diag = _diagnostic(
             DIAGNOSTIC_MATCHER_CONTRACT_FAILURE,
             DryRunStage.MATCHING,
             DiagnosticSeverity.ERROR,
-            "Evidence matching execution failed.",
+            "Evidence collection failed.",
         )
         match_plan = None
+    else:
+        matcher = evidence_matcher if evidence_matcher is not None else DeterministicEvidenceMatcher()
+        try:
+            raw_plan = matcher.match(evidence_records, context=matching_context)
+            match_plan = _validate_evidence_match_plan(raw_plan, expected_keys)
+        except Exception:
+            matcher_failure_diag = _diagnostic(
+                DIAGNOSTIC_MATCHER_CONTRACT_FAILURE,
+                DryRunStage.MATCHING,
+                DiagnosticSeverity.ERROR,
+                "Evidence matching execution failed.",
+            )
+            match_plan = None
 
     if matcher_failure_diag is not None:
         diagnostics.append(matcher_failure_diag)

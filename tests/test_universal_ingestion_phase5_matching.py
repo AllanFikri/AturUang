@@ -84,6 +84,8 @@ from aturuang.ingestion_orchestration import (
     DryRunDocumentResult,
     DryRunStage,
     SqliteRegistryAuthority,
+    _extract_account_binding_for_event,
+    _validate_evidence_match_plan,
     dry_run_artifact,
     dry_run_batch,
     safe_dry_run_batch_json,
@@ -95,15 +97,20 @@ from aturuang.ingestion_matching import (
     EconomicEventGroup,
     EvidenceMatchDecision,
     EvidenceMatchPlan,
+    MATCHER_CONTRACT_VERSION,
     MatchReasonCode,
     MatchRelation,
     MatchTier,
     MatchingContext,
     ProtectedAccountBinding,
+    RelationshipKind,
     SafeEvidenceRecord,
     compute_evidence_key,
     compute_group_key,
     make_evidence_record_from_envelope,
+)
+from aturuang.ingestion_identity_privacy import (
+    is_valid_protected_key,
 )
 
 
@@ -119,8 +126,9 @@ def _make_binding(
     conf: ConfidenceLevel = ConfidenceLevel.HIGH,
     eligible: bool = True,
 ) -> ProtectedAccountBinding:
+    canonical_key = key if is_valid_protected_key(key) else f"v1:{_make_sha256(key)}"
     return ProtectedAccountBinding(
-        protected_account_key=key,
+        protected_account_key=canonical_key,
         institution_id=inst,
         account_type=acc_type,
         ownership_state=ownership,
@@ -211,6 +219,7 @@ def _make_trade_record(
     source_reg: str = "stockbit",
     source_doc: str | None = None,
     binding: ProtectedAccountBinding | None = None,
+    reference_raw: str | None = None,
 ) -> SafeEvidenceRecord:
     doc_id = source_doc or f"doc-{seed}"
     rf = _make_sha256(f"trade-row-{seed}")
@@ -229,6 +238,7 @@ def _make_trade_record(
         event_date=trade_date,
         settlement_date=settlement_date,
         account_binding=binding,
+        reference_raw=reference_raw,
         trade_side=side,
         gross_amount=gross,
         net_amount=net,
@@ -295,10 +305,14 @@ class StubAdapter:
         descriptor: AdapterDescriptor,
         events: Sequence[NormalizedEventEnvelope] = (),
         natural_key: str = "synthetic-natural-key-1",
+        parse_status: AdapterParseStatus = AdapterParseStatus.COMPLETED,
+        review_required: bool = False,
     ) -> None:
         self.descriptor = descriptor
         self.events = tuple(events)
         self.natural_key = natural_key
+        self.parse_status = parse_status
+        self.review_required = review_required
 
     def parse(self, adapter_input: Any) -> AdapterResult:
         source_doc_id = getattr(adapter_input, "source_document_id", "doc-stub")
@@ -313,10 +327,15 @@ class StubAdapter:
             )
             for evt in self.events
         )
+        status = (
+            AdapterParseStatus.REVIEW_REQUIRED
+            if self.review_required
+            else self.parse_status
+        )
         return AdapterResult(
             descriptor=self.descriptor,
             source_document_id=source_doc_id,
-            parse_status=AdapterParseStatus.COMPLETED,
+            parse_status=status,
             period_status=getattr(adapter_input, "period_status", PeriodStatus.CLOSED),
             events=events,
             natural_document_key_candidate=self.natural_key,
@@ -639,7 +658,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         cash = _make_cash_record("comm-csh-1", amount=Decimal("75000"), direction=EventDirection.OUTFLOW, date="2026-03-02", binding=b_cash)
         ctx = MatchingContext(
             relationships=(
-                AccountRelationship(source_key="shopee_orders", target_key="ACC-BCA-001", relationship_kind="COMMERCE_PAYMENT"),
+                AccountRelationship(source_key="shopee_orders", target_key=b_cash.protected_account_key, relationship_kind=RelationshipKind.COMMERCE_PAYMENT),
             )
         )
         plan = self.matcher.match([order, cash], context=ctx)
@@ -654,7 +673,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         cash = _make_cash_record("comm-csh-in", amount=Decimal("75000"), direction=EventDirection.INFLOW, binding=b_cash)
         ctx = MatchingContext(
             relationships=(
-                AccountRelationship(source_key="shopee_orders", target_key="ACC-BCA-001", relationship_kind="COMMERCE_PAYMENT"),
+                AccountRelationship(source_key="shopee_orders", target_key=b_cash.protected_account_key, relationship_kind=RelationshipKind.COMMERCE_PAYMENT),
             )
         )
         plan = self.matcher.match([order, cash], context=ctx)
@@ -681,7 +700,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         cash2 = _make_cash_record("comm-mult-csh2", amount=Decimal("75000"), direction=EventDirection.OUTFLOW, binding=b_cash)
         ctx = MatchingContext(
             relationships=(
-                AccountRelationship(source_key="shopee_orders", target_key="ACC-BCA-001", relationship_kind="COMMERCE_PAYMENT"),
+                AccountRelationship(source_key="shopee_orders", target_key=b_cash.protected_account_key, relationship_kind=RelationshipKind.COMMERCE_PAYMENT),
             )
         )
         plan = self.matcher.match([order, cash1, cash2], context=ctx)
@@ -698,7 +717,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         cash = _make_cash_record("inv-buy-csh", amount=Decimal("200300"), direction=EventDirection.OUTFLOW, date="2026-03-03", binding=b_rdn)
         ctx = MatchingContext(
             relationships=(
-                AccountRelationship(source_key="stockbit", target_key="ACC-RDN-001", relationship_kind="INVESTMENT_SETTLEMENT"),
+                AccountRelationship(source_key="stockbit", target_key=b_rdn.protected_account_key, relationship_kind=RelationshipKind.INVESTMENT_SETTLEMENT),
             )
         )
         plan = self.matcher.match([trade, cash], context=ctx)
@@ -713,7 +732,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         cash = _make_cash_record("inv-sell-csh", amount=Decimal("299500"), direction=EventDirection.INFLOW, date="2026-03-03", binding=b_rdn)
         ctx = MatchingContext(
             relationships=(
-                AccountRelationship(source_key="stockbit", target_key="ACC-RDN-001", relationship_kind="INVESTMENT_SETTLEMENT"),
+                AccountRelationship(source_key="stockbit", target_key=b_rdn.protected_account_key, relationship_kind=RelationshipKind.INVESTMENT_SETTLEMENT),
             )
         )
         plan = self.matcher.match([trade, cash], context=ctx)
@@ -727,7 +746,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         cash = _make_cash_record("inv-gross-csh", amount=Decimal("200000"), direction=EventDirection.OUTFLOW, date="2026-03-03", binding=b_rdn)
         ctx = MatchingContext(
             relationships=(
-                AccountRelationship(source_key="stockbit", target_key="ACC-RDN-001", relationship_kind="INVESTMENT_SETTLEMENT"),
+                AccountRelationship(source_key="stockbit", target_key=b_rdn.protected_account_key, relationship_kind=RelationshipKind.INVESTMENT_SETTLEMENT),
             )
         )
         plan = self.matcher.match([trade, cash], context=ctx)
@@ -739,7 +758,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         cash = _make_cash_record("inv-date-csh", amount=Decimal("200000"), direction=EventDirection.OUTFLOW, date="2026-03-05", binding=b_rdn)
         ctx = MatchingContext(
             relationships=(
-                AccountRelationship(source_key="stockbit", target_key="ACC-RDN-001", relationship_kind="INVESTMENT_SETTLEMENT"),
+                AccountRelationship(source_key="stockbit", target_key=b_rdn.protected_account_key, relationship_kind=RelationshipKind.INVESTMENT_SETTLEMENT),
             )
         )
         plan = self.matcher.match([trade, cash], context=ctx)
@@ -781,8 +800,10 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_34_batch_matching_runs_after_valid_account_discovery_and_appears_in_safe_json(self) -> None:
-        b_src = _make_binding("ACC-BATCH-001")
-        b_dst = _make_binding("ACC-BATCH-002")
+        k1 = f"v1:{_make_sha256('ACC-BATCH-001')}"
+        k2 = f"v1:{_make_sha256('ACC-BATCH-002')}"
+        b_src = _make_binding(k1)
+        b_dst = _make_binding(k2)
 
         art1_content = b"content-artifact-1"
         art2_content = b"content-artifact-2"
@@ -844,7 +865,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         plan1 = AccountDiscoveryPlan(
             resolutions=(
                 AccountResolution(
-                    protected_account_key="ACC-BATCH-001",
+                    protected_account_key=k1,
                     institution_id="bca",
                     source_registry_id="bca_statement",
                     display_name_safe="BCA 1",
@@ -860,7 +881,7 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         plan2 = AccountDiscoveryPlan(
             resolutions=(
                 AccountResolution(
-                    protected_account_key="ACC-BATCH-002",
+                    protected_account_key=k2,
                     institution_id="bca",
                     source_registry_id="bca_statement",
                     display_name_safe="BCA 2",
@@ -1212,6 +1233,627 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
             sidecar_files = [f for f in os.listdir(tmpdir) if f.startswith("test_registry.db-")]
             self.assertEqual(sidecar_files, [])
             self.assertFalse(os.path.exists("money_tracks.db"))
+
+    # -------------------------------------------------------------------------
+    # Substage 1 Repair: Authority, Boundary & Safety Regressions (test_37 to test_52)
+    # -------------------------------------------------------------------------
+
+    def test_37_protected_account_binding_rejects_invalid_protected_key(self) -> None:
+        invalid_keys = [
+            "ACC-BCA-001",
+            "raw-account-12345",
+            "",
+            "   ",
+            "v1:abc",
+            "v0:" + _make_sha256("test"),
+            "v1:" + _make_sha256("test").upper(),
+            "invalid_key_format",
+        ]
+        for bad_key in invalid_keys:
+            with self.assertRaises(ValueError):
+                ProtectedAccountBinding(
+                    protected_account_key=bad_key,
+                    institution_id="bca",
+                    account_type=AccountType.TRANSACTIONAL,
+                    ownership_state=OwnershipState.OWNED,
+                    ownership_confidence=ConfidenceLevel.HIGH,
+                )
+
+        valid_key = f"v1:{_make_sha256('valid-acc')}"
+        binding = ProtectedAccountBinding(
+            protected_account_key=valid_key,
+            institution_id="bca",
+            account_type=AccountType.TRANSACTIONAL,
+            ownership_state=OwnershipState.OWNED,
+            ownership_confidence=ConfidenceLevel.HIGH,
+        )
+        self.assertEqual(binding.protected_account_key, valid_key)
+
+    def test_38_protected_account_binding_is_explicitly_owned_guards_against_invalid_key(self) -> None:
+        valid_key = f"v1:{_make_sha256('acc-owned')}"
+        binding = ProtectedAccountBinding(
+            protected_account_key=valid_key,
+            institution_id="bca",
+            account_type=AccountType.TRANSACTIONAL,
+            ownership_state=OwnershipState.OWNED,
+            ownership_confidence=ConfidenceLevel.HIGH,
+        )
+        self.assertTrue(binding.is_explicitly_owned)
+
+        # Mutate to malformed key via object.__setattr__ to test defensive guard
+        object.__setattr__(binding, "protected_account_key", "MALFORMED-KEY")
+        self.assertFalse(binding.is_explicitly_owned)
+
+    def test_39_extract_account_binding_for_event_safely_filters_invalid_keys_and_handles_errors(self) -> None:
+        rf = _make_sha256("rf-binding-safe")
+        env = NormalizedEventEnvelope(
+            source_document_id="doc-1",
+            source_registry_id="bca_statement",
+            template_id="bca_statement_v1",
+            parser_version="v1",
+            source_channel=SourceChannel.PDF,
+            event_role=EventRole.CASH_MOVEMENT,
+            source_event_id=None,
+            row_fingerprint=rf,
+            evidence_quality=ConfidenceLevel.HIGH,
+            parse_confidence=ConfidenceLevel.HIGH,
+            provenance=SourceProvenanceContract(
+                source_document_id="doc-1",
+                raw_locator="doc1.pdf",
+            ),
+            payload=CashMovementEvidence(
+                amount=Decimal("100000"),
+                currency="IDR",
+                direction=EventDirection.OUTFLOW,
+                status=SourceEventStatus.POSTED,
+                occurred_at="2026-03-01",
+            ),
+        )
+
+        doc_with_bad_key = DryRunDocumentResult(
+            source_document_id="doc-1",
+            content_sha256=_make_sha256("c1"),
+            size_bytes=100,
+            occurrence_tokens=("tok1",),
+            observed_extensions=(".pdf",),
+            identity_status=DocumentIdentityStatus.NEW,
+            disposition=DryRunDisposition.READY_FOR_STAGING,
+            occurrences=(),
+            diagnostics=(),
+            preflight=None,
+            account_discovery_plan=AccountDiscoveryPlan(
+                resolutions=(
+                    AccountResolution(
+                        protected_account_key="ACC-INVALID-RAW",
+                        institution_id="bca",
+                        source_registry_id="bca_statement",
+                        display_name_safe="BCA Bad",
+                        account_type=AccountType.TRANSACTIONAL,
+                        ownership_state=OwnershipState.OWNED,
+                        ownership_confidence=ConfidenceLevel.HIGH,
+                        lifecycle_state=LifecycleState.UNCHANGED,
+                        effective_date="2026-03-01",
+                        persistence_eligible=True,
+                    ),
+                )
+            ),
+        )
+
+        binding = _extract_account_binding_for_event(env, doc_with_bad_key)
+        self.assertIsNone(binding)
+
+    def test_40_account_relationship_enforces_closed_relationship_kind_enum(self) -> None:
+        rel = AccountRelationship(
+            source_key="shopee_orders",
+            target_key="v1:" + _make_sha256("k1"),
+            relationship_kind=RelationshipKind.COMMERCE_PAYMENT,
+        )
+        self.assertEqual(rel.relationship_kind, RelationshipKind.COMMERCE_PAYMENT)
+
+        rel2 = AccountRelationship(
+            source_key="stockbit",
+            target_key="v1:" + _make_sha256("k2"),
+            relationship_kind="INVESTMENT_SETTLEMENT",
+        )
+        self.assertEqual(rel2.relationship_kind, RelationshipKind.INVESTMENT_SETTLEMENT)
+
+        with self.assertRaises(ValueError):
+            AccountRelationship(
+                source_key="shopee_orders",
+                target_key="v1:" + _make_sha256("k3"),
+                relationship_kind="FREE_FORM_ARBITRARY_KIND",
+            )
+
+    def test_41_commerce_matching_strictly_requires_explicit_commerce_payment_with_valid_key(self) -> None:
+        b_cash = _make_binding("ACC-BCA-COMM")
+        order = _make_order_record("comm-strict-ord", amount=Decimal("75000"), source_reg="shopee_orders")
+        cash = _make_cash_record("comm-strict-csh", amount=Decimal("75000"), direction=EventDirection.OUTFLOW, binding=b_cash)
+
+        # Context has INVESTMENT_SETTLEMENT instead of COMMERCE_PAYMENT
+        ctx_wrong = MatchingContext(
+            relationships=(
+                AccountRelationship(
+                    source_key="shopee_orders",
+                    target_key=b_cash.protected_account_key,
+                    relationship_kind=RelationshipKind.INVESTMENT_SETTLEMENT,
+                ),
+            )
+        )
+        plan_wrong = self.matcher.match([order, cash], context=ctx_wrong)
+        self.assertEqual(len(plan_wrong.strong_groups), 0)
+
+        # Context has correct COMMERCE_PAYMENT
+        ctx_correct = MatchingContext(
+            relationships=(
+                AccountRelationship(
+                    source_key="shopee_orders",
+                    target_key=b_cash.protected_account_key,
+                    relationship_kind=RelationshipKind.COMMERCE_PAYMENT,
+                ),
+            )
+        )
+        plan_correct = self.matcher.match([order, cash], context=ctx_correct)
+        self.assertEqual(len(plan_correct.strong_groups), 1)
+        self.assertEqual(plan_correct.strong_groups[0].match_relation, MatchRelation.COMMERCE_PAYMENT)
+
+    def test_42_investment_matching_strictly_requires_broker_or_investment_settlement_with_valid_key(self) -> None:
+        b_rdn = _make_binding("ACC-RDN-INV", acc_type=AccountType.RDN)
+        trade = _make_trade_record("inv-strict-trade", net=Decimal("200000"), side="BUY", settlement_date="2026-03-03", source_reg="stockbit")
+        cash = _make_cash_record("inv-strict-csh", amount=Decimal("200000"), direction=EventDirection.OUTFLOW, date="2026-03-03", binding=b_rdn)
+
+        # Context has COMMERCE_PAYMENT instead of INVESTMENT_SETTLEMENT / BROKER_SETTLEMENT
+        ctx_wrong = MatchingContext(
+            relationships=(
+                AccountRelationship(
+                    source_key="stockbit",
+                    target_key=b_rdn.protected_account_key,
+                    relationship_kind=RelationshipKind.COMMERCE_PAYMENT,
+                ),
+            )
+        )
+        plan_wrong = self.matcher.match([trade, cash], context=ctx_wrong)
+        self.assertEqual(len(plan_wrong.strong_groups), 0)
+
+        # Context has BROKER_SETTLEMENT
+        ctx_broker = MatchingContext(
+            relationships=(
+                AccountRelationship(
+                    source_key="stockbit",
+                    target_key=b_rdn.protected_account_key,
+                    relationship_kind=RelationshipKind.BROKER_SETTLEMENT,
+                ),
+            )
+        )
+        plan_broker = self.matcher.match([trade, cash], context=ctx_broker)
+        self.assertEqual(len(plan_broker.strong_groups), 1)
+        self.assertEqual(plan_broker.strong_groups[0].match_relation, MatchRelation.INVESTMENT_SETTLEMENT)
+
+    def test_43_validate_evidence_match_plan_rejects_contract_version_mismatch(self) -> None:
+        rec = _make_cash_record("csh-contract-ver")
+        expected_keys = {rec.evidence_key}
+        bad_plan = EvidenceMatchPlan(
+            matcher_contract_version="wrong-version-v99",
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec.evidence_key,
+                    match_tier=MatchTier.UNMATCHED,
+                    match_relation=None,
+                    group_key=None,
+                    reason_codes=(),
+                    is_auto_link_eligible=False,
+                ),
+            ),
+            groups=(),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(bad_plan, expected_keys)
+
+    def test_44_validate_evidence_match_plan_rejects_missing_or_duplicate_decisions(self) -> None:
+        rec1 = _make_cash_record("csh-dec-1")
+        rec2 = _make_cash_record("csh-dec-2")
+        expected_keys = {rec1.evidence_key, rec2.evidence_key}
+
+        # Missing decision for rec2
+        plan_missing = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.UNMATCHED,
+                    match_relation=None,
+                    group_key=None,
+                    reason_codes=(),
+                    is_auto_link_eligible=False,
+                ),
+            ),
+            groups=(),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_missing, expected_keys)
+
+        # Duplicate decision for rec1
+        plan_dup = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.UNMATCHED,
+                    match_relation=None,
+                    group_key=None,
+                    reason_codes=(),
+                    is_auto_link_eligible=False,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.UNMATCHED,
+                    match_relation=None,
+                    group_key=None,
+                    reason_codes=(),
+                    is_auto_link_eligible=False,
+                ),
+            ),
+            groups=(),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_dup, {rec1.evidence_key})
+
+    def test_45_validate_evidence_match_plan_rejects_group_key_recomputation_mismatch(self) -> None:
+        rec1 = _make_cash_record("csh-gk-1")
+        rec2 = _make_cash_record("csh-gk-2")
+        expected_keys = {rec1.evidence_key, rec2.evidence_key}
+        member_keys = (min(rec1.evidence_key, rec2.evidence_key), max(rec1.evidence_key, rec2.evidence_key))
+        forged_group_key = _make_sha256("forged-group-key")
+
+        plan = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=forged_group_key,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=forged_group_key,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=forged_group_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=member_keys,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan, expected_keys)
+
+    def test_46_validate_evidence_match_plan_rejects_group_with_fewer_than_two_members(self) -> None:
+        rec = _make_cash_record("csh-single-grp")
+        expected_keys = {rec.evidence_key}
+        g_key = compute_group_key(MatchRelation.DUPLICATE_EVIDENCE, (rec.evidence_key,), MATCHER_CONTRACT_VERSION)
+
+        plan = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=g_key,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=g_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=(rec.evidence_key,),
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan, expected_keys)
+
+    def test_47_validate_evidence_match_plan_rejects_decision_group_inconsistency(self) -> None:
+        rec1 = _make_cash_record("csh-inc-1")
+        rec2 = _make_cash_record("csh-inc-2")
+        expected_keys = {rec1.evidence_key, rec2.evidence_key}
+        member_keys = (min(rec1.evidence_key, rec2.evidence_key), max(rec1.evidence_key, rec2.evidence_key))
+        g_key = compute_group_key(MatchRelation.DUPLICATE_EVIDENCE, member_keys, MATCHER_CONTRACT_VERSION)
+
+        # Decision tier is STRONG but group tier is EXACT
+        plan = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=g_key,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=g_key,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=g_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=member_keys,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan, expected_keys)
+
+    def test_48_validate_evidence_match_plan_rejects_orphan_decision_or_orphan_group(self) -> None:
+        rec = _make_cash_record("csh-orphan")
+        expected_keys = {rec.evidence_key}
+        ghost_group_key = _make_sha256("non-existent-group")
+
+        # Decision references group that does not exist in groups
+        plan = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=ghost_group_key,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan, expected_keys)
+
+    def test_49_validate_evidence_match_plan_rejects_member_assigned_to_multiple_groups(self) -> None:
+        rec1 = _make_cash_record("csh-multi-1")
+        rec2 = _make_cash_record("csh-multi-2")
+        rec3 = _make_cash_record("csh-multi-3")
+        expected_keys = {rec1.evidence_key, rec2.evidence_key, rec3.evidence_key}
+
+        pair1 = (min(rec1.evidence_key, rec2.evidence_key), max(rec1.evidence_key, rec2.evidence_key))
+        pair2 = (min(rec1.evidence_key, rec3.evidence_key), max(rec1.evidence_key, rec3.evidence_key))
+        gk1 = compute_group_key(MatchRelation.DUPLICATE_EVIDENCE, pair1, MATCHER_CONTRACT_VERSION)
+        gk2 = compute_group_key(MatchRelation.DUPLICATE_EVIDENCE, pair2, MATCHER_CONTRACT_VERSION)
+
+        plan = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk1,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk1,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec3.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk2,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk1,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=pair1,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+                EconomicEventGroup(
+                    group_key=gk2,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=pair2,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan, expected_keys)
+
+    def test_50_validate_evidence_match_plan_rejects_forbidden_auto_link_combinations(self) -> None:
+        rec1 = _make_cash_record("csh-badcombo-1")
+        rec2 = _make_cash_record("csh-badcombo-2")
+        expected_keys = {rec1.evidence_key, rec2.evidence_key}
+        pair = (min(rec1.evidence_key, rec2.evidence_key), max(rec1.evidence_key, rec2.evidence_key))
+        # EXACT tier with non-DUPLICATE_EVIDENCE relation
+        gk = compute_group_key(MatchRelation.INTERNAL_TRANSFER_PAIR, pair, MATCHER_CONTRACT_VERSION)
+
+        plan = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    group_key=gk,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    group_key=gk,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan, expected_keys)
+
+    def test_51_same_document_reference_pairs_complementary_roles_and_skips_same_role(self) -> None:
+        # Complementary: trade + cash sharing reference inside same document
+        b_rdn = _make_binding("ACC-RDN-DOCREF", acc_type=AccountType.RDN)
+        trade = _make_trade_record(
+            "docref-trade",
+            net=Decimal("150000"),
+            side="BUY",
+            settlement_date="2026-03-01",
+            source_doc="doc-shared-contract",
+            reference_raw="CONTRACT-REF-12345",
+        )
+        cash = _make_cash_record(
+            "docref-cash",
+            amount=Decimal("150000"),
+            direction=EventDirection.OUTFLOW,
+            date="2026-03-01",
+            source_doc="doc-shared-contract",
+            reference_raw="CONTRACT-REF-12345",
+            binding=b_rdn,
+        )
+
+        plan = self.matcher.match([trade, cash])
+        self.assertEqual(len(plan.exact_groups), 0)
+        self.assertEqual(len(plan.strong_groups), 1)
+        grp = plan.strong_groups[0]
+        self.assertEqual(grp.match_relation, MatchRelation.INVESTMENT_SETTLEMENT)
+        self.assertIn(MatchReasonCode.SAME_DOCUMENT_REFERENCE, grp.reason_codes)
+        self.assertIn(MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION, grp.reason_codes)
+
+        # Same-role rows sharing reference are skipped (never treated as duplicates or matches)
+        cash1 = _make_cash_record(
+            "csh-same-role-1",
+            amount=Decimal("50000"),
+            source_doc="doc-same-statement",
+            reference_raw="STMT-REF-999",
+            binding=b_rdn,
+        )
+        cash2 = _make_cash_record(
+            "csh-same-role-2",
+            amount=Decimal("50000"),
+            source_doc="doc-same-statement",
+            reference_raw="STMT-REF-999",
+            binding=b_rdn,
+        )
+        plan_same_role = self.matcher.match([cash1, cash2])
+        self.assertEqual(len(plan_same_role.exact_groups), 0)
+        self.assertEqual(len(plan_same_role.strong_groups), 0)
+
+    def test_52_invalid_date_code_and_review_required_documents_fail_closed(self) -> None:
+        # Invalid date string returns INVALID_DATE reason code
+        rec_bad_date = _make_cash_record("bad-date", date="2026-03-01FOOBAR", is_eligible=False)
+        reason_bad = self.matcher._ineligible_reason(rec_bad_date)
+        self.assertEqual(reason_bad, MatchReasonCode.INVALID_DATE)
+
+        # Missing date returns MISSING_REQUIRED_DATE
+        rec_missing_date = _make_cash_record("missing-date", date="", is_eligible=False)
+        reason_missing = self.matcher._ineligible_reason(rec_missing_date)
+        self.assertEqual(reason_missing, MatchReasonCode.MISSING_REQUIRED_DATE)
+
+        # dry_run_batch with REVIEW_REQUIRED document includes its evidence as review-required
+        content = b"content-review-req"
+        art = _make_artifact(content)
+        disc = DiscoveryResult(
+            artifacts=(art,),
+            diagnostics=(),
+            archives_seen=0,
+            physical_files_seen=1,
+            supported_occurrences=1,
+        )
+        descriptor = AdapterDescriptor(
+            adapter_id="bca-review-test",
+            source_registry_id="bca_statement",
+            template_id="bca_statement_v1",
+            parser_version="v1",
+            source_channel=SourceChannel.PDF,
+        )
+        env = NormalizedEventEnvelope(
+            source_document_id="doc-review",
+            source_registry_id="bca_statement",
+            template_id="bca_statement_v1",
+            parser_version="v1",
+            source_channel=SourceChannel.PDF,
+            event_role=EventRole.CASH_MOVEMENT,
+            source_event_id=None,
+            row_fingerprint=_make_sha256("rf-review-test"),
+            evidence_quality=ConfidenceLevel.HIGH,
+            parse_confidence=ConfidenceLevel.HIGH,
+            provenance=SourceProvenanceContract(
+                source_document_id="doc-review",
+                raw_locator="doc1.pdf",
+            ),
+            payload=CashMovementEvidence(
+                amount=Decimal("150000"),
+                currency="IDR",
+                direction=EventDirection.OUTFLOW,
+                status=SourceEventStatus.POSTED,
+                occurred_at="2026-03-01",
+            ),
+        )
+        adapter = StubAdapter(descriptor, events=(env,), review_required=True)
+        preflight = _make_preflight(content)
+        batch = dry_run_batch(
+            "root",
+            disc,
+            registry=MockRegistry(),
+            adapter_catalog=AdapterCatalog((adapter,)),
+            payload_reader=lambda r, a, **k: content,
+            preflight_func=lambda p, **k: preflight,
+        )
+        self.assertEqual(batch.review_required_count, 1)
+        self.assertIsNotNone(batch.match_plan)
+        self.assertEqual(len(batch.match_plan.exact_groups), 0)
+        self.assertEqual(len(batch.match_plan.strong_groups), 0)
+        self.assertEqual(len(batch.match_plan.ineligible_evidence), 1)
+        dec = batch.match_plan.ineligible_evidence[0]
+        self.assertEqual(dec.match_tier, MatchTier.INELIGIBLE)
+        self.assertIn(MatchReasonCode.EVIDENCE_REQUIRES_REVIEW, dec.reason_codes)
 
 
 if __name__ == "__main__":
