@@ -11,11 +11,35 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from typing import Any, Sequence
+import re
+from typing import Any
 
 
 DEFAULT_ACCOUNT_DOMAIN = "aturuang:account:v1"
 MIN_SECRET_BYTES = 32
+
+_PROTECTED_KEY_RE = re.compile(r"^v([1-9]\d*):([0-9a-f]{64})$")
+
+
+def is_valid_protected_key(key: Any) -> bool:
+    """
+    Validate that a key adheres strictly to the canonical versioned format:
+    v<positive-version>:<64 lowercase hexadecimal characters>
+    """
+    if not isinstance(key, str):
+        return False
+    return _PROTECTED_KEY_RE.fullmatch(key) is not None
+
+
+def validate_protected_key(key: Any, field_name: str = "protected_account_key") -> str:
+    """
+    Validate protected key and return it, or raise ValueError if invalid.
+    """
+    if not is_valid_protected_key(key):
+        raise ValueError(
+            f"{field_name} must match canonical format 'v<version>:<64-hex-digest>'"
+        )
+    return str(key)
 
 
 def canonical_encoding(*parts: str | bytes) -> bytes:
@@ -24,7 +48,7 @@ def canonical_encoding(*parts: str | bytes) -> bytes:
 
     Each part is framed as f"{len(bytes)}:{bytes}".
     Parts are joined with a pipe delimiter b"|".
-    This guarantees collision-resistance across arbitrary inputs.
+    Rejects unsupported input types; does not silently stringify objects.
     """
     framed_parts: list[bytes] = []
     for part in parts:
@@ -33,7 +57,9 @@ def canonical_encoding(*parts: str | bytes) -> bytes:
         elif isinstance(part, (bytes, bytearray)):
             b = bytes(part)
         else:
-            b = str(part).encode("utf-8")
+            raise TypeError(
+                f"Unsupported part type: {type(part).__name__}. Must be str or bytes."
+            )
         prefix = f"{len(b)}:".encode("ascii")
         framed_parts.append(prefix + b)
     return b"|".join(framed_parts)
@@ -47,7 +73,7 @@ class AccountIdentityProtector:
     - Caller must supply secret explicitly (min 32 bytes).
     - No hard-coded, default, or env-read secrets.
     - Domain separation and key versioning.
-    - Canonical length-prefixed encoding.
+    - Canonical length-prefixed encoding rejecting arbitrary objects.
     - Constant-time comparison helper.
     - Secret is masked in __repr__ and never leaked in exceptions.
     """
@@ -103,20 +129,25 @@ class AccountIdentityProtector:
 
         Returns string formatted as 'v{key_version}:{hex_digest}'.
         """
-        if not institution_id or not str(institution_id).strip():
-            raise ValueError("institution_id must not be empty")
-        if not source_registry_id or not str(source_registry_id).strip():
-            raise ValueError("source_registry_id must not be empty")
+        if not institution_id or not isinstance(institution_id, str) or not institution_id.strip():
+            raise ValueError("institution_id must not be empty string")
+        if not source_registry_id or not isinstance(source_registry_id, str) or not source_registry_id.strip():
+            raise ValueError("source_registry_id must not be empty string")
         if not account_type or not str(account_type).strip():
             raise ValueError("account_type must not be empty")
-        if not raw_key or not str(raw_key).strip():
-            raise ValueError("raw_key must not be empty")
+        if not raw_key or not isinstance(raw_key, str) or not raw_key.strip():
+            raise ValueError("raw_key must not be empty string")
+
+        parent_str = ""
+        if parent_protected_key is not None:
+            if not is_valid_protected_key(parent_protected_key):
+                raise ValueError("parent_protected_key must be a valid canonical protected key")
+            parent_str = str(parent_protected_key).strip()
 
         inst_str = str(institution_id).strip()
         src_str = str(source_registry_id).strip()
         type_str = str(getattr(account_type, "value", account_type)).strip()
         raw_str = str(raw_key).strip()
-        parent_str = str(parent_protected_key).strip() if parent_protected_key else ""
 
         encoded_message = canonical_encoding(
             self._domain,
