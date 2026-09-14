@@ -7,7 +7,7 @@ from hashlib import sha256
 import json
 import sqlite3
 import unicodedata
-from typing import Callable, Iterable, Mapping, Protocol
+from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 from .ingestion_adapter import (
     AdapterContractError,
@@ -23,8 +23,16 @@ from .ingestion_adapter import (
 )
 from .ingestion_contracts import (
     DocumentIdentityStatus,
+    LifecycleState,
     SourceChannel,
     TemplateMatchStatus,
+)
+from .ingestion_account_discovery import (
+    AccountDiscoveryObservation,
+    AccountDiscoveryPlan,
+    AccountDiscoveryResolver,
+    AccountResolution,
+    ExistingAccountState,
 )
 from .ingestion_discovery import (
     ArtifactOccurrence,
@@ -78,6 +86,7 @@ class DryRunStage(str, Enum):
     AUTHORITY = "AUTHORITY"
     ADAPTER = "ADAPTER"
     IDENTITY = "IDENTITY"
+    ACCOUNT_DISCOVERY = "ACCOUNT_DISCOVERY"
     BATCH = "BATCH"
 
 
@@ -115,6 +124,10 @@ class DryRunDocumentResult:
     )
     diagnostics: tuple[DryRunDiagnostic, ...] = field(
         default_factory=tuple,
+    )
+    account_discovery_plan: AccountDiscoveryPlan | None = field(
+        default=None,
+        repr=False,
     )
 
 
@@ -434,6 +447,50 @@ def _adapter_diagnostics(
     )
 
 
+DIAGNOSTIC_ACCOUNT_OBSERVATION_EXTRACTOR_MISSING = "ACCOUNT_OBSERVATION_EXTRACTOR_MISSING"
+DIAGNOSTIC_ACCOUNT_OBSERVATION_RESULT_INVALID = "ACCOUNT_OBSERVATION_RESULT_INVALID"
+DIAGNOSTIC_ACCOUNT_OBSERVATION_EMPTY = "ACCOUNT_OBSERVATION_EMPTY"
+DIAGNOSTIC_ACCOUNT_OBSERVATION_EXTRACTION_FAILED = "ACCOUNT_OBSERVATION_EXTRACTION_FAILED"
+DIAGNOSTIC_ACCOUNT_DISCOVERY_RESOLUTION_FAILED = "ACCOUNT_DISCOVERY_RESOLUTION_FAILED"
+DIAGNOSTIC_ACCOUNT_DISCOVERY_REVIEW_REQUIRED = "ACCOUNT_DISCOVERY_REVIEW_REQUIRED"
+
+ACCOUNT_BEARING_REGISTRIES = frozenset({
+    "jago_statement",
+    "seabank_statement",
+    "blu_mutation",
+    "gopay_statement",
+    "bca_statement",
+    "stockbit_soa",
+    "shopeepay_mutation",
+})
+
+ACCOUNT_BEARING_INSTITUTIONS = frozenset({
+    "jago",
+    "seabank",
+    "blu",
+    "gopay",
+    "bca",
+    "stockbit",
+    "shopeepay",
+})
+
+
+def _is_account_bearing(
+    adapter: UniversalSourceAdapter,
+    source_registry_id: str,
+) -> bool:
+    if source_registry_id == "shopee_orders":
+        return False
+    if source_registry_id in ACCOUNT_BEARING_REGISTRIES:
+        return True
+    descriptor = getattr(adapter, "descriptor", None)
+    if descriptor is not None:
+        inst_id = getattr(descriptor, "institution_id", None)
+        if inst_id in ACCOUNT_BEARING_INSTITUTIONS:
+            return True
+    return False
+
+
 def dry_run_artifact(
     root: str | object,
     artifact: DiscoveredArtifact,
@@ -444,6 +501,8 @@ def dry_run_artifact(
     discovery_policy: DiscoveryPolicy | None = None,
     payload_reader: Callable[..., bytes] = read_discovered_artifact,
     preflight_func: PreflightFunction = preflight_bytes,
+    account_resolver: AccountDiscoveryResolver | None = None,
+    existing_accounts: Sequence[ExistingAccountState] | None = None,
 ) -> DryRunDocumentResult:
     temporary_document_id = _dryrun_document_id(
         artifact.content_sha256
@@ -854,6 +913,143 @@ def dry_run_artifact(
         or adapter_result.review_required
     )
 
+    account_discovery_plan: AccountDiscoveryPlan | None = None
+    account_discovery_diagnostics: list[DryRunDiagnostic] = []
+    account_discovery_requires_review = False
+    contract_failure_diagnostic: DryRunDiagnostic | None = None
+
+    if account_resolver is not None:
+        if source_registry_id == "shopee_orders":
+            account_discovery_plan = AccountDiscoveryPlan(
+                resolutions=(),
+                diagnostics=(),
+            )
+        elif hasattr(adapter, "extract_account_observations") and callable(
+            getattr(adapter, "extract_account_observations")
+        ):
+            try:
+                raw_obs = adapter.extract_account_observations(adapter_result)
+            except Exception:
+                contract_failure_diagnostic = _diagnostic(
+                    DIAGNOSTIC_ACCOUNT_OBSERVATION_EXTRACTION_FAILED,
+                    DryRunStage.ACCOUNT_DISCOVERY,
+                    DiagnosticSeverity.ERROR,
+                    "Account observation extractor execution failed.",
+                    source_document_id=temporary_document_id,
+                )
+                raw_obs = None
+
+            if contract_failure_diagnostic is None:
+                if not isinstance(raw_obs, (list, tuple)):
+                    contract_failure_diagnostic = _diagnostic(
+                        DIAGNOSTIC_ACCOUNT_OBSERVATION_RESULT_INVALID,
+                        DryRunStage.ACCOUNT_DISCOVERY,
+                        DiagnosticSeverity.ERROR,
+                        "Account observation extractor returned an invalid result type.",
+                        source_document_id=temporary_document_id,
+                    )
+                elif any(
+                    not isinstance(item, AccountDiscoveryObservation)
+                    for item in raw_obs
+                ):
+                    contract_failure_diagnostic = _diagnostic(
+                        DIAGNOSTIC_ACCOUNT_OBSERVATION_RESULT_INVALID,
+                        DryRunStage.ACCOUNT_DISCOVERY,
+                        DiagnosticSeverity.ERROR,
+                        "Account observation extractor returned a foreign item type.",
+                        source_document_id=temporary_document_id,
+                    )
+                elif len(raw_obs) == 0:
+                    account_discovery_plan = AccountDiscoveryPlan(
+                        resolutions=(),
+                        diagnostics=(),
+                    )
+                    if _is_account_bearing(adapter, source_registry_id):
+                        account_discovery_diagnostics.append(
+                            _diagnostic(
+                                DIAGNOSTIC_ACCOUNT_OBSERVATION_EMPTY,
+                                DryRunStage.ACCOUNT_DISCOVERY,
+                                DiagnosticSeverity.WARNING,
+                                "Account-bearing source document yielded no account observations.",
+                                source_document_id=temporary_document_id,
+                            )
+                        )
+                        account_discovery_requires_review = True
+                else:
+                    try:
+                        resolved_plan = account_resolver.resolve(
+                            raw_obs,
+                            existing_accounts=existing_accounts,
+                        )
+                        account_discovery_plan = resolved_plan
+                    except Exception:
+                        contract_failure_diagnostic = _diagnostic(
+                            DIAGNOSTIC_ACCOUNT_DISCOVERY_RESOLUTION_FAILED,
+                            DryRunStage.ACCOUNT_DISCOVERY,
+                            DiagnosticSeverity.ERROR,
+                            "Account discovery resolution execution failed.",
+                            source_document_id=temporary_document_id,
+                        )
+
+                    if (
+                        contract_failure_diagnostic is None
+                        and resolved_plan is not None
+                    ):
+                        has_unverified_or_non_eligible = any(
+                            (not r.persistence_eligible)
+                            or (r.lifecycle_state == LifecycleState.UNVERIFIED)
+                            for r in resolved_plan.resolutions
+                        )
+                        has_resolver_diagnostics = len(resolved_plan.diagnostics) > 0
+                        if has_unverified_or_non_eligible or has_resolver_diagnostics:
+                            account_discovery_diagnostics.append(
+                                _diagnostic(
+                                    DIAGNOSTIC_ACCOUNT_DISCOVERY_REVIEW_REQUIRED,
+                                    DryRunStage.ACCOUNT_DISCOVERY,
+                                    DiagnosticSeverity.WARNING,
+                                    "Account discovery resolution requires review.",
+                                    source_document_id=temporary_document_id,
+                                )
+                            )
+                            account_discovery_requires_review = True
+        elif _is_account_bearing(adapter, source_registry_id):
+            account_discovery_diagnostics.append(
+                _diagnostic(
+                    DIAGNOSTIC_ACCOUNT_OBSERVATION_EXTRACTOR_MISSING,
+                    DryRunStage.ACCOUNT_DISCOVERY,
+                    DiagnosticSeverity.WARNING,
+                    "Account-bearing source adapter lacks account observation extractor.",
+                    source_document_id=temporary_document_id,
+                )
+            )
+            account_discovery_requires_review = True
+            account_discovery_plan = AccountDiscoveryPlan(
+                resolutions=(),
+                diagnostics=(),
+            )
+        else:
+            account_discovery_plan = AccountDiscoveryPlan(
+                resolutions=(),
+                diagnostics=(),
+            )
+
+    if contract_failure_diagnostic is not None:
+        return DryRunDocumentResult(
+            source_document_id=temporary_document_id,
+            disposition=DryRunDisposition.FAILED,
+            identity_status=None,
+            semantic_sha256=semantic_sha,
+            preflight=preflight,
+            selected_adapter=selected_descriptor,
+            adapter_result=adapter_result,
+            natural_document_key_candidate=natural_key,
+            diagnostics=converted_diagnostics
+            + tuple(account_discovery_diagnostics)
+            + (contract_failure_diagnostic,),
+            account_discovery_plan=account_discovery_plan,
+            **_base_result_kwargs(artifact),
+        )
+
     if natural_key is None:
         return DryRunDocumentResult(
             source_document_id=temporary_document_id,
@@ -865,6 +1061,7 @@ def dry_run_artifact(
             adapter_result=adapter_result,
             natural_document_key_candidate=None,
             diagnostics=converted_diagnostics
+            + tuple(account_discovery_diagnostics)
             + (
                 _diagnostic(
                     "NATURAL_KEY_MISSING",
@@ -874,6 +1071,7 @@ def dry_run_artifact(
                     source_document_id=temporary_document_id,
                 ),
             ),
+            account_discovery_plan=account_discovery_plan,
             **_base_result_kwargs(artifact),
         )
 
@@ -893,6 +1091,7 @@ def dry_run_artifact(
             adapter_result=adapter_result,
             natural_document_key_candidate=natural_key,
             diagnostics=converted_diagnostics
+            + tuple(account_discovery_diagnostics)
             + (
                 _diagnostic(
                     "REGISTRY_AUTHORITY_UNAVAILABLE",
@@ -902,6 +1101,7 @@ def dry_run_artifact(
                     source_document_id=temporary_document_id,
                 ),
             ),
+            account_discovery_plan=account_discovery_plan,
             **_base_result_kwargs(artifact),
         )
     except Exception:
@@ -968,11 +1168,10 @@ def dry_run_artifact(
             ),
         )
     else:
-        disposition = (
-            DryRunDisposition.REVIEW_REQUIRED
-            if adapter_requires_review
-            else DryRunDisposition.READY_FOR_STAGING
-        )
+        if adapter_requires_review or account_discovery_requires_review:
+            disposition = DryRunDisposition.REVIEW_REQUIRED
+        else:
+            disposition = DryRunDisposition.READY_FOR_STAGING
 
     return DryRunDocumentResult(
         source_document_id=temporary_document_id,
@@ -984,7 +1183,10 @@ def dry_run_artifact(
         selected_adapter=selected_descriptor,
         adapter_result=adapter_result,
         natural_document_key_candidate=natural_key,
-        diagnostics=converted_diagnostics + identity_diagnostics,
+        diagnostics=converted_diagnostics
+        + identity_diagnostics
+        + tuple(account_discovery_diagnostics),
+        account_discovery_plan=account_discovery_plan,
         **_base_result_kwargs(artifact),
     )
 
@@ -1011,6 +1213,9 @@ _BATCH_FATAL_CODES = {
     "SEMANTIC_CANONICALIZATION_FAILED",
     "NATURAL_IDENTITY_LOOKUP_FAILED",
     "NATURAL_IDENTITY_INVARIANT_FAILED",
+    "ACCOUNT_OBSERVATION_RESULT_INVALID",
+    "ACCOUNT_OBSERVATION_EXTRACTION_FAILED",
+    "ACCOUNT_DISCOVERY_RESOLUTION_FAILED",
 }
 
 
@@ -1207,6 +1412,65 @@ def _safe_preflight_view(
     }
 
 
+def _safe_account_discovery_view(
+    plan: AccountDiscoveryPlan | None,
+) -> dict[str, object] | None:
+    if plan is None:
+        return None
+
+    def _sort_key(res: AccountResolution) -> tuple[str, str, str, str]:
+        return (
+            res.institution_id,
+            res.source_registry_id,
+            res.protected_account_key or "",
+            res.effective_date,
+        )
+
+    resolutions_view = []
+    for res in sorted(plan.resolutions, key=_sort_key):
+        diag_codes = sorted(d.code for d in res.diagnostics)
+        resolutions_view.append(
+            {
+                "account_type": (
+                    res.account_type.value
+                    if isinstance(res.account_type, Enum)
+                    else str(res.account_type)
+                ),
+                "diagnostic_codes": diag_codes,
+                "diagnostics": diag_codes,
+                "display_name_safe": res.display_name_safe,
+                "effective_date": res.effective_date,
+                "institution_id": res.institution_id,
+                "lifecycle_state": (
+                    res.lifecycle_state.value
+                    if isinstance(res.lifecycle_state, Enum)
+                    else str(res.lifecycle_state)
+                ),
+                "ownership_confidence": (
+                    res.ownership_confidence.value
+                    if isinstance(res.ownership_confidence, Enum)
+                    else str(res.ownership_confidence)
+                ),
+                "ownership_state": (
+                    res.ownership_state.value
+                    if isinstance(res.ownership_state, Enum)
+                    else str(res.ownership_state)
+                ),
+                "parent_protected_account_key": res.parent_protected_account_key,
+                "persistence_eligible": res.persistence_eligible,
+                "protected_account_key": res.protected_account_key,
+                "source_registry_id": res.source_registry_id,
+            }
+        )
+
+    plan_diag_codes = sorted(d.code for d in plan.diagnostics)
+    return {
+        "diagnostic_codes": plan_diag_codes,
+        "diagnostics": plan_diag_codes,
+        "resolutions": resolutions_view,
+    }
+
+
 def safe_dry_run_document_view(
     result: DryRunDocumentResult,
 ) -> dict[str, object]:
@@ -1220,6 +1484,9 @@ def safe_dry_run_document_view(
             "template_id": result.selected_adapter.template_id,
         }
     return {
+        "account_discovery": _safe_account_discovery_view(
+            result.account_discovery_plan
+        ),
         "content_sha256": result.content_sha256,
         "diagnostics": [
             {
@@ -1302,6 +1569,8 @@ def dry_run_batch(
     discovery_policy: DiscoveryPolicy | None = None,
     payload_reader: Callable[..., bytes] = read_discovered_artifact,
     preflight_func: PreflightFunction = preflight_bytes,
+    account_resolver: AccountDiscoveryResolver | None = None,
+    existing_accounts: Sequence[ExistingAccountState] | None = None,
 ) -> DryRunBatchResult:
     claims = dict(claimed_source_registry_ids or {})
     documents = tuple(
@@ -1316,6 +1585,8 @@ def dry_run_batch(
             discovery_policy=discovery_policy,
             payload_reader=payload_reader,
             preflight_func=preflight_func,
+            account_resolver=account_resolver,
+            existing_accounts=existing_accounts,
         )
         for artifact in sorted(
             discovery.artifacts,
@@ -1391,6 +1662,12 @@ def dry_run_batch(
 __all__ = [
     "AdapterCatalog",
     "AdapterCatalogError",
+    "DIAGNOSTIC_ACCOUNT_DISCOVERY_RESOLUTION_FAILED",
+    "DIAGNOSTIC_ACCOUNT_DISCOVERY_REVIEW_REQUIRED",
+    "DIAGNOSTIC_ACCOUNT_OBSERVATION_EMPTY",
+    "DIAGNOSTIC_ACCOUNT_OBSERVATION_EXTRACTION_FAILED",
+    "DIAGNOSTIC_ACCOUNT_OBSERVATION_EXTRACTOR_MISSING",
+    "DIAGNOSTIC_ACCOUNT_OBSERVATION_RESULT_INVALID",
     "DryRunBatchResult",
     "DryRunBatchStatus",
     "DryRunDiagnostic",
