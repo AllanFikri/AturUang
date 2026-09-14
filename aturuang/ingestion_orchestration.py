@@ -1697,18 +1697,54 @@ def _validate_evidence_match_plan(
                 f"Group key recomputation mismatch: expected {expected_group_key}, got {g.group_key}"
             )
 
-        # Tier and relation constraints
+        if not g.is_auto_link_eligible:
+            raise ValueError(f"Group must have is_auto_link_eligible=True: {g.group_key}")
+
+        if not g.reason_codes:
+            raise ValueError(f"Group reason_codes cannot be empty: {g.group_key}")
+        if len(g.reason_codes) != len(set(g.reason_codes)):
+            raise ValueError(f"Group reason_codes contains duplicate codes: {g.group_key}")
+
+        # Tier, relation, and canonical reason code constraints
         if g.match_tier == MatchTier.EXACT:
             if g.match_relation != MatchRelation.DUPLICATE_EVIDENCE:
                 raise ValueError(
                     f"EXACT group relation must be DUPLICATE_EVIDENCE, got {g.match_relation}"
                 )
-        elif g.match_tier == MatchTier.STRONG:
-            if g.match_relation not in (
-                MatchRelation.INTERNAL_TRANSFER_PAIR,
-                MatchRelation.COMMERCE_PAYMENT,
-                MatchRelation.INVESTMENT_SETTLEMENT,
+            if tuple(g.reason_codes) not in (
+                (MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                (MatchReasonCode.SAME_PROVIDER_TRANSACTION_ID,),
             ):
+                raise ValueError(
+                    f"EXACT DUPLICATE_EVIDENCE group must have exactly SAME_SOURCE_EVENT_ID or SAME_PROVIDER_TRANSACTION_ID, got {g.reason_codes}"
+                )
+        elif g.match_tier == MatchTier.STRONG:
+            if g.match_relation == MatchRelation.INTERNAL_TRANSFER_PAIR:
+                if tuple(g.reason_codes) != (MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,):
+                    raise ValueError(
+                        f"INTERNAL_TRANSFER_PAIR group must have reason OPPOSITE_OWNED_CASH_MOVEMENT, got {g.reason_codes}"
+                    )
+            elif g.match_relation == MatchRelation.COMMERCE_PAYMENT:
+                reasons_set = set(g.reason_codes)
+                allowed_commerce = {
+                    MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION,
+                    MatchReasonCode.SAME_DOCUMENT_REFERENCE,
+                }
+                if not reasons_set.issubset(allowed_commerce) or MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION not in reasons_set:
+                    raise ValueError(
+                        f"COMMERCE_PAYMENT group must have COMMERCE_PAYMENT_CORROBORATION (optionally supplemented by SAME_DOCUMENT_REFERENCE), got {g.reason_codes}"
+                    )
+            elif g.match_relation == MatchRelation.INVESTMENT_SETTLEMENT:
+                reasons_set = set(g.reason_codes)
+                allowed_inv = {
+                    MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION,
+                    MatchReasonCode.SAME_DOCUMENT_REFERENCE,
+                }
+                if not reasons_set.issubset(allowed_inv) or MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION not in reasons_set:
+                    raise ValueError(
+                        f"INVESTMENT_SETTLEMENT group must have INVESTMENT_SETTLEMENT_CORROBORATION (optionally supplemented by SAME_DOCUMENT_REFERENCE), got {g.reason_codes}"
+                    )
+            else:
                 raise ValueError(
                     f"STRONG group relation must be INTERNAL_TRANSFER_PAIR, COMMERCE_PAYMENT, or INVESTMENT_SETTLEMENT, got {g.match_relation}"
                 )
@@ -1744,6 +1780,19 @@ def _validate_evidence_match_plan(
                 raise ValueError(
                     f"Decision auto_link {dec.is_auto_link_eligible} does not match group {g.is_auto_link_eligible} for {mk}"
                 )
+            if tuple(dec.reason_codes) != tuple(g.reason_codes):
+                raise ValueError(
+                    f"Decision reason_codes {dec.reason_codes} does not match group {g.reason_codes} for {mk}"
+                )
+
+    AUTO_LINK_REASON_CODES = {
+        MatchReasonCode.SAME_SOURCE_EVENT_ID,
+        MatchReasonCode.SAME_PROVIDER_TRANSACTION_ID,
+        MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,
+        MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION,
+        MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION,
+        MatchReasonCode.SAME_DOCUMENT_REFERENCE,
+    }
 
     # Check decisions for consistency and orphan groups
     for k, d in seen_decisions.items():
@@ -1760,8 +1809,14 @@ def _validate_evidence_match_plan(
                 )
             if d.is_auto_link_eligible:
                 raise ValueError(f"Decision without group_key cannot be auto_link_eligible: {k}")
-            if d.match_tier in (MatchTier.EXACT, MatchTier.STRONG):
-                raise ValueError(f"Decision without group_key cannot have tier {d.match_tier}: {k}")
+            if d.match_tier not in (MatchTier.AMBIGUOUS, MatchTier.UNMATCHED, MatchTier.INELIGIBLE):
+                raise ValueError(
+                    f"Decision without group_key must have tier AMBIGUOUS, UNMATCHED, or INELIGIBLE, got {d.match_tier}: {k}"
+                )
+            if any(code in AUTO_LINK_REASON_CODES for code in d.reason_codes):
+                raise ValueError(
+                    f"Ungrouped decision cannot contain auto-link reason codes: {k}, got {d.reason_codes}"
+                )
 
     return plan
 

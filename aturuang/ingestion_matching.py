@@ -571,7 +571,8 @@ class DeterministicEvidenceMatcher:
 
         # Step 1: Pre-categorize ineligible records
         for r in records:
-            if not r.is_eligible or r.requires_review:
+            is_date_valid = bool(r.event_date and _parse_iso_date(r.event_date) is not None)
+            if not r.is_eligible or r.requires_review or not is_date_valid:
                 reason = self._ineligible_reason(r)
                 decisions[r.evidence_key] = EvidenceMatchDecision(
                     evidence_key=r.evidence_key,
@@ -1053,10 +1054,16 @@ class DeterministicEvidenceMatcher:
                             continue
                         if trade.trade_side == "SELL" and cash.direction != EventDirection.INFLOW:
                             continue
-                        # Non-conflicting dates
-                        d_t = _parse_iso_date(trade.settlement_date or trade.event_date)
+                        # Explicit settlement date required (never substitute trade_date/event_date)
+                        if not trade.settlement_date:
+                            continue
+                        d_t = _parse_iso_date(trade.settlement_date)
+                        if d_t is None:
+                            continue
                         d_c = _parse_iso_date(cash.event_date)
-                        if d_t is not None and d_c is not None and calendar_days_between(d_t, d_c) > 2:
+                        if d_c is None:
+                            continue
+                        if calendar_days_between(d_t, d_c) != 0:
                             continue
 
                         k1, k2 = min(trade.evidence_key, cash.evidence_key), max(trade.evidence_key, cash.evidence_key)

@@ -1855,6 +1855,545 @@ class TestUniversalIngestionPhase5Matching(unittest.TestCase):
         self.assertEqual(dec.match_tier, MatchTier.INELIGIBLE)
         self.assertIn(MatchReasonCode.EVIDENCE_REQUIRES_REVIEW, dec.reason_codes)
 
+    def test_53_grouped_decision_must_have_identical_reason_codes_to_group(self) -> None:
+        rec1 = _make_cash_record("csh-rc-1")
+        rec2 = _make_cash_record("csh-rc-2")
+        expected_keys = {rec1.evidence_key, rec2.evidence_key}
+        pair = (min(rec1.evidence_key, rec2.evidence_key), max(rec1.evidence_key, rec2.evidence_key))
+        gk = compute_group_key(MatchRelation.DUPLICATE_EVIDENCE, pair, MATCHER_CONTRACT_VERSION)
+
+        # Decision 1 has different reason codes than group
+        plan_diff = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk,
+                    reason_codes=(MatchReasonCode.SAME_PROVIDER_TRANSACTION_ID,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_diff, expected_keys)
+
+        # Decision with empty reason codes when group has reason codes
+        plan_empty_dec = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk,
+                    reason_codes=(),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_empty_dec, expected_keys)
+
+        # Matching reason codes succeeds
+        plan_valid = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        validated = _validate_evidence_match_plan(plan_valid, expected_keys)
+        self.assertIsNotNone(validated)
+
+    def test_54_exact_and_strong_groups_require_canonical_reason_codes_and_auto_link_eligible(self) -> None:
+        rec1 = _make_cash_record("csh-canon-1")
+        rec2 = _make_cash_record("csh-canon-2")
+        expected_keys = {rec1.evidence_key, rec2.evidence_key}
+        pair = (min(rec1.evidence_key, rec2.evidence_key), max(rec1.evidence_key, rec2.evidence_key))
+
+        # 1. EXACT with non-canonical reason code
+        gk_exact = compute_group_key(MatchRelation.DUPLICATE_EVIDENCE, pair, MATCHER_CONTRACT_VERSION)
+        plan_bad_exact = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk_exact,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk_exact,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk_exact,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_bad_exact, expected_keys)
+
+        # 2. INTERNAL_TRANSFER_PAIR with invalid reason
+        gk_xfer = compute_group_key(MatchRelation.INTERNAL_TRANSFER_PAIR, pair, MATCHER_CONTRACT_VERSION)
+        plan_bad_xfer = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    group_key=gk_xfer,
+                    reason_codes=(MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    group_key=gk_xfer,
+                    reason_codes=(MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk_xfer,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_bad_xfer, expected_keys)
+
+        # 3. Group with is_auto_link_eligible=False is rejected
+        plan_not_autolink = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk_exact,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=False,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    group_key=gk_exact,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=False,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk_exact,
+                    match_tier=MatchTier.EXACT,
+                    match_relation=MatchRelation.DUPLICATE_EVIDENCE,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.SAME_SOURCE_EVENT_ID,),
+                    is_auto_link_eligible=False,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_not_autolink, expected_keys)
+
+        # 4. Ungrouped decision with auto-link reason code is rejected
+        plan_ungrouped_autolink_reason = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.UNMATCHED,
+                    match_relation=None,
+                    group_key=None,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT,),
+                    is_auto_link_eligible=False,
+                ),
+            ),
+            groups=(),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_ungrouped_autolink_reason, {rec1.evidence_key})
+
+    def test_55_same_document_reference_may_only_supplement_commerce_or_investment(self) -> None:
+        rec1 = _make_cash_record("csh-docref-supp-1")
+        rec2 = _make_cash_record("csh-docref-supp-2")
+        expected_keys = {rec1.evidence_key, rec2.evidence_key}
+        pair = (min(rec1.evidence_key, rec2.evidence_key), max(rec1.evidence_key, rec2.evidence_key))
+
+        # 1. SAME_DOCUMENT_REFERENCE alone without primary corroboration is rejected
+        gk_comm = compute_group_key(MatchRelation.COMMERCE_PAYMENT, pair, MATCHER_CONTRACT_VERSION)
+        plan_alone = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.COMMERCE_PAYMENT,
+                    group_key=gk_comm,
+                    reason_codes=(MatchReasonCode.SAME_DOCUMENT_REFERENCE,),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.COMMERCE_PAYMENT,
+                    group_key=gk_comm,
+                    reason_codes=(MatchReasonCode.SAME_DOCUMENT_REFERENCE,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk_comm,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.COMMERCE_PAYMENT,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.SAME_DOCUMENT_REFERENCE,),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_alone, expected_keys)
+
+        # 2. SAME_DOCUMENT_REFERENCE on INTERNAL_TRANSFER_PAIR is rejected
+        gk_xfer = compute_group_key(MatchRelation.INTERNAL_TRANSFER_PAIR, pair, MATCHER_CONTRACT_VERSION)
+        plan_xfer_docref = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    group_key=gk_xfer,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT, MatchReasonCode.SAME_DOCUMENT_REFERENCE),
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    group_key=gk_xfer,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT, MatchReasonCode.SAME_DOCUMENT_REFERENCE),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk_xfer,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INTERNAL_TRANSFER_PAIR,
+                    member_evidence_keys=pair,
+                    reason_codes=(MatchReasonCode.OPPOSITE_OWNED_CASH_MOVEMENT, MatchReasonCode.SAME_DOCUMENT_REFERENCE),
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            _validate_evidence_match_plan(plan_xfer_docref, expected_keys)
+
+        # 3. Valid supplementing on COMMERCE_PAYMENT is accepted
+        valid_comm_reasons = (MatchReasonCode.COMMERCE_PAYMENT_CORROBORATION, MatchReasonCode.SAME_DOCUMENT_REFERENCE)
+        plan_valid_comm = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.COMMERCE_PAYMENT,
+                    group_key=gk_comm,
+                    reason_codes=valid_comm_reasons,
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.COMMERCE_PAYMENT,
+                    group_key=gk_comm,
+                    reason_codes=valid_comm_reasons,
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk_comm,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.COMMERCE_PAYMENT,
+                    member_evidence_keys=pair,
+                    reason_codes=valid_comm_reasons,
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        self.assertIsNotNone(_validate_evidence_match_plan(plan_valid_comm, expected_keys))
+
+        # 4. Valid supplementing on INVESTMENT_SETTLEMENT is accepted
+        gk_inv = compute_group_key(MatchRelation.INVESTMENT_SETTLEMENT, pair, MATCHER_CONTRACT_VERSION)
+        valid_inv_reasons = (MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION, MatchReasonCode.SAME_DOCUMENT_REFERENCE)
+        plan_valid_inv = EvidenceMatchPlan(
+            matcher_contract_version=MATCHER_CONTRACT_VERSION,
+            decisions=(
+                EvidenceMatchDecision(
+                    evidence_key=rec1.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INVESTMENT_SETTLEMENT,
+                    group_key=gk_inv,
+                    reason_codes=valid_inv_reasons,
+                    is_auto_link_eligible=True,
+                ),
+                EvidenceMatchDecision(
+                    evidence_key=rec2.evidence_key,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INVESTMENT_SETTLEMENT,
+                    group_key=gk_inv,
+                    reason_codes=valid_inv_reasons,
+                    is_auto_link_eligible=True,
+                ),
+            ),
+            groups=(
+                EconomicEventGroup(
+                    group_key=gk_inv,
+                    match_tier=MatchTier.STRONG,
+                    match_relation=MatchRelation.INVESTMENT_SETTLEMENT,
+                    member_evidence_keys=pair,
+                    reason_codes=valid_inv_reasons,
+                    is_auto_link_eligible=True,
+                ),
+            ),
+        )
+        self.assertIsNotNone(_validate_evidence_match_plan(plan_valid_inv, expected_keys))
+
+    def test_56_matcher_rederives_date_eligibility_and_never_trusts_is_eligible_flag(self) -> None:
+        # Record claims is_eligible=True but has missing date
+        rec_missing_date = _make_cash_record("trust-missing-date", date="", is_eligible=True)
+        plan_missing = self.matcher.match([rec_missing_date])
+        self.assertEqual(len(plan_missing.ineligible_evidence), 1)
+        dec_m = plan_missing.ineligible_evidence[0]
+        self.assertEqual(dec_m.match_tier, MatchTier.INELIGIBLE)
+        self.assertIn(MatchReasonCode.MISSING_REQUIRED_DATE, dec_m.reason_codes)
+        self.assertFalse(dec_m.is_auto_link_eligible)
+
+        # Record claims is_eligible=True but has malformed date
+        rec_bad_date = _make_cash_record("trust-bad-date", date="2026-02-30", is_eligible=True)
+        plan_bad = self.matcher.match([rec_bad_date])
+        self.assertEqual(len(plan_bad.ineligible_evidence), 1)
+        dec_b = plan_bad.ineligible_evidence[0]
+        self.assertEqual(dec_b.match_tier, MatchTier.INELIGIBLE)
+        self.assertIn(MatchReasonCode.INVALID_DATE, dec_b.reason_codes)
+        self.assertFalse(dec_b.is_auto_link_eligible)
+
+        # Pair with identical source_event_id where one has invalid date but claims is_eligible=True
+        rec_good = _make_cash_record("trust-pair-good", source_event_id="EVT-TRUST-1", date="2026-03-01", is_eligible=True)
+        rec_bad = _make_cash_record("trust-pair-bad", source_event_id="EVT-TRUST-1", date="invalid-date", is_eligible=True)
+        plan_pair = self.matcher.match([rec_good, rec_bad])
+        self.assertEqual(len(plan_pair.exact_groups), 0)
+        self.assertEqual(len(plan_pair.strong_groups), 0)
+        self.assertEqual(len(plan_pair.ineligible_evidence), 1)
+        self.assertEqual(plan_pair.ineligible_evidence[0].evidence_key, rec_bad.evidence_key)
+
+    def test_57_investment_settlement_requires_explicit_valid_settlement_date_no_trade_date_fallback(self) -> None:
+        b_rdn = _make_binding("ACC-RDN-STRICT-DATE", acc_type=AccountType.RDN)
+        cash = _make_cash_record(
+            "inv-strict-cash",
+            amount=Decimal("200000"),
+            direction=EventDirection.OUTFLOW,
+            date="2026-03-03",
+            binding=b_rdn,
+        )
+        ctx = MatchingContext(
+            relationships=(
+                AccountRelationship(source_key="stockbit", target_key=b_rdn.protected_account_key, relationship_kind=RelationshipKind.INVESTMENT_SETTLEMENT),
+            )
+        )
+
+        # 1. Missing settlement_date (settlement_date=None) even though trade_date matches cash date
+        trade_no_settle = _make_trade_record(
+            "inv-no-settle",
+            net=Decimal("200000"),
+            side="BUY",
+            trade_date="2026-03-03",
+            settlement_date=None,
+            source_reg="stockbit",
+        )
+        plan_no_settle = self.matcher.match([trade_no_settle, cash], context=ctx)
+        self.assertEqual(len(plan_no_settle.strong_groups), 0)
+
+        # 2. Malformed settlement_date
+        trade_bad_settle = _make_trade_record(
+            "inv-bad-settle",
+            net=Decimal("200000"),
+            side="BUY",
+            trade_date="2026-03-01",
+            settlement_date="invalid-iso-date",
+            source_reg="stockbit",
+        )
+        plan_bad_settle = self.matcher.match([trade_bad_settle, cash], context=ctx)
+        self.assertEqual(len(plan_bad_settle.strong_groups), 0)
+
+        # 3. Settlement date mismatch (different calendar day)
+        trade_mismatch = _make_trade_record(
+            "inv-mismatch-settle",
+            net=Decimal("200000"),
+            side="BUY",
+            trade_date="2026-03-01",
+            settlement_date="2026-03-05",
+            source_reg="stockbit",
+        )
+        plan_mismatch = self.matcher.match([trade_mismatch, cash], context=ctx)
+        self.assertEqual(len(plan_mismatch.strong_groups), 0)
+
+        # 4. Valid matching settlement_date
+        trade_valid = _make_trade_record(
+            "inv-valid-settle",
+            net=Decimal("200000"),
+            side="BUY",
+            trade_date="2026-03-01",
+            settlement_date="2026-03-03",
+            source_reg="stockbit",
+        )
+        plan_valid = self.matcher.match([trade_valid, cash], context=ctx)
+        self.assertEqual(len(plan_valid.strong_groups), 1)
+        self.assertEqual(plan_valid.strong_groups[0].match_relation, MatchRelation.INVESTMENT_SETTLEMENT)
+
+    def test_58_same_document_reference_investment_pair_requires_explicit_settlement_date(self) -> None:
+        b_rdn = _make_binding("ACC-RDN-DOCREF-SETTLE", acc_type=AccountType.RDN)
+        cash = _make_cash_record(
+            "docref-settle-cash",
+            amount=Decimal("150000"),
+            direction=EventDirection.OUTFLOW,
+            date="2026-03-03",
+            source_doc="doc-shared-contract-strict",
+            reference_raw="STRICT-CONTRACT-REF-999",
+            binding=b_rdn,
+        )
+
+        # 1. Missing settlement_date does NOT fall back to trade_date/event_date
+        trade_fallback_attempt = _make_trade_record(
+            "trade-fallback-attempt",
+            net=Decimal("150000"),
+            side="BUY",
+            trade_date="2026-03-03",
+            settlement_date=None,
+            source_doc="doc-shared-contract-strict",
+            reference_raw="STRICT-CONTRACT-REF-999",
+        )
+        plan_fallback = self.matcher.match([trade_fallback_attempt, cash])
+        self.assertEqual(len(plan_fallback.strong_groups), 0)
+
+        # 2. Malformed settlement_date does not match
+        trade_malformed = _make_trade_record(
+            "trade-docref-malformed",
+            net=Decimal("150000"),
+            side="BUY",
+            trade_date="2026-03-01",
+            settlement_date="not-an-iso-date",
+            source_doc="doc-shared-contract-strict",
+            reference_raw="STRICT-CONTRACT-REF-999",
+        )
+        plan_malformed = self.matcher.match([trade_malformed, cash])
+        self.assertEqual(len(plan_malformed.strong_groups), 0)
+
+        # 3. Valid settlement date matching cash date creates strong investment group
+        trade_valid = _make_trade_record(
+            "trade-docref-valid",
+            net=Decimal("150000"),
+            side="BUY",
+            trade_date="2026-03-01",
+            settlement_date="2026-03-03",
+            source_doc="doc-shared-contract-strict",
+            reference_raw="STRICT-CONTRACT-REF-999",
+        )
+        plan_valid = self.matcher.match([trade_valid, cash])
+        self.assertEqual(len(plan_valid.strong_groups), 1)
+        grp = plan_valid.strong_groups[0]
+        self.assertEqual(grp.match_relation, MatchRelation.INVESTMENT_SETTLEMENT)
+        self.assertIn(MatchReasonCode.INVESTMENT_SETTLEMENT_CORROBORATION, grp.reason_codes)
+        self.assertIn(MatchReasonCode.SAME_DOCUMENT_REFERENCE, grp.reason_codes)
+
 
 if __name__ == "__main__":
     unittest.main()
