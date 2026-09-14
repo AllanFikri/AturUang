@@ -28,6 +28,7 @@ from .ingestion_contracts import (
     TemplateMatchStatus,
 )
 from .ingestion_account_discovery import (
+    AccountDiscoveryDiagnostic,
     AccountDiscoveryObservation,
     AccountDiscoveryPlan,
     AccountDiscoveryResolver,
@@ -489,6 +490,33 @@ def _is_account_bearing(
         if inst_id in ACCOUNT_BEARING_INSTITUTIONS:
             return True
     return False
+
+
+def _validate_account_discovery_plan(plan: Any) -> AccountDiscoveryPlan:
+    if plan is None:
+        raise ValueError("Resolver returned None")
+    if not isinstance(plan, AccountDiscoveryPlan):
+        raise TypeError("Resolver returned foreign object")
+    if not isinstance(plan.resolutions, (tuple, list)):
+        raise TypeError("Plan resolutions is not a sequence")
+    for res in plan.resolutions:
+        if not isinstance(res, AccountResolution):
+            raise TypeError("Plan resolution entry is not an AccountResolution")
+        if not isinstance(res.diagnostics, (tuple, list)):
+            raise TypeError("Resolution diagnostics is not a sequence")
+        for diag in res.diagnostics:
+            if not isinstance(diag, AccountDiscoveryDiagnostic):
+                raise TypeError(
+                    "Resolution diagnostic entry is not an AccountDiscoveryDiagnostic"
+                )
+    if not isinstance(plan.diagnostics, (tuple, list)):
+        raise TypeError("Plan diagnostics is not a sequence")
+    for diag in plan.diagnostics:
+        if not isinstance(diag, AccountDiscoveryDiagnostic):
+            raise TypeError(
+                "Plan diagnostic entry is not an AccountDiscoveryDiagnostic"
+            )
+    return plan
 
 
 def dry_run_artifact(
@@ -976,12 +1004,15 @@ def dry_run_artifact(
                         )
                         account_discovery_requires_review = True
                 else:
+                    validated_plan: AccountDiscoveryPlan | None = None
                     try:
                         resolved_plan = account_resolver.resolve(
                             raw_obs,
                             existing_accounts=existing_accounts,
                         )
-                        account_discovery_plan = resolved_plan
+                        validated_plan = _validate_account_discovery_plan(
+                            resolved_plan
+                        )
                     except Exception:
                         contract_failure_diagnostic = _diagnostic(
                             DIAGNOSTIC_ACCOUNT_DISCOVERY_RESOLUTION_FAILED,
@@ -990,18 +1021,30 @@ def dry_run_artifact(
                             "Account discovery resolution execution failed.",
                             source_document_id=temporary_document_id,
                         )
+                        account_discovery_plan = None
+                        validated_plan = None
 
                     if (
                         contract_failure_diagnostic is None
-                        and resolved_plan is not None
+                        and validated_plan is not None
                     ):
+                        account_discovery_plan = validated_plan
                         has_unverified_or_non_eligible = any(
                             (not r.persistence_eligible)
                             or (r.lifecycle_state == LifecycleState.UNVERIFIED)
-                            for r in resolved_plan.resolutions
+                            for r in validated_plan.resolutions
                         )
-                        has_resolver_diagnostics = len(resolved_plan.diagnostics) > 0
-                        if has_unverified_or_non_eligible or has_resolver_diagnostics:
+                        has_resolver_diagnostics = (
+                            len(validated_plan.diagnostics) > 0
+                            or any(
+                                len(r.diagnostics) > 0
+                                for r in validated_plan.resolutions
+                            )
+                        )
+                        if (
+                            has_unverified_or_non_eligible
+                            or has_resolver_diagnostics
+                        ):
                             account_discovery_diagnostics.append(
                                 _diagnostic(
                                     DIAGNOSTIC_ACCOUNT_DISCOVERY_REVIEW_REQUIRED,
@@ -1044,9 +1087,8 @@ def dry_run_artifact(
             adapter_result=adapter_result,
             natural_document_key_candidate=natural_key,
             diagnostics=converted_diagnostics
-            + tuple(account_discovery_diagnostics)
             + (contract_failure_diagnostic,),
-            account_discovery_plan=account_discovery_plan,
+            account_discovery_plan=None,
             **_base_result_kwargs(artifact),
         )
 

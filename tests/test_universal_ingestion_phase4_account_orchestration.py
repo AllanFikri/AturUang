@@ -774,6 +774,21 @@ class TestUniversalIngestionPhase4AccountOrchestration(unittest.TestCase):
             def resolve(self, *args: Any, **kwargs: Any) -> Any:
                 raise ValueError("Resolver crash simulation!")
 
+        class NoneResolver:
+            def resolve(self, *args: Any, **kwargs: Any) -> Any:
+                return None
+
+        class ForeignObjectResolver:
+            def resolve(self, *args: Any, **kwargs: Any) -> Any:
+                return "foreign-non-plan-object"
+
+        class MalformedPlanResolver:
+            def resolve(self, *args: Any, **kwargs: Any) -> Any:
+                return AccountDiscoveryPlan(
+                    resolutions=("not-an-account-resolution",),  # type: ignore
+                    diagnostics=(),
+                )
+
         descriptor = AdapterDescriptor(
             adapter_id="bca-res-crash",
             source_registry_id="bca_statement",
@@ -793,11 +808,29 @@ class TestUniversalIngestionPhase4AccountOrchestration(unittest.TestCase):
             effective_date="2026-03-01",
         )
         adapter = StubAdapter(descriptor, extractor_func=lambda res: (obs,))
-        result = self._run_dry_run(adapter, account_resolver=CrashingResolver())  # type: ignore
-        self.assertEqual(result.disposition, DryRunDisposition.FAILED)
-        diag = [d for d in result.diagnostics if d.code == DIAGNOSTIC_ACCOUNT_DISCOVERY_RESOLUTION_FAILED]
-        self.assertEqual(len(diag), 1)
-        self.assertEqual(diag[0].severity, DiagnosticSeverity.ERROR)
+
+        cases = [
+            ("exception", CrashingResolver()),
+            ("none", NoneResolver()),
+            ("foreign_object", ForeignObjectResolver()),
+            ("malformed_plan", MalformedPlanResolver()),
+        ]
+
+        for case_name, bad_resolver in cases:
+            with self.subTest(case=case_name):
+                result = self._run_dry_run(adapter, account_resolver=bad_resolver)  # type: ignore
+                self.assertEqual(result.disposition, DryRunDisposition.FAILED)
+                fail_diags = [
+                    d for d in result.diagnostics
+                    if d.code == DIAGNOSTIC_ACCOUNT_DISCOVERY_RESOLUTION_FAILED
+                ]
+                self.assertEqual(len(fail_diags), 1)
+                self.assertEqual(fail_diags[0].severity, DiagnosticSeverity.ERROR)
+                self.assertEqual(
+                    fail_diags[0].message,
+                    "Account discovery resolution execution failed.",
+                )
+                self.assertIsNone(result.account_discovery_plan)
 
     # -------------------------------------------------------------------------
     # Test 16: Valid NEW persistence-eligible resolution preserves READY_FOR_STAGING
@@ -1167,6 +1200,45 @@ class TestUniversalIngestionPhase4AccountOrchestration(unittest.TestCase):
             size_before = os.path.getsize(db_path)
 
             con = sqlite3.connect(db_path)
+            forbidden_actions: list[Any] = []
+            traced_statements: list[str] = []
+
+            FORBIDDEN_AUTHORIZER_ACTIONS = {
+                sqlite3.SQLITE_INSERT,
+                sqlite3.SQLITE_UPDATE,
+                sqlite3.SQLITE_DELETE,
+                sqlite3.SQLITE_ATTACH,
+                sqlite3.SQLITE_DETACH,
+                sqlite3.SQLITE_ALTER_TABLE,
+                sqlite3.SQLITE_CREATE_INDEX,
+                sqlite3.SQLITE_CREATE_TABLE,
+                sqlite3.SQLITE_CREATE_TEMP_INDEX,
+                sqlite3.SQLITE_CREATE_TEMP_TABLE,
+                sqlite3.SQLITE_CREATE_TEMP_TRIGGER,
+                sqlite3.SQLITE_CREATE_TEMP_VIEW,
+                sqlite3.SQLITE_CREATE_TRIGGER,
+                sqlite3.SQLITE_CREATE_VIEW,
+                sqlite3.SQLITE_CREATE_VTABLE,
+                sqlite3.SQLITE_DROP_INDEX,
+                sqlite3.SQLITE_DROP_TABLE,
+                sqlite3.SQLITE_DROP_TEMP_INDEX,
+                sqlite3.SQLITE_DROP_TEMP_TABLE,
+                sqlite3.SQLITE_DROP_TEMP_TRIGGER,
+                sqlite3.SQLITE_DROP_TEMP_VIEW,
+                sqlite3.SQLITE_DROP_TRIGGER,
+                sqlite3.SQLITE_DROP_VIEW,
+                sqlite3.SQLITE_DROP_VTABLE,
+            }
+
+            def _authorizer(action_code: int, arg1: Any, arg2: Any, db_name: Any, trigger_name: Any) -> int:
+                if action_code in FORBIDDEN_AUTHORIZER_ACTIONS or (action_code == sqlite3.SQLITE_PRAGMA and arg2 is not None):
+                    forbidden_actions.append((action_code, arg1, arg2, db_name, trigger_name))
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            con.set_authorizer(_authorizer)
+            con.set_trace_callback(traced_statements.append)
+
             try:
                 registry = SqliteRegistryAuthority(con)
                 descriptor = AdapterDescriptor(
@@ -1206,6 +1278,30 @@ class TestUniversalIngestionPhase4AccountOrchestration(unittest.TestCase):
             finally:
                 con.close()
 
+            self.assertEqual(forbidden_actions, [])
+            self.assertGreater(len(traced_statements), 0)
+            FORBIDDEN_SQL_PREFIXES = (
+                "INSERT",
+                "UPDATE",
+                "DELETE",
+                "REPLACE",
+                "CREATE",
+                "ALTER",
+                "DROP",
+                "VACUUM",
+                "ATTACH",
+                "DETACH",
+            )
+            for stmt in traced_statements:
+                stmt_upper = stmt.strip().upper()
+                for prefix in FORBIDDEN_SQL_PREFIXES:
+                    self.assertFalse(
+                        stmt_upper.startswith(prefix),
+                        f"Forbidden statement executed: {stmt}",
+                    )
+                if stmt_upper.startswith("PRAGMA"):
+                    self.assertNotIn("=", stmt_upper, f"Mutating PRAGMA executed: {stmt}")
+
             with open(db_path, "rb") as f:
                 sha_after = hashlib.sha256(f.read()).hexdigest()
             size_after = os.path.getsize(db_path)
@@ -1215,6 +1311,7 @@ class TestUniversalIngestionPhase4AccountOrchestration(unittest.TestCase):
 
             sidecar_files = [f for f in os.listdir(tmpdir) if f.startswith("test_registry.db-")]
             self.assertEqual(sidecar_files, [])
+            self.assertFalse(os.path.exists("money_tracks.db"))
 
 
 if __name__ == "__main__":
