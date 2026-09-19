@@ -1,12 +1,13 @@
 """
-Universal Ingestion Stage 7B — Local Web Composer, Import Center & Review Queue.
+Universal Ingestion Stage 7C — Local Web Composer, Import Center, Review Queue & Receipt OCR.
 
 Provides a clean, minimalist web interface and JSON API allowing the Owner to:
 1. Quick Capture natural Indonesian financial grammar into candidates with deterministic preview hashes.
 2. Ingest statement files (CSV, PDF) via Import Center batch manager.
 3. Review, approve, reject, or modify ambiguous items in the Visual Review Queue.
-4. Confirm and apply candidates atomically through the Stage 6 Safe Apply engine.
-5. Query real-time account balances and monthly summaries with zero write risk.
+4. Process, review, correct, and apply physical receipts via Receipt OCR Review (Stage 7C).
+5. Confirm and apply candidates atomically through the Stage 6 Safe Apply engine.
+6. Query real-time account balances and monthly summaries with zero write risk.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from aturuang.quick_capture import QuickCaptureResult, parse_quick_capture
 from aturuang.query_service import get_account_balances, get_monthly_summary, get_pending_reviews
 from aturuang.import_center import ImportCenterManager, ImportBatch, ImportBatchItem
 from aturuang.review_queue_ui import ReviewQueueManager, ReviewItem
+from aturuang.receipt_ocr import ReceiptOCRManager, ReceiptDraft
 
 
 def _decimal_default(obj: Any) -> Any:
@@ -37,7 +39,7 @@ def _decimal_default(obj: Any) -> Any:
 
 
 class QuickCaptureComposer:
-    """Owner Experience MVP: Local Web Composer, Import Center, and Visual Review Queue."""
+    """Owner Experience MVP: Local Web Composer, Import Center, Review Queue, and Receipt OCR."""
 
     def __init__(
         self,
@@ -51,6 +53,7 @@ class QuickCaptureComposer:
         self.engine = SafeApplyEngine(self.db_path, self.backup_dir)
         self.import_manager = ImportCenterManager(self.db_path, staging_dir=self.staging_dir)
         self.review_manager = ReviewQueueManager(self.db_path, backup_dir=self.backup_dir)
+        self.receipt_manager = ReceiptOCRManager(self.db_path, backup_dir=self.backup_dir)
 
     def preview(self, text: str, default_account: str = "Cash") -> dict[str, Any]:
         """Parses quick capture text, builds candidate, and returns structured preview with hash."""
@@ -98,7 +101,7 @@ class QuickCaptureComposer:
         }
 
     def confirm_and_apply(self, candidate_or_payload: ApplyCandidate | dict[str, Any]) -> ApplyResult:
-        """Confirms candidate and applies it atomically through SafeApplyEngine with pre-apply backup."""
+        """Confirms candidate and safely applies mutations through Stage 6 engine."""
         if isinstance(candidate_or_payload, ApplyCandidate):
             candidate = candidate_or_payload
         elif isinstance(candidate_or_payload, dict):
@@ -253,6 +256,51 @@ class QuickCaptureComposer:
         else:
             raise ValueError(f"Unknown review action: {action}")
 
+    # ------------------ Receipt OCR Operations ------------------
+
+    def process_receipt_upload(self, filename: str, content: bytes) -> dict[str, Any]:
+        """Runs local OCR extraction, formats draft, and returns reviewable JSON."""
+        draft = self.receipt_manager.process_receipt(filename, content)
+        return {
+            "status": draft.status,
+            "receipt_id": draft.receipt_id,
+            "filename": draft.filename,
+            "image_hash": draft.image_hash,
+            "merchant": draft.merchant,
+            "date": draft.date,
+            "time": draft.time,
+            "amount": f"{draft.amount:.2f}",
+            "category": draft.category,
+            "account_from": draft.account_from,
+            "field_confidences": draft.field_confidences,
+            "reason": draft.reason,
+            "preview_hash": draft.preview_hash,
+        }
+
+    def confirm_receipt_draft(
+        self,
+        receipt_id: str,
+        corrections: dict[str, Any] | None = None,
+        action: str = "apply",
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Applies corrections and routes draft candidate to Safe Apply engine."""
+        act = action.lower().strip()
+        if act == "reject":
+            draft = self.receipt_manager.reject(receipt_id, reason=reason)
+            return {"success": True, "status": draft.status, "receipt_id": receipt_id}
+
+        res = self.receipt_manager.confirm_and_apply(receipt_id, corrections=corrections)
+        return {
+            "success": res.success,
+            "status": "APPLIED",
+            "applied_count": len(res.applied_row_ids),
+            "applied_row_ids": list(res.applied_row_ids),
+            "preview_hash": res.preview_hash,
+            "is_idempotent_replay": res.is_idempotent_replay,
+            "receipt_id": receipt_id,
+        }
+
     # ------------------ Query Services ------------------
 
     def get_balances(self) -> dict[str, Any]:
@@ -273,12 +321,12 @@ class QuickCaptureComposer:
         query: dict[str, list[str]] | None = None,
         body: bytes | str | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
-        """Dispatches HTTP requests for local web composer UI, Import Center, and Review Queue."""
+        """Dispatches HTTP requests for local web composer UI, Import Center, Review Queue, and Receipt OCR."""
         m = method.upper()
         p = path.rstrip("/") or "/"
         q = query or {}
 
-        if m == "GET" and (p in ("/", "/quick-capture", "/import", "/review")):
+        if m == "GET" and (p in ("/", "/quick-capture", "/import", "/review", "/receipt")):
             html_content = self.render_html()
             return 200, {"Content-Type": "text/html; charset=utf-8"}, html_content.encode("utf-8")
 
@@ -351,6 +399,48 @@ class QuickCaptureComposer:
             except Exception as e:
                 return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"success": False, "error": str(e)}).encode("utf-8")
 
+        # Receipt OCR HTTP endpoints (Stage 7C)
+        if m == "POST" and p == "/api/receipt/upload":
+            try:
+                filename = "receipt.png"
+                content_bytes = b""
+                if body:
+                    if isinstance(body, bytes):
+                        # Check if JSON or raw bytes
+                        try:
+                            payload = json.loads(body.decode("utf-8"))
+                            filename = payload.get("filename", "receipt.png")
+                            c_raw = payload.get("content", "")
+                            content_bytes = c_raw.encode("latin-1") if isinstance(c_raw, str) else bytes(c_raw)
+                        except Exception:
+                            filename = q.get("filename", ["receipt.png"])[0]
+                            content_bytes = body
+                    else:
+                        payload = json.loads(body)
+                        filename = payload.get("filename", "receipt.png")
+                        c_raw = payload.get("content", "")
+                        content_bytes = c_raw.encode("latin-1") if isinstance(c_raw, str) else bytes(c_raw)
+
+                out = self.process_receipt_upload(filename, content_bytes)
+                return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(out).encode("utf-8")
+            except Exception as e:
+                return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"success": False, "error": str(e)}).encode("utf-8")
+
+        if m == "POST" and p == "/api/receipt/confirm":
+            try:
+                payload: dict[str, Any] = {}
+                if body:
+                    raw_str = body.decode("utf-8") if isinstance(body, bytes) else body
+                    payload = json.loads(raw_str)
+                receipt_id = payload.get("receipt_id", "")
+                corrections = payload.get("corrections")
+                action = payload.get("action", "apply")
+                reason = payload.get("reason", "")
+                out = self.confirm_receipt_draft(receipt_id, corrections=corrections, action=action, reason=reason)
+                return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(out).encode("utf-8")
+            except Exception as e:
+                return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"success": False, "error": str(e)}).encode("utf-8")
+
         if m == "GET" and p == "/api/quick-capture/balances":
             bals = self.get_balances()
             return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(bals, default=_decimal_default).encode("utf-8")
@@ -370,7 +460,7 @@ class QuickCaptureComposer:
         return 404, {"Content-Type": "text/plain"}, b"Not Found"
 
     def render_html(self) -> str:
-        """Renders minimalist Vanilla HTML/JS interface with Quick Capture, Import Center, and Review Queue tabs."""
+        """Renders minimalist Vanilla HTML/JS interface with Quick Capture, Import Center, Review Queue, and Receipt OCR."""
         return """<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -435,7 +525,7 @@ class QuickCaptureComposer:
       padding: 20px;
       margin-bottom: 20px;
     }
-    input[type="text"], textarea {
+    input[type="text"], input[type="number"], input[type="date"], textarea {
       width: 100%;
       box-sizing: border-box;
       padding: 12px 16px;
@@ -486,6 +576,7 @@ class QuickCaptureComposer:
       <button class="tab-btn active" onclick="switchTab('quick')">Catat Cepat</button>
       <button class="tab-btn" onclick="switchTab('import')">Pusat Impor</button>
       <button class="tab-btn" onclick="switchTab('review')">Antrean Tinjauan</button>
+      <button class="tab-btn" onclick="switchTab('receipt')">Pindai Struk</button>
     </div>
 
     <!-- Tab 1: Catat Cepat -->
@@ -514,6 +605,16 @@ class QuickCaptureComposer:
       </div>
     </div>
 
+    <!-- Tab 4: Pindai Struk -->
+    <div id="tab-receipt" class="tab-pane">
+      <div class="card">
+        <h2 style="font-size: 18px; margin-top: 0;">Pindai Struk Belanja (OCR)</h2>
+        <input type="file" id="receiptFileInput" accept=".png,.jpg,.jpeg">
+        <button class="btn" style="margin-top:12px;" onclick="uploadReceipt()">Pindai Struk (OCR)</button>
+        <div id="receiptResult" style="margin-top: 16px; display: none;"></div>
+      </div>
+    </div>
+
     <!-- Saldo Terkini -->
     <div class="card">
       <h2 style="font-size: 18px; margin-top: 0;">Saldo Akun Terkini</h2>
@@ -528,6 +629,7 @@ class QuickCaptureComposer:
     }
 
     let currentPayload = null;
+    let activeReceipt = null;
 
     function switchTab(t) {
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -542,6 +644,9 @@ class QuickCaptureComposer:
         document.querySelector('.tab-btn:nth-child(3)').classList.add('active');
         document.getElementById('tab-review').classList.add('active');
         loadReviewQueue();
+      } else if (t === 'receipt') {
+        document.querySelector('.tab-btn:nth-child(4)').classList.add('active');
+        document.getElementById('tab-receipt').classList.add('active');
       }
     }
 
@@ -718,6 +823,83 @@ class QuickCaptureComposer:
           loadBalances();
         } else {
           alert('Gagal: ' + (data.error || 'Terjadi kesalahan.'));
+        }
+      } catch (err) {
+        alert('Kesalahan jaringan.');
+      }
+    }
+
+    async function uploadReceipt() {
+      const fin = document.getElementById('receiptFileInput');
+      if (!fin || !fin.files || fin.files.length === 0) {
+        alert('Pilih berkas struk terlebih dahulu.');
+        return;
+      }
+      const file = fin.files[0];
+      const formData = new FormData();
+      formData.append('file', file);
+      const resDiv = document.getElementById('receiptResult');
+      if (resDiv) {
+        resDiv.style.display = 'block';
+        resDiv.innerHTML = '<span>Sedang memindai teks struk (OCR)...</span>';
+      }
+      try {
+        const res = await fetch('/api/receipt/upload?filename=' + encodeURIComponent(file.name), {
+          method: 'POST',
+          body: file
+        });
+        const data = await res.json();
+        activeReceipt = data;
+        if (resDiv) {
+          if (res.ok && data.receipt_id) {
+            resDiv.innerHTML = `
+              <div style="color:var(--primary); font-weight:600; margin-bottom:8px;">Hasil Pemindaian Struk</div>
+              <table class="table">
+                <tr><td>Merchant</td><td><input type="text" id="rcptMerchant" value="${esc(data.merchant)}"></td></tr>
+                <tr><td>Tanggal</td><td><input type="date" id="rcptDate" value="${esc(data.date)}"></td></tr>
+                <tr><td>Nominal (Rp)</td><td><input type="number" step="0.01" id="rcptAmount" value="${esc(data.amount)}"></td></tr>
+                <tr><td>Akun Pembayaran</td><td><input type="text" id="rcptAccount" value="${esc(data.account_from || 'Cash')}"></td></tr>
+                <tr><td>Kategori</td><td><input type="text" id="rcptCategory" value="${esc(data.category || 'Shopping')}"></td></tr>
+              </table>
+              <button class="btn" style="margin-top:12px;" onclick="confirmReceipt()">Konfirmasi & Terapkan</button>
+            `;
+          } else {
+            resDiv.innerHTML = `<span style="color:var(--danger)">Gagal memindai: ${esc(data.error || data.reason || 'Terjadi kesalahan')}</span>`;
+          }
+        }
+      } catch (err) {
+        if (resDiv) resDiv.innerHTML = '<span style="color:var(--danger)">Kesalahan jaringan saat memindai struk.</span>';
+      }
+    }
+
+    async function confirmReceipt() {
+      if (!activeReceipt) return;
+      const corrections = {
+        merchant: document.getElementById('rcptMerchant').value,
+        date: document.getElementById('rcptDate').value,
+        amount: document.getElementById('rcptAmount').value,
+        account_from: document.getElementById('rcptAccount').value,
+        category: document.getElementById('rcptCategory').value
+      };
+      try {
+        const res = await fetch('/api/receipt/confirm', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            receipt_id: activeReceipt.receipt_id,
+            corrections: corrections,
+            action: 'apply'
+          })
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert('Struk berhasil dikonfirmasi dan diterapkan!');
+          document.getElementById('receiptResult').style.display = 'none';
+          document.getElementById('receiptFileInput').value = '';
+          activeReceipt = null;
+          loadBalances();
+        } else {
+          alert('Gagal menerapkan: ' + (data.error || 'Terjadi kesalahan.'));
         }
       } catch (err) {
         alert('Kesalahan jaringan.');
