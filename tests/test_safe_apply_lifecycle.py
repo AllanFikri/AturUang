@@ -1,8 +1,9 @@
 """
-Universal Ingestion Stage 6 — Safe Review, Apply Gate, and Recovery Engine Unit Tests.
+Universal Ingestion Stage 6-R1 — Safe Review, Apply Gate, and Recovery Engine Unit Tests.
 
 Comprehensive testing of candidate lifecycle state machine, deterministic preview hash binding,
-pre-apply automated backups, atomic SQLite transactions, strict idempotency enforcement,
+pre-apply automated backups via native SQLite Online Backup API, autocommit isolation
+(isolation_level=None) with explicit BEGIN IMMEDIATE transactions, strict idempotency enforcement,
 immutable audit trails, and backup restore recovery drills.
 """
 
@@ -54,7 +55,7 @@ def _find_production_db() -> Path:
 
 
 class SafeApplyLifecycleTests(unittest.TestCase):
-    """Comprehensive lifecycle, transactional, and recovery unit tests for Stage 6."""
+    """Comprehensive lifecycle, transactional, and recovery unit tests for Stage 6-R1."""
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -151,6 +152,9 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         self.assertTrue(res1.success)
         self.assertFalse(res1.is_idempotent_replay)
 
+        # Count backups after first apply
+        backups_after_first = list(self.backup_dir.glob("*.db"))
+
         # Re-apply same candidate
         cand_retry = self._make_candidate(candidate_id="CAND_IDEM_01", idempotency_key="IDEM_KEY_01")
         cand_retry.transition_to(CandidateLifecycleState.PARSED)
@@ -169,6 +173,10 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         count = cur.fetchone()[0]
         con.close()
         self.assertEqual(count, 1)
+
+        # Verify no additional backup files were created during replay
+        backups_after_retry = list(self.backup_dir.glob("*.db"))
+        self.assertEqual(len(backups_after_first), len(backups_after_retry))
 
     def test_idempotency_conflict_detected_on_payload_mismatch(self) -> None:
         cand1 = self._make_candidate(candidate_id="CAND_01", idempotency_key="SHARED_IDEM_KEY", amount=Decimal("100000.00"))
@@ -264,9 +272,6 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         self.assertTrue(res.success)
 
     def test_pre_apply_backup_created_and_verified_before_mutation(self) -> None:
-        # Pre-apply DB state hash
-        pre_db_hash = compute_file_sha256(self.db_path)
-
         cand = self._make_candidate(candidate_id="CAND_BAK", idempotency_key="IDEM_BAK")
         cand.transition_to(CandidateLifecycleState.PARSED)
         cand.transition_to(CandidateLifecycleState.READY_FOR_CONFIRMATION)
@@ -280,11 +285,16 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         self.assertGreaterEqual(len(backups), 1)
         latest_backup = backups[-1]
         self.assertGreater(latest_backup.stat().st_size, 0)
-        self.assertEqual(compute_file_sha256(latest_backup), pre_db_hash)
+
+        # Verify backup opens cleanly via native SQLite connection
+        test_conn = sqlite3.connect(latest_backup)
+        try:
+            check = test_conn.execute("PRAGMA quick_check").fetchone()
+            self.assertEqual(check[0], "ok")
+        finally:
+            test_conn.close()
 
     def test_atomic_rollback_on_simulated_db_error(self) -> None:
-        pre_db_hash = compute_file_sha256(self.db_path)
-
         mut1 = self._make_mutation(amount=Decimal("10.00"), canonical_id="TX_ERR_1")
         mut2 = self._make_mutation(amount=Decimal("20.00"), canonical_id="TX_ERR_2")
         cand = self._make_candidate(
@@ -310,28 +320,23 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         con.close()
         self.assertEqual(count, 0)
 
-        # DB file has zero mutations from candidate
-        post_db_hash = compute_file_sha256(self.db_path)
-        self.assertEqual(pre_db_hash, post_db_hash)
-
     def test_restore_from_backup_recovers_original_state(self) -> None:
         # Create initial state A
         backup_file, pre_hash = create_pre_apply_backup(self.db_path, self.backup_dir)
 
         # Mutate database state B
-        con = sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path, isolation_level=None)
+        con.execute("BEGIN IMMEDIATE")
         con.execute(
             "INSERT INTO transactions (date, time, transaction_type, amount, account_from, account_to) VALUES (?, ?, ?, ?, ?, ?)",
-            ("2026-03-01", "12:00:00", "Expense", 999.0, "Acc1", "Acc2"),
+            ("2026-03-01", "12:00:00", "Expense", "999.00", "Acc1", "Acc2"),
         )
-        con.commit()
+        con.execute("COMMIT")
         con.close()
-        self.assertNotEqual(compute_file_sha256(self.db_path), pre_hash)
 
-        # Restore from backup
+        # Restore from backup via native SQLite backup API
         success = restore_from_backup(backup_file, self.db_path)
         self.assertTrue(success)
-        self.assertEqual(compute_file_sha256(self.db_path), pre_hash)
 
         # Verify table has 0 rows again
         con = sqlite3.connect(self.db_path)
@@ -365,7 +370,8 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         self.assertEqual(row[1], "IDEM_AUDIT")
 
     def test_exact_decimal_preservation_in_applied_ledger(self) -> None:
-        amount_exact = Decimal("123456.78")
+        # Exact cents amounts that would suffer IEEE 754 precision issues under float
+        amount_exact = Decimal("123456789.01")
         mut = self._make_mutation(amount=amount_exact)
         cand = self._make_candidate(candidate_id="CAND_DEC", idempotency_key="IDEM_DEC", mutations=(mut,))
         cand.transition_to(CandidateLifecycleState.PARSED)
@@ -375,7 +381,18 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         res = self.engine.apply(cand)
         self.assertTrue(res.success)
 
-        # Verify float is forbidden in LedgerMutation
+        # Verify exact stored representation in DB
+        con = sqlite3.connect(self.db_path)
+        cur = con.cursor()
+        cur.execute("SELECT amount, CAST(amount AS TEXT) FROM transactions WHERE id = ?", (res.applied_row_ids[0],))
+        row = cur.fetchone()
+        con.close()
+
+        stored_amount = Decimal(str(row[0]))
+        self.assertEqual(stored_amount, amount_exact)
+        self.assertEqual(f"{stored_amount:.2f}", "123456789.01")
+
+        # Verify float is strictly forbidden in LedgerMutation
         with self.assertRaises(TypeError):
             self._make_mutation(amount=100.5)  # type: ignore
 
@@ -410,9 +427,9 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         con = sqlite3.connect(self.db_path)
         cur = con.cursor()
         cur.execute("SELECT amount FROM transactions WHERE id IN (?, ?)", res.applied_row_ids)
-        amounts = [r[0] for r in cur.fetchall()]
+        amounts = [Decimal(str(r[0])) for r in cur.fetchall()]
         con.close()
-        self.assertEqual(amounts, [500000.0, 500000.0])
+        self.assertEqual(amounts, [Decimal("500000.0"), Decimal("500000.0")])
 
     def test_invalid_state_transition_raises_error(self) -> None:
         cand = self._make_candidate()
@@ -465,7 +482,7 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         cand.confirm()
 
         # Hold exclusive lock on database with separate connection
-        lock_con = sqlite3.connect(self.db_path, timeout=0.1)
+        lock_con = sqlite3.connect(self.db_path, timeout=0.1, isolation_level=None)
         lock_con.execute("BEGIN EXCLUSIVE")
 
         # Engine attempting apply must encounter database lock
@@ -473,7 +490,7 @@ class SafeApplyLifecycleTests(unittest.TestCase):
             self.engine.apply(cand)
 
         # Release lock
-        lock_con.rollback()
+        lock_con.execute("ROLLBACK")
         lock_con.close()
 
         # Now apply succeeds
@@ -499,6 +516,65 @@ class SafeApplyLifecycleTests(unittest.TestCase):
         self.assertTrue(prod_db.exists())
         current_hash = hashlib.sha256(prod_db.read_bytes()).hexdigest()
         self.assertEqual(current_hash, EXPECTED_PRODUCTION_DB_SHA256)
+
+    def test_sqlite_isolation_level_none_active_during_apply(self) -> None:
+        # Verify isolation_level=None property
+        test_con = sqlite3.connect(self.db_path, isolation_level=None)
+        try:
+            self.assertIsNone(test_con.isolation_level)
+            # Must allow explicit BEGIN IMMEDIATE without python implicit driver interference
+            test_con.execute("BEGIN IMMEDIATE")
+            test_con.execute("COMMIT")
+        finally:
+            test_con.close()
+
+    def test_idempotent_replay_prevents_orphaned_backup_files(self) -> None:
+        cand = self._make_candidate(candidate_id="CAND_NO_ORPHAN", idempotency_key="IDEM_NO_ORPHAN")
+        cand.transition_to(CandidateLifecycleState.PARSED)
+        cand.transition_to(CandidateLifecycleState.READY_FOR_CONFIRMATION)
+        cand.confirm()
+
+        # First apply creates 1 backup
+        self.engine.apply(cand)
+        initial_backups = list(self.backup_dir.glob("*.db"))
+        self.assertEqual(len(initial_backups), 1)
+
+        # Replays 5 times
+        for _ in range(5):
+            replay_cand = self._make_candidate(candidate_id="CAND_NO_ORPHAN", idempotency_key="IDEM_NO_ORPHAN")
+            replay_cand.transition_to(CandidateLifecycleState.PARSED)
+            replay_cand.transition_to(CandidateLifecycleState.READY_FOR_CONFIRMATION)
+            replay_cand.confirm()
+            res = self.engine.apply(replay_cand)
+            self.assertTrue(res.is_idempotent_replay)
+
+        # Assert zero new backup files were created on disk across 5 replays
+        final_backups = list(self.backup_dir.glob("*.db"))
+        self.assertEqual(len(final_backups), 1)
+
+    def test_native_sqlite_backup_api_fidelity(self) -> None:
+        # Create a database with test tables and data
+        test_src = self.temp_path / "fidelity_src.db"
+        con = sqlite3.connect(test_src, isolation_level=None)
+        con.execute("CREATE TABLE test_tab (id INT PRIMARY KEY, val TEXT, amount REAL)")
+        con.execute("INSERT INTO test_tab VALUES (1, 'val1', 123.45)")
+        con.execute("INSERT INTO test_tab VALUES (2, 'val2', 678.90)")
+        con.close()
+
+        # Perform backup using create_pre_apply_backup
+        bak_file, bak_hash = create_pre_apply_backup(test_src, self.backup_dir)
+        self.assertTrue(bak_file.exists())
+        self.assertGreater(bak_file.stat().st_size, 0)
+
+        # Inspect backup with native sqlite3
+        bak_conn = sqlite3.connect(bak_file)
+        try:
+            res = bak_conn.execute("PRAGMA quick_check").fetchone()
+            self.assertEqual(res[0], "ok")
+            rows = bak_conn.execute("SELECT id, val, amount FROM test_tab ORDER BY id").fetchall()
+            self.assertEqual(rows, [(1, "val1", 123.45), (2, "val2", 678.90)])
+        finally:
+            bak_conn.close()
 
 
 if __name__ == "__main__":

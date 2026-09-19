@@ -1,8 +1,9 @@
 """
-Universal Ingestion Stage 6 — Safe Review, Apply Gate, and Recovery Engine.
+Universal Ingestion Stage 6-R1 — Safe Review, Apply Gate, and Recovery Engine.
 
 Provides candidate lifecycle state machine, deterministic preview hash binding,
-pre-apply automated backups, atomic SQLite transactions, strict idempotency enforcement,
+pre-apply automated backups via native SQLite Online Backup API, autocommit isolation
+(isolation_level=None) with explicit BEGIN IMMEDIATE transactions, strict idempotency enforcement,
 immutable audit trails, and backup restore recovery drills.
 """
 
@@ -15,7 +16,6 @@ from enum import Enum
 import hashlib
 import json
 from pathlib import Path
-import shutil
 import sqlite3
 from typing import Any, Mapping, Sequence
 import uuid
@@ -32,6 +32,10 @@ def _require_decimal(value: Any, field_name: str) -> Decimal:
     if not value.is_finite():
         raise ValueError(f"{field_name} must be finite Decimal")
     return value
+
+
+# Register SQLite Decimal adapter and converter
+sqlite3.register_adapter(Decimal, lambda d: f"{d:.2f}")
 
 
 def compute_file_sha256(path: Path | str) -> str:
@@ -339,7 +343,7 @@ def create_pre_apply_backup(
     db_path: Path | str,
     backup_dir: Path | str | None = None,
 ) -> tuple[Path, str]:
-    """Automatically creates an atomic backup file and asserts hash fidelity before mutation."""
+    """Creates an atomic backup using SQLite native Online Backup API and validates integrity."""
     p = Path(db_path)
     if not p.exists():
         raise FileNotFoundError(f"Database file does not exist: {p}")
@@ -347,46 +351,65 @@ def create_pre_apply_backup(
     b_dir = Path(backup_dir) if backup_dir else p.parent / "backups"
     b_dir.mkdir(parents=True, exist_ok=True)
 
-    pre_hash = compute_file_sha256(p)
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     unique_id = uuid.uuid4().hex[:8]
     backup_file = b_dir / f"{p.name}.backup_{timestamp}_{unique_id}.db"
 
-    shutil.copy2(p, backup_file)
+    # Native SQLite Online Backup API
+    src_conn = sqlite3.connect(p)
+    dst_conn = sqlite3.connect(backup_file)
+    try:
+        src_conn.backup(dst_conn)
+    finally:
+        dst_conn.close()
+        src_conn.close()
 
     if not backup_file.exists() or backup_file.stat().st_size == 0:
         raise BackupError(f"Backup file creation failed or empty: {backup_file}")
 
-    backup_hash = compute_file_sha256(backup_file)
-    if backup_hash != pre_hash:
-        backup_file.unlink(missing_ok=True)
-        raise BackupError(
-            f"Pre-apply backup SHA-256 mismatch: got {backup_hash}, expected {pre_hash}"
-        )
+    # Verify backup opens cleanly and integrity is intact
+    test_conn = sqlite3.connect(backup_file)
+    try:
+        res = test_conn.execute("PRAGMA quick_check").fetchone()
+        if not res or res[0] != "ok":
+            raise BackupError(f"Backup integrity check failed: {res}")
+    finally:
+        test_conn.close()
 
-    return backup_file, pre_hash
+    backup_hash = compute_file_sha256(backup_file)
+    return backup_file, backup_hash
 
 
 def restore_from_backup(
     backup_path: Path | str,
     target_db_path: Path | str,
 ) -> bool:
-    """Restores target database from an existing backup and validates hash integrity."""
+    """Restores target database from an existing backup using native SQLite Online Backup API."""
     b_path = Path(backup_path)
     t_path = Path(target_db_path)
 
     if not b_path.exists() or b_path.stat().st_size == 0:
         raise FileNotFoundError(f"Valid backup file not found: {b_path}")
 
-    expected_hash = compute_file_sha256(b_path)
     t_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(b_path, t_path)
 
-    restored_hash = compute_file_sha256(t_path)
-    if restored_hash != expected_hash:
-        raise BackupError(
-            f"Restore verification failed: got {restored_hash}, expected {expected_hash}"
-        )
+    # Native SQLite Online Backup API to restore
+    src_conn = sqlite3.connect(b_path)
+    dst_conn = sqlite3.connect(t_path)
+    try:
+        src_conn.backup(dst_conn)
+    finally:
+        dst_conn.close()
+        src_conn.close()
+
+    test_conn = sqlite3.connect(t_path)
+    try:
+        res = test_conn.execute("PRAGMA quick_check").fetchone()
+        if not res or res[0] != "ok":
+            raise BackupError(f"Restored database integrity check failed: {res}")
+    finally:
+        test_conn.close()
+
     return True
 
 
@@ -405,7 +428,7 @@ class SafeApplyEngine:
     def init_schema(self) -> None:
         """Ensures required tables for ledger, idempotency, and audit trail exist."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        con = sqlite3.connect(self.db_path)
+        con = sqlite3.connect(self.db_path, isolation_level=None)
         try:
             con.execute("PRAGMA foreign_keys=ON")
             con.executescript("""
@@ -461,7 +484,6 @@ class SafeApplyEngine:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
             """)
-            con.commit()
         finally:
             con.close()
 
@@ -500,8 +522,8 @@ class SafeApplyEngine:
                 f"PREVIEW_HASH_MISMATCH: got {recalculated_hash}, expected {candidate.preview_hash}"
             )
 
-        # 5. Check idempotency pre-check
-        read_con = sqlite3.connect(self.db_path)
+        # 5. Check idempotency pre-check (No backup created on idempotent replay!)
+        read_con = sqlite3.connect(self.db_path, timeout=1.0)
         try:
             cur = read_con.cursor()
             cur.execute(
@@ -516,7 +538,7 @@ class SafeApplyEngine:
                     raise IdempotencyConflictError(
                         f"IDEMPOTENCY_CONFLICT: Key '{candidate.idempotency_key}' already used with different preview hash"
                     )
-                # Idempotent replay: return existing result
+                # Idempotent replay: return existing result immediately without creating ANY backup file!
                 candidate.state = CandidateLifecycleState.APPLIED
                 row_ids = tuple(json.loads(existing_ids_json))
                 return ApplyResult(
@@ -532,20 +554,20 @@ class SafeApplyEngine:
         finally:
             read_con.close()
 
-        # 6. Automated Pre-Apply Backup
+        # 6. Automated Pre-Apply Backup via native SQLite backup API
         backup_file, pre_hash = create_pre_apply_backup(self.db_path, self.backup_dir)
 
-        # 7. Atomic transaction
+        # 7. Atomic transaction with isolation_level=None
         applied_timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
         applied_row_ids: list[int] = []
 
-        con = sqlite3.connect(self.db_path, timeout=1.0)
+        con = sqlite3.connect(self.db_path, timeout=1.0, isolation_level=None)
         try:
             con.execute("PRAGMA foreign_keys=ON")
             con.execute("BEGIN IMMEDIATE")
             cur = con.cursor()
 
-            # Double check idempotency under lock
+            # Double-check idempotency under lock in case of concurrent execution
             cur.execute(
                 "SELECT preview_hash, mutation_row_ids, applied_timestamp FROM safe_apply_idempotency WHERE idempotency_key = ?",
                 (candidate.idempotency_key,),
@@ -553,9 +575,12 @@ class SafeApplyEngine:
             row = cur.fetchone()
             if row:
                 existing_hash, existing_ids_json, existing_timestamp = row
+                # Clean up backup file if a race resulted in idempotent replay
+                backup_file.unlink(missing_ok=True)
+                con.execute("ROLLBACK")
                 if existing_hash != candidate.preview_hash:
+                    candidate.transition_to(CandidateLifecycleState.FAILED, "IDEMPOTENCY_CONFLICT")
                     raise IdempotencyConflictError("IDEMPOTENCY_CONFLICT")
-                con.rollback()
                 candidate.state = CandidateLifecycleState.APPLIED
                 return ApplyResult(
                     success=True,
@@ -568,7 +593,7 @@ class SafeApplyEngine:
                     applied_timestamp=existing_timestamp,
                 )
 
-            # Insert mutations
+            # Insert mutations with exact Decimal string formatting (no float cast)
             for idx, mut in enumerate(candidate.mutations):
                 if simulated_error_at_mutation is not None and idx == simulated_error_at_mutation:
                     raise RuntimeError(f"Simulated mid-apply error at mutation index {idx}")
@@ -585,7 +610,7 @@ class SafeApplyEngine:
                         mut.date,
                         mut.time,
                         mut.transaction_type,
-                        float(mut.amount),
+                        f"{mut.amount:.2f}",
                         mut.account_from,
                         mut.account_to,
                         mut.description,
@@ -617,10 +642,13 @@ class SafeApplyEngine:
                 ),
             )
 
-            # Commit atomic mutations
-            con.commit()
+            # Explicit COMMIT
+            con.execute("COMMIT")
         except Exception as exc:
-            con.rollback()
+            try:
+                con.execute("ROLLBACK")
+            except Exception:
+                pass
             candidate.transition_to(CandidateLifecycleState.FAILED, str(exc))
             raise
         finally:
@@ -631,9 +659,10 @@ class SafeApplyEngine:
 
         # 8. Record audit entry
         audit_entry: AuditTrailEntry | None = None
-        audit_con = sqlite3.connect(self.db_path)
+        audit_con = sqlite3.connect(self.db_path, timeout=1.0, isolation_level=None)
         try:
             acur = audit_con.cursor()
+            acur.execute("BEGIN IMMEDIATE")
             acur.execute(
                 """
                 INSERT INTO safe_apply_audit (
@@ -653,7 +682,7 @@ class SafeApplyEngine:
                 ),
             )
             audit_id = acur.lastrowid
-            audit_con.commit()
+            acur.execute("COMMIT")
             audit_entry = AuditTrailEntry(
                 audit_id=audit_id,
                 candidate_id=candidate.candidate_id,
