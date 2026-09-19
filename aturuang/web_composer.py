@@ -1,10 +1,12 @@
 """
-Universal Ingestion Stage 7A — Local Web Composer & Preview Binding.
+Universal Ingestion Stage 7B — Local Web Composer, Import Center & Review Queue.
 
 Provides a clean, minimalist web interface and JSON API allowing the Owner to:
-1. Parse natural Indonesian financial grammar into candidates with deterministic preview hashes.
-2. Confirm and apply candidates atomically through the Stage 6 Safe Apply engine.
-3. Query real-time account balances and monthly summaries with zero write risk.
+1. Quick Capture natural Indonesian financial grammar into candidates with deterministic preview hashes.
+2. Ingest statement files (CSV, PDF) via Import Center batch manager.
+3. Review, approve, reject, or modify ambiguous items in the Visual Review Queue.
+4. Confirm and apply candidates atomically through the Stage 6 Safe Apply engine.
+5. Query real-time account balances and monthly summaries with zero write risk.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ from aturuang.safe_apply import (
 )
 from aturuang.quick_capture import QuickCaptureResult, parse_quick_capture
 from aturuang.query_service import get_account_balances, get_monthly_summary, get_pending_reviews
+from aturuang.import_center import ImportCenterManager, ImportBatch, ImportBatchItem
+from aturuang.review_queue_ui import ReviewQueueManager, ReviewItem
 
 
 def _decimal_default(obj: Any) -> Any:
@@ -33,16 +37,20 @@ def _decimal_default(obj: Any) -> Any:
 
 
 class QuickCaptureComposer:
-    """Owner Experience MVP: Local Web Composer and Preview Binding for Quick Capture."""
+    """Owner Experience MVP: Local Web Composer, Import Center, and Visual Review Queue."""
 
     def __init__(
         self,
         db_path: Path | str,
         backup_dir: Path | str | None = None,
+        staging_dir: Path | str | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.backup_dir = Path(backup_dir) if backup_dir else self.db_path.parent / "backups"
+        self.staging_dir = Path(staging_dir) if staging_dir else self.db_path.parent / "staging"
         self.engine = SafeApplyEngine(self.db_path, self.backup_dir)
+        self.import_manager = ImportCenterManager(self.db_path, staging_dir=self.staging_dir)
+        self.review_manager = ReviewQueueManager(self.db_path, backup_dir=self.backup_dir)
 
     def preview(self, text: str, default_account: str = "Cash") -> dict[str, Any]:
         """Parses quick capture text, builds candidate, and returns structured preview with hash."""
@@ -156,17 +164,107 @@ class QuickCaptureComposer:
 
         return self.engine.apply(candidate)
 
+    # ------------------ Import Center Operations ------------------
+
+    def upload_file(self, filename: str, content: bytes, provider: str = "auto") -> dict[str, Any]:
+        """Uploads and processes a file batch, registering any ambiguous or review-needed items."""
+        batch = self.import_manager.process_batch(filename, content, provider=provider)
+        for it in batch.items:
+            if it.status in ("REVIEW_REQUIRED", "AMBIGUOUS"):
+                rev_item = ReviewItem(
+                    item_id=it.item_id,
+                    batch_id=batch.batch_id,
+                    date=it.date,
+                    time=it.time,
+                    transaction_type=it.transaction_type,
+                    amount=it.amount,
+                    account_from=it.account_from,
+                    account_to=it.account_to,
+                    description=it.description,
+                    category=it.category,
+                    status=it.status,
+                    reason=it.reason,
+                    candidate=it.candidate,
+                )
+                self.review_manager.add_item(rev_item)
+
+        return self.import_manager.get_batch_summary(batch.batch_id) or {}
+
+    def get_import_batch(self, batch_id: str) -> dict[str, Any] | None:
+        return self.import_manager.get_batch_summary(batch_id)
+
+    # ------------------ Review Queue Operations ------------------
+
+    def get_review_queue(self) -> list[dict[str, Any]]:
+        """Returns active review queue items."""
+        items = self.review_manager.get_pending_items()
+        out = []
+        for it in items:
+            out.append({
+                "item_id": it.item_id,
+                "batch_id": it.batch_id,
+                "date": it.date,
+                "time": it.time,
+                "transaction_type": it.transaction_type,
+                "amount": f"{it.amount:.2f}",
+                "account_from": it.account_from,
+                "account_to": it.account_to,
+                "description": it.description,
+                "category": it.category,
+                "status": it.status,
+                "reason": it.reason,
+                "preview_hash": it.preview_hash,
+            })
+        return out
+
+    def dispatch_review_action(
+        self,
+        action: str,
+        item_id: str,
+        updates: dict[str, Any] | None = None,
+        notes: str = "",
+    ) -> dict[str, Any]:
+        """Executes review queue action: approve, reject, modify, or apply."""
+        act = action.lower().strip()
+        if act == "approve":
+            item = self.review_manager.approve(item_id, notes=notes)
+            return {"success": True, "status": item.status, "item_id": item.item_id}
+        elif act == "reject":
+            item = self.review_manager.reject(item_id, reason=notes)
+            return {"success": True, "status": item.status, "item_id": item.item_id}
+        elif act == "modify":
+            item = self.review_manager.modify(item_id, updates or {})
+            return {
+                "success": True,
+                "status": item.status,
+                "item_id": item.item_id,
+                "preview_hash": item.preview_hash,
+                "amount": f"{item.amount:.2f}",
+            }
+        elif act == "apply":
+            apply_res = self.review_manager.confirm_and_apply(item_id)
+            return {
+                "success": apply_res.success,
+                "state": apply_res.state.value,
+                "applied_row_ids": list(apply_res.applied_row_ids),
+                "is_idempotent_replay": apply_res.is_idempotent_replay,
+                "preview_hash": apply_res.preview_hash,
+            }
+        else:
+            raise ValueError(f"Unknown review action: {action}")
+
+    # ------------------ Query Services ------------------
+
     def get_balances(self) -> dict[str, Any]:
-        """Returns read-only account balances."""
         return get_account_balances(self.db_path)
 
     def get_monthly_summary(self, year: int, month: int) -> dict[str, Any]:
-        """Returns read-only monthly cash flow summary."""
         return get_monthly_summary(year, month, self.db_path)
 
     def get_pending_reviews(self) -> list[dict[str, Any]]:
-        """Returns pending review queue."""
         return get_pending_reviews(self.db_path)
+
+    # ------------------ HTTP Request Dispatcher ------------------
 
     def handle_request(
         self,
@@ -175,12 +273,12 @@ class QuickCaptureComposer:
         query: dict[str, list[str]] | None = None,
         body: bytes | str | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
-        """Dispatches HTTP requests for local web composer UI and JSON endpoints."""
+        """Dispatches HTTP requests for local web composer UI, Import Center, and Review Queue."""
         m = method.upper()
         p = path.rstrip("/") or "/"
         q = query or {}
 
-        if m == "GET" and (p in ("/", "/quick-capture")):
+        if m == "GET" and (p in ("/", "/quick-capture", "/import", "/review")):
             html_content = self.render_html()
             return 200, {"Content-Type": "text/html; charset=utf-8"}, html_content.encode("utf-8")
 
@@ -211,6 +309,48 @@ class QuickCaptureComposer:
                 err_out = {"success": False, "error": str(e)}
                 return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(err_out).encode("utf-8")
 
+        # Import Center HTTP endpoints
+        if m == "POST" and p == "/api/import/upload":
+            try:
+                payload: dict[str, Any] = {}
+                if body:
+                    raw_str = body.decode("utf-8") if isinstance(body, bytes) else body
+                    payload = json.loads(raw_str)
+                filename = payload.get("filename", "upload.csv")
+                content_str = payload.get("content", "")
+                content_bytes = content_str.encode("utf-8") if isinstance(content_str, str) else b""
+                summary = self.upload_file(filename, content_bytes)
+                return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(summary).encode("utf-8")
+            except Exception as e:
+                return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"success": False, "error": str(e)}).encode("utf-8")
+
+        if m == "GET" and p == "/api/import/batch":
+            batch_id = q.get("id", [""])[0]
+            summary = self.get_import_batch(batch_id)
+            if not summary:
+                return 404, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"error": "Batch not found"}).encode("utf-8")
+            return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(summary).encode("utf-8")
+
+        # Review Queue HTTP endpoints
+        if m == "GET" and p == "/api/review-queue/pending":
+            items = self.get_review_queue()
+            return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(items).encode("utf-8")
+
+        if m == "POST" and p == "/api/review-queue/action":
+            try:
+                payload: dict[str, Any] = {}
+                if body:
+                    raw_str = body.decode("utf-8") if isinstance(body, bytes) else body
+                    payload = json.loads(raw_str)
+                action = payload.get("action", "")
+                item_id = payload.get("item_id", "")
+                updates = payload.get("updates")
+                notes = payload.get("notes", "")
+                res = self.dispatch_review_action(action, item_id, updates=updates, notes=notes)
+                return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(res).encode("utf-8")
+            except Exception as e:
+                return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"success": False, "error": str(e)}).encode("utf-8")
+
         if m == "GET" and p == "/api/quick-capture/balances":
             bals = self.get_balances()
             return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(bals, default=_decimal_default).encode("utf-8")
@@ -230,13 +370,13 @@ class QuickCaptureComposer:
         return 404, {"Content-Type": "text/plain"}, b"Not Found"
 
     def render_html(self) -> str:
-        """Renders minimalist Vanilla HTML/JS interface for Quick Capture."""
+        """Renders minimalist Vanilla HTML/JS interface with Quick Capture, Import Center, and Review Queue tabs."""
         return """<!DOCTYPE html>
 <html lang="id">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AturUang — Quick Capture & Saldo Cepat</title>
+  <title>AturUang — Pusat Impor & Catat Cepat</title>
   <style>
     :root {
       --bg: #0f172a;
@@ -247,6 +387,7 @@ class QuickCaptureComposer:
       --primary: #10b981;
       --primary-hover: #059669;
       --danger: #ef4444;
+      --warning: #f59e0b;
       --font: system-ui, -apple-system, sans-serif;
     }
     body {
@@ -257,17 +398,35 @@ class QuickCaptureComposer:
       color: var(--text);
     }
     .container {
-      max-width: 760px;
+      max-width: 840px;
       margin: 0 auto;
     }
-    h1 {
-      font-size: 24px;
-      margin-bottom: 8px;
-    }
-    .subtitle {
-      color: var(--text-muted);
+    .nav-tabs {
+      display: flex;
+      gap: 12px;
       margin-bottom: 24px;
-      font-size: 14px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+    }
+    .tab-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      padding: 8px 16px;
+      border-radius: 8px;
+    }
+    .tab-btn.active {
+      background: var(--card);
+      color: var(--primary);
+    }
+    .tab-pane {
+      display: none;
+    }
+    .tab-pane.active {
+      display: block;
     }
     .card {
       background: var(--card);
@@ -276,35 +435,29 @@ class QuickCaptureComposer:
       padding: 20px;
       margin-bottom: 20px;
     }
-    input[type="text"] {
+    input[type="text"], textarea {
       width: 100%;
       box-sizing: border-box;
       padding: 12px 16px;
-      font-size: 16px;
+      font-size: 15px;
       background: #0f172a;
       border: 1px solid var(--border);
       border-radius: 8px;
       color: var(--text);
       outline: none;
     }
-    input[type="text"]:focus {
-      border-color: var(--primary);
-    }
     .btn {
       display: inline-block;
-      padding: 10px 20px;
+      padding: 8px 16px;
       background: var(--primary);
       color: #fff;
       border: none;
       border-radius: 8px;
       cursor: pointer;
       font-weight: 600;
-      font-size: 14px;
-      margin-top: 12px;
+      font-size: 13px;
     }
-    .btn:hover {
-      background: var(--primary-hover);
-    }
+    .btn-danger { background: var(--danger); }
     .badge {
       display: inline-block;
       padding: 4px 8px;
@@ -314,37 +467,54 @@ class QuickCaptureComposer:
     }
     .badge-success { background: #064e3b; color: #34d399; }
     .badge-review { background: #7c2d12; color: #fb923c; }
-    .preview-table {
+    .table {
       width: 100%;
       border-collapse: collapse;
       margin-top: 12px;
       font-size: 14px;
     }
-    .preview-table td {
-      padding: 6px 0;
-    }
-    .preview-table td.label {
-      color: var(--text-muted);
-      width: 140px;
-    }
-    .hash {
-      font-family: monospace;
-      font-size: 12px;
-      color: #38bdf8;
-      word-break: break-all;
+    .table td, .table th {
+      padding: 8px 6px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
     }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>Catat Cepat (Quick Capture)</h1>
-    <div class="subtitle">Ketik transaksi informal: contoh "-25rb makan bakso gopay" atau "+5jt gaji bca"</div>
-
-    <div class="card">
-      <input type="text" id="captureInput" placeholder='Ketik transaksi, misal: -25rb makan bakso gopay' autocomplete="off">
-      <div id="previewArea" style="margin-top: 16px; display: none;"></div>
+    <div class="nav-tabs">
+      <button class="tab-btn active" onclick="switchTab('quick')">Catat Cepat</button>
+      <button class="tab-btn" onclick="switchTab('import')">Pusat Impor</button>
+      <button class="tab-btn" onclick="switchTab('review')">Antrean Tinjauan</button>
     </div>
 
+    <!-- Tab 1: Catat Cepat -->
+    <div id="tab-quick" class="tab-pane active">
+      <div class="card">
+        <input type="text" id="captureInput" placeholder='Ketik transaksi, misal: -25rb makan bakso gopay' autocomplete="off">
+        <div id="previewArea" style="margin-top: 16px; display: none;"></div>
+      </div>
+    </div>
+
+    <!-- Tab 2: Pusat Impor -->
+    <div id="tab-import" class="tab-pane">
+      <div class="card">
+        <h2 style="font-size: 18px; margin-top: 0;">Unggah Berkas Mutasi (CSV / PDF)</h2>
+        <input type="file" id="fileInput" accept=".csv,.pdf">
+        <button class="btn" style="margin-top:12px;" onclick="uploadFile()">Unggah & Analisis</button>
+        <div id="importResult" style="margin-top: 16px; display: none;"></div>
+      </div>
+    </div>
+
+    <!-- Tab 3: Antrean Tinjauan -->
+    <div id="tab-review" class="tab-pane">
+      <div class="card">
+        <h2 style="font-size: 18px; margin-top: 0;">Antrean Tinjauan Pemilik</h2>
+        <div id="reviewList">Memuat antrean...</div>
+      </div>
+    </div>
+
+    <!-- Saldo Terkini -->
     <div class="card">
       <h2 style="font-size: 18px; margin-top: 0;">Saldo Akun Terkini</h2>
       <div id="balancesList">Memuat saldo...</div>
@@ -359,6 +529,22 @@ class QuickCaptureComposer:
 
     let currentPayload = null;
 
+    function switchTab(t) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+      if (t === 'quick') {
+        document.querySelector('.tab-btn:nth-child(1)').classList.add('active');
+        document.getElementById('tab-quick').classList.add('active');
+      } else if (t === 'import') {
+        document.querySelector('.tab-btn:nth-child(2)').classList.add('active');
+        document.getElementById('tab-import').classList.add('active');
+      } else if (t === 'review') {
+        document.querySelector('.tab-btn:nth-child(3)').classList.add('active');
+        document.getElementById('tab-review').classList.add('active');
+        loadReviewQueue();
+      }
+    }
+
     async function loadBalances() {
       try {
         const res = await fetch('/api/quick-capture/balances');
@@ -368,11 +554,11 @@ class QuickCaptureComposer:
           container.innerHTML = '<span style="color:var(--text-muted)">Belum ada data saldo akun.</span>';
           return;
         }
-        let html = '<table class="preview-table">';
+        let html = '<table class="table">';
         data.accounts.forEach(a => {
-          html += `<tr><td class="label">${esc(a.name)}</td><td>Rp ${esc(Number(a.current_balance || a.balance || 0).toLocaleString('id-ID'))}</td></tr>`;
+          html += `<tr><td>${esc(a.name)}</td><td>Rp ${esc(Number(a.current_balance || a.balance || 0).toLocaleString('id-ID'))}</td></tr>`;
         });
-        html += `<tr><td class="label" style="font-weight:700;color:var(--text)">Total Saldo</td><td style="font-weight:700;color:#34d399">Rp ${esc(Number(data.total_balance || 0).toLocaleString('id-ID'))}</td></tr>`;
+        html += `<tr><td><b>Total Saldo</b></td><td style="color:#34d399"><b>Rp ${esc(Number(data.total_balance || 0).toLocaleString('id-ID'))}</b></td></tr>`;
         html += '</table>';
         container.innerHTML = html;
       } catch (err) {
@@ -381,10 +567,12 @@ class QuickCaptureComposer:
     }
 
     async function updatePreview() {
-      const q = document.getElementById('captureInput').value.trim();
+      const inputEl = document.getElementById('captureInput');
+      if (!inputEl) return;
+      const q = inputEl.value.trim();
       const area = document.getElementById('previewArea');
       if (!q) {
-        area.style.display = 'none';
+        if (area) area.style.display = 'none';
         currentPayload = null;
         return;
       }
@@ -392,6 +580,7 @@ class QuickCaptureComposer:
         const res = await fetch('/api/quick-capture/preview?q=' + encodeURIComponent(q));
         const data = await res.json();
         currentPayload = data;
+        if (!area) return;
         area.style.display = 'block';
 
         if (data.status === 'SUCCESS') {
@@ -400,15 +589,15 @@ class QuickCaptureComposer:
               <span class="badge badge-success">SIAP KONFIRMASI</span>
               <span class="hash">Hash: ${esc(data.preview_hash.substring(0, 16))}...</span>
             </div>
-            <table class="preview-table">
-              <tr><td class="label">Tipe Transaksi</td><td><b>${esc(data.transaction_type)}</b></td></tr>
-              <tr><td class="label">Nominal</td><td><b>Rp ${esc(Number(data.amount).toLocaleString('id-ID'))}</b></td></tr>
-              <tr><td class="label">Akun Asal</td><td>${esc(data.account_from || '-')}</td></tr>
-              <tr><td class="label">Akun Tujuan</td><td>${esc(data.account_to || '-')}</td></tr>
-              <tr><td class="label">Deskripsi</td><td>${esc(data.description)}</td></tr>
-              <tr><td class="label">Kategori</td><td>${esc(data.category)}</td></tr>
+            <table class="table" style="margin-top:10px;">
+              <tr><td>Tipe Transaksi</td><td><b>${esc(data.transaction_type)}</b></td></tr>
+              <tr><td>Nominal</td><td><b>Rp ${esc(Number(data.amount).toLocaleString('id-ID'))}</b></td></tr>
+              <tr><td>Akun Asal</td><td>${esc(data.account_from || '-')}</td></tr>
+              <tr><td>Akun Tujuan</td><td>${esc(data.account_to || '-')}</td></tr>
+              <tr><td>Deskripsi</td><td>${esc(data.description)}</td></tr>
+              <tr><td>Kategori</td><td>${esc(data.category)}</td></tr>
             </table>
-            <button class="btn" onclick="confirmAndApply()">Konfirmasi & Terapkan</button>
+            <button class="btn" style="margin-top:12px;" onclick="confirmAndApply()">Konfirmasi & Terapkan</button>
           `;
         } else {
           area.innerHTML = `
@@ -417,7 +606,7 @@ class QuickCaptureComposer:
           `;
         }
       } catch (err) {
-        area.innerHTML = '<span style="color:var(--danger)">Gagal menghasilkan pratinjau.</span>';
+        if (area) area.innerHTML = '<span style="color:var(--danger)">Gagal menghasilkan pratinjau.</span>';
       }
     }
 
@@ -432,8 +621,10 @@ class QuickCaptureComposer:
         const result = await res.json();
         if (result.success) {
           alert('Transaksi berhasil diterapkan secara aman!');
-          document.getElementById('captureInput').value = '';
-          document.getElementById('previewArea').style.display = 'none';
+          const inputEl = document.getElementById('captureInput');
+          if (inputEl) inputEl.value = '';
+          const area = document.getElementById('previewArea');
+          if (area) area.style.display = 'none';
           currentPayload = null;
           loadBalances();
         } else {
@@ -444,11 +635,103 @@ class QuickCaptureComposer:
       }
     }
 
+    async function uploadFile() {
+      const fin = document.getElementById('fileInput');
+      if (!fin || !fin.files || fin.files.length === 0) {
+        alert('Pilih berkas terlebih dahulu.');
+        return;
+      }
+      const file = fin.files[0];
+      const formData = new FormData();
+      formData.append('file', file);
+      const resDiv = document.getElementById('importResult');
+      if (resDiv) {
+        resDiv.style.display = 'block';
+        resDiv.innerHTML = '<span>Sedang mengunggah dan menganalisis berkas...</span>';
+      }
+      try {
+        const res = await fetch('/api/import/upload', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await res.json();
+        if (resDiv) {
+          if (res.ok && data.status === 'SUCCESS') {
+            resDiv.innerHTML = `
+              <div style="color:var(--primary); font-weight:600; margin-bottom:8px;">Berkas berhasil diproses!</div>
+              <table class="table">
+                <tr><td>Batch ID</td><td><code>${esc(data.batch_id || '-')}</code></td></tr>
+                <tr><td>Total Transaksi</td><td>${esc(data.total_discovered || data.total_transactions || 0)}</td></tr>
+                <tr><td>Status Rekonsiliasi</td><td>${esc(data.reconciliation_status || data.status || '-')}</td></tr>
+              </table>
+            `;
+            loadBalances();
+          } else {
+            resDiv.innerHTML = `<span style="color:var(--danger)">Gagal memproses: ${esc(data.error || data.diagnostic_reason || 'Terjadi kesalahan')}</span>`;
+          }
+        }
+      } catch (err) {
+        if (resDiv) resDiv.innerHTML = '<span style="color:var(--danger)">Kesalahan jaringan saat mengunggah.</span>';
+      }
+    }
+
+    async function loadReviewQueue() {
+      try {
+        const res = await fetch('/api/review-queue/pending');
+        const items = await res.json();
+        const container = document.getElementById('reviewList');
+        if (!items || items.length === 0) {
+          container.innerHTML = '<span style="color:var(--text-muted)">Tidak ada transaksi yang memerlukan tinjauan.</span>';
+          return;
+        }
+        let html = '<table class="table"><tr><th>Tanggal</th><th>Deskripsi</th><th>Nominal</th><th>Alasan</th><th>Aksi</th></tr>';
+        items.forEach(it => {
+          html += `<tr>
+            <td>${esc(it.date)}</td>
+            <td>${esc(it.description)}</td>
+            <td>Rp ${esc(Number(it.amount).toLocaleString('id-ID'))}</td>
+            <td style="color:#fb923c;">${esc(it.reason)}</td>
+            <td>
+              <button class="btn" onclick="reviewAction('approve', '${esc(it.item_id)}')">Setujui</button>
+              <button class="btn btn-danger" onclick="reviewAction('reject', '${esc(it.item_id)}')">Tolak</button>
+            </td>
+          </tr>`;
+        });
+        html += '</table>';
+        container.innerHTML = html;
+      } catch (err) {
+        document.getElementById('reviewList').innerText = 'Gagal memuat antrean tinjauan.';
+      }
+    }
+
+    async function reviewAction(action, itemId) {
+      try {
+        const res = await fetch('/api/review-queue/action', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({action: action, item_id: itemId})
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert('Aksi berhasil dijalankan.');
+          loadReviewQueue();
+          loadBalances();
+        } else {
+          alert('Gagal: ' + (data.error || 'Terjadi kesalahan.'));
+        }
+      } catch (err) {
+        alert('Kesalahan jaringan.');
+      }
+    }
+
     let debounceTimer;
-    document.getElementById('captureInput').addEventListener('input', () => {
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(updatePreview, 250);
-    });
+    const captureInputEl = document.getElementById('captureInput');
+    if (captureInputEl) {
+      captureInputEl.addEventListener('input', () => {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(updatePreview, 250);
+      });
+    }
 
     loadBalances();
   </script>
