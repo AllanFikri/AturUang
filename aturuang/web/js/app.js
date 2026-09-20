@@ -4318,5 +4318,51 @@ if ('serviceWorker' in navigator) {
   });
 }
 
+// --- Cloudflare Edge Inbox Sync ---
+async function pullFromCloud() {
+  const btn = $('pullCloudBtn');
+  const badge = $('cloudSyncStatusBadge');
+  if (btn) btn.disabled = true;
+  if (badge) {
+    badge.textContent = 'Cloud: Menyinkronkan...';
+    badge.style.color = '#38bdf8';
+  }
+  try {
+    const res = await api('/api/sync/pull-cloud', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    if (res && res.status === 'success') {
+      const count = res.staged_count || 0;
+      if (badge) {
+        badge.textContent = `Cloud: Sinkron (${count} baru)`;
+        badge.style.color = '#10b981';
+      }
+      await load();
+      if (state.page === 'transactions') await loadTransactions();
+      if (state.page === 'review') await loadReviewQueue();
+    } else if (res && res.status === 'skipped') {
+      if (badge) {
+        badge.textContent = 'Cloud: Belum Dikonfigurasi';
+        badge.style.color = '#eab308';
+      }
+    } else {
+      if (badge) {
+        badge.textContent = 'Cloud: Gagal';
+        badge.style.color = '#ef4444';
+      }
+    }
+  } catch (err) {
+    if (badge) {
+      badge.textContent = 'Cloud: Error';
+      badge.style.color = '#ef4444';
+    }
+    console.warn('Pull cloud sync failed:', err);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // Initialize Quick Capture event bindings
 initQuickCapture();

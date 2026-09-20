@@ -33,6 +33,8 @@
       <button class="btn" onclick="openQuickCaptureModal()" style="background:#10b981;color:#fff;font-weight:700" title="Catat Cepat transaksi dengan bahasa alami">⚡ Catat Cepat</button>
       <button class="btn" onclick="goPage('import')" title="Pusat Impor Berkas Mutasi (CSV / PDF)">📥 Impor</button>
       <button class="btn" onclick="goPage('receipt')" title="Pindai Struk Belanja (OCR)">🧾 Struk</button>
+      <button id="pullCloudBtn" class="btn" onclick="pullFromCloud()" title="Tarik bukti mutasi dari Cloudflare D1">☁️ Tarik dari Cloud</button>
+      <span id="cloudSyncStatusBadge" class="badge" style="display:inline-flex;align-items:center;font-size:12px;padding:4px 8px;border-radius:6px;background:rgba(255,255,255,0.08);color:var(--muted);font-weight:500">Cloud: Idle</span>
       <button class="btn primary" onclick="openTxModal()">+ Transaksi Baru</button>
     </div>
   </div>

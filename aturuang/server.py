@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import hashlib
+import hmac
 import http.server
 import io
 import json
@@ -17,7 +19,11 @@ import os
 import socketserver
 import sqlite3
 import sys
+import time
+import types
 import urllib.parse
+import urllib.request
+import uuid
 import webbrowser
 from pathlib import Path
 
@@ -211,6 +217,186 @@ def set_watched_folder_scanner(scanner) -> None:
     _watched_folder_instance = scanner
 
 
+_last_edge_sync_info = {
+    "status": "idle",
+    "last_sync_at": None,
+    "last_result": None,
+}
+
+
+def init_edge_sync_schema(con: sqlite3.Connection) -> None:
+    """Initialize edge sync message staging schema."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS edge_synced_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT 'gmail',
+            sender TEXT,
+            subject TEXT,
+            payload TEXT NOT NULL,
+            synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'STAGED'
+        );
+    """)
+    con.commit()
+
+
+def sync_edge_inbox(
+    worker_url: str | None = None,
+    secret: str | None = None,
+    db_path: str | Path | None = None,
+    staging_dir: str | Path | None = None,
+    apply_engine: Any = None,
+    review_manager: Any = None,
+) -> dict[str, Any]:
+    """Pull pending Gmail evidence payloads from Cloudflare Worker endpoint GET /api/sync/gmail.
+
+    Signed with HMAC-SHA256 headers: X-Timestamp, X-Nonce, X-Signature.
+    Stages fetched evidence into local ingestion staging idempotently (tracking external message_id).
+    Acknowledges consumption to Worker (POST /api/sync/ack).
+    """
+    global _last_edge_sync_info
+    if worker_url is None:
+        worker_url = os.environ.get("CLOUDFLARE_WORKER_URL") or os.environ.get("EDGE_WORKER_URL") or ""
+    if secret is None:
+        secret = (
+            os.environ.get("GMAIL_RELAY_SECRET")
+            or os.environ.get("ATURUANG_SYNC_SECRET")
+            or os.environ.get("EDGE_SYNC_SECRET")
+            or ""
+        )
+
+    clean_url = str(worker_url).strip().rstrip("/")
+    clean_secret = str(secret).strip()
+
+    if not clean_url or not clean_secret:
+        res = {
+            "status": "skipped",
+            "reason": "unconfigured",
+            "message": "Worker URL or secret not configured",
+            "fetched_count": 0,
+            "staged_count": 0,
+            "acknowledged_count": 0,
+        }
+        _last_edge_sync_info = {
+            "status": "skipped",
+            "last_sync_at": dt.datetime.now().isoformat(),
+            "last_result": res,
+        }
+        return res
+
+    # 1. Fetch pending evidence via GET /api/sync/gmail with HMAC headers
+    now_ms = int(time.time() * 1000)
+    nonce = uuid.uuid4().hex
+    payload_to_sign = f"{now_ms}.{nonce}."
+    sig = hmac.new(clean_secret.encode("utf-8"), payload_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    req_headers = {
+        "X-Timestamp": str(now_ms),
+        "X-Nonce": nonce,
+        "X-Signature": sig,
+        "Accept": "application/json",
+        "User-Agent": "AturUang-EdgeSync/1.0",
+    }
+
+    get_req = urllib.request.Request(f"{clean_url}/api/sync/gmail", headers=req_headers, method="GET")
+    with urllib.request.urlopen(get_req, timeout=10) as resp:
+        resp_bytes = resp.read()
+        resp_data = json.loads(resp_bytes.decode("utf-8") or "[]")
+
+    if isinstance(resp_data, list):
+        messages = resp_data
+    elif isinstance(resp_data, dict):
+        messages = resp_data.get("messages") or resp_data.get("results") or resp_data.get("items") or []
+    else:
+        messages = []
+
+    # 2. Stage fetched evidence into local SQLite staging idempotently
+    target_db = Path(db_path) if db_path else DB_FILE
+    staged_ids = []
+
+    con = sqlite3.connect(str(target_db), timeout=5.0)
+    try:
+        init_edge_sync_schema(con)
+        for item in messages:
+            msg_id = str(item.get("message_id") or item.get("id") or item.get("external_event_id") or "").strip()
+            if not msg_id:
+                continue
+
+            existing = con.execute("SELECT id FROM edge_synced_messages WHERE message_id = ?", (msg_id,)).fetchone()
+            if existing:
+                continue
+
+            sender = item.get("from") or item.get("sender") or ""
+            subject = item.get("subject") or ""
+            payload_str = json.dumps(item, ensure_ascii=False)
+
+            con.execute(
+                "INSERT INTO edge_synced_messages (message_id, source, sender, subject, payload, status) VALUES (?, ?, ?, ?, ?, ?)",
+                (msg_id, "gmail", sender, subject, payload_str, "STAGED"),
+            )
+            con.commit()
+            staged_ids.append(msg_id)
+
+            if staging_dir:
+                s_dir = Path(staging_dir)
+                s_dir.mkdir(parents=True, exist_ok=True)
+                (s_dir / f"{msg_id}.json").write_text(payload_str, encoding="utf-8")
+    finally:
+        con.close()
+
+    # 3. Acknowledge consumption to Worker (POST /api/sync/ack)
+    ack_count = 0
+    if staged_ids:
+        ack_body_dict = {"acknowledged_ids": staged_ids, "source": "gmail"}
+        ack_body_str = json.dumps(ack_body_dict, ensure_ascii=False)
+        ack_body_bytes = ack_body_str.encode("utf-8")
+
+        ack_ms = int(time.time() * 1000)
+        ack_nonce = uuid.uuid4().hex
+        ack_payload_to_sign = f"{ack_ms}.{ack_nonce}.{ack_body_str}"
+        ack_sig = hmac.new(clean_secret.encode("utf-8"), ack_payload_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        ack_headers = {
+            "X-Timestamp": str(ack_ms),
+            "X-Nonce": ack_nonce,
+            "X-Signature": ack_sig,
+            "Content-Type": "application/json",
+            "User-Agent": "AturUang-EdgeSync/1.0",
+        }
+
+        ack_req = urllib.request.Request(
+            f"{clean_url}/api/sync/ack",
+            data=ack_body_bytes,
+            headers=ack_headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(ack_req, timeout=10) as ack_resp:
+            ack_resp.read()
+        ack_count = len(staged_ids)
+
+    res = {
+        "status": "success",
+        "fetched_count": len(messages),
+        "staged_count": len(staged_ids),
+        "staged_ids": staged_ids,
+        "acknowledged_count": ack_count,
+    }
+    _last_edge_sync_info = {
+        "status": "success",
+        "last_sync_at": dt.datetime.now().isoformat(),
+        "last_result": res,
+    }
+    return res
+
+
+# Module alias to support 'import aturuang.edge_sync'
+_edge_sync_mod = types.ModuleType("aturuang.edge_sync")
+_edge_sync_mod.sync_edge_inbox = sync_edge_inbox
+_edge_sync_mod.init_edge_sync_schema = init_edge_sync_schema
+sys.modules["aturuang.edge_sync"] = _edge_sync_mod
+
+
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -306,6 +492,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "skipped_files_count": 0,
                 "last_scan_timestamp": None,
             })
+
+        if path == "/api/sync/status":
+            return self.send_json(_last_edge_sync_info)
 
         # Static assets
         if path in {"/", "/index.html"}:
@@ -553,6 +742,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 res = scanner.scan_now()
                 return self.send_json(res)
             return self.send_json({"success": False, "error": "Scanner not initialized"}, 500)
+
+        if path == "/api/sync/pull-cloud":
+            payload = {}
+            try:
+                payload = self.read_json()
+            except Exception:
+                pass
+            worker_url = payload.get("worker_url") if isinstance(payload, dict) else None
+            secret = payload.get("secret") if isinstance(payload, dict) else None
+            try:
+                res = sync_edge_inbox(worker_url=worker_url, secret=secret)
+                return self.send_json(res)
+            except Exception as e:
+                return self.send_json({"status": "error", "error": str(e)}, 500)
 
         try:
             payload = self.read_json()
@@ -1257,6 +1460,11 @@ def run_app(port: int = DEFAULT_PORT, open_browser: bool = True) -> None:
             pass
 
     try:
+        sync_edge_inbox()
+    except Exception:
+        pass
+
+    try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
@@ -1278,6 +1486,8 @@ __all__ = [
     "set_composer",
     "get_watched_folder_scanner",
     "set_watched_folder_scanner",
+    "sync_edge_inbox",
+    "init_edge_sync_schema",
 ]
 
 

@@ -483,6 +483,15 @@ class SafeApplyEngine:
                     post_state_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS transaction_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transaction_id INTEGER,
+                    action TEXT NOT NULL,
+                    old_data TEXT NOT NULL DEFAULT '{}',
+                    new_data TEXT NOT NULL DEFAULT '{}',
+                    timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
             """)
         finally:
             con.close()
@@ -710,3 +719,119 @@ class SafeApplyEngine:
             applied_timestamp=applied_timestamp,
             audit_entry=audit_entry,
         )
+
+    def auto_apply_if_eligible(
+        self,
+        candidate: ApplyCandidate,
+        match_tier: str,
+        reconciliation_status: str,
+        review_manager: Any = None,
+    ) -> tuple[bool, ApplyResult | None, str]:
+        """Grand Design V2.1 Section 4.3 & 6: Zero-Click Auto-Apply Policy.
+
+        When evidence is processed through Truth Pipeline:
+        - If Match Tier is EXACT or STRONG and reconciliation status is RECONCILED (or BALANCED):
+          * Directly dispatch candidate to SafeApplyEngine.apply() with automated pre-apply SQLite backup.
+          * Record applied mutation in canonical transactions table.
+          * Emit audit event AUTO_APPLIED_HIGH_CONFIDENCE.
+        - If status is AMBIGUOUS, UNRESOLVED, or has balance discrepancies:
+          * Route strictly to ReviewQueueManager (REVIEW_REQUIRED).
+        """
+        tier = str(match_tier).upper().strip()
+        recon = str(reconciliation_status).upper().strip()
+
+        is_eligible = tier in ("EXACT", "STRONG") and recon in ("RECONCILED", "BALANCED")
+
+        if is_eligible:
+            # Transition through state machine to READY_FOR_CONFIRMATION then CONFIRMED
+            if candidate.state == CandidateLifecycleState.RECEIVED:
+                candidate.transition_to(CandidateLifecycleState.PARSED, "Auto-parsed candidate")
+            if candidate.state == CandidateLifecycleState.PARSED:
+                candidate.transition_to(
+                    CandidateLifecycleState.READY_FOR_CONFIRMATION,
+                    "Auto-validated: high-confidence exact/strong match",
+                )
+            if candidate.state == CandidateLifecycleState.READY_FOR_CONFIRMATION:
+                candidate.transition_to(
+                    CandidateLifecycleState.CONFIRMED,
+                    "Auto-confirmed: high-confidence exact/strong match",
+                )
+
+            # Execute safe atomic apply with native pre-apply SQLite backup
+            apply_result = self.apply(candidate)
+
+            # Emit audit event in transaction_audit_log if table exists
+            try:
+                con = sqlite3.connect(self.db_path, timeout=1.0)
+                try:
+                    for row_id in apply_result.applied_row_ids:
+                        con.execute(
+                            """
+                            INSERT INTO transaction_audit_log (transaction_id, action, old_data, new_data)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (
+                                row_id,
+                                "AUTO_APPLIED_HIGH_CONFIDENCE",
+                                "{}",
+                                json.dumps({"candidate_id": candidate.candidate_id, "tier": tier, "recon": recon}),
+                            ),
+                        )
+                    con.commit()
+                finally:
+                    con.close()
+            except Exception:
+                pass
+
+            return True, apply_result, "AUTO_APPLIED_HIGH_CONFIDENCE"
+        else:
+            # Route strictly to ReviewQueueManager
+            if candidate.state == CandidateLifecycleState.RECEIVED:
+                candidate.transition_to(CandidateLifecycleState.PARSED, "Auto-parsed candidate")
+            if candidate.state != CandidateLifecycleState.REVIEW_REQUIRED:
+                candidate.transition_to(
+                    CandidateLifecycleState.REVIEW_REQUIRED,
+                    f"Ambiguous match ({tier}) or unreconciled status ({recon})",
+                )
+
+            if review_manager is not None:
+                from aturuang.review_queue_ui import ReviewItem
+                first_mut = candidate.mutations[0] if candidate.mutations else None
+                if first_mut:
+                    rev_item = ReviewItem(
+                        item_id=f"rev_{candidate.candidate_id}",
+                        batch_id=candidate.candidate_id,
+                        date=first_mut.date,
+                        time=first_mut.time,
+                        transaction_type=first_mut.transaction_type,
+                        amount=first_mut.amount,
+                        account_from=first_mut.account_from,
+                        account_to=first_mut.account_to,
+                        description=first_mut.description,
+                        category=first_mut.category,
+                        status="REVIEW_REQUIRED",
+                        reason=f"Ambiguous or discrepant evidence (tier: {tier}, recon: {recon})",
+                        candidate=candidate,
+                    )
+                    review_manager.add_item(rev_item)
+
+            return False, None, "REVIEW_REQUIRED"
+
+    auto_apply = auto_apply_if_eligible
+    evaluate_and_apply = auto_apply_if_eligible
+
+
+def auto_apply_candidate(
+    engine: SafeApplyEngine,
+    candidate: ApplyCandidate,
+    match_tier: str,
+    reconciliation_status: str,
+    review_manager: Any = None,
+) -> tuple[bool, ApplyResult | None, str]:
+    """Helper dispatching auto-apply evaluation to SafeApplyEngine."""
+    return engine.auto_apply_if_eligible(
+        candidate,
+        match_tier=match_tier,
+        reconciliation_status=reconciliation_status,
+        review_manager=review_manager,
+    )
