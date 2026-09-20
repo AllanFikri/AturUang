@@ -252,7 +252,8 @@ def get_edge_sync_config(worker_url: str | None = None, secret: str | None = Non
         )
     if secret is None:
         secret = (
-            os.environ.get("GMAIL_RELAY_SECRET")
+            os.environ.get("STAGING_ADMIN_TOKEN")
+            or os.environ.get("GMAIL_RELAY_SECRET")
             or os.environ.get("ATURUANG_SYNC_SECRET")
             or os.environ.get("EDGE_SYNC_SECRET")
             or os.environ.get("CLOUDFLARE_SYNC_SECRET")
@@ -277,7 +278,7 @@ def get_edge_sync_config(worker_url: str | None = None, secret: str | None = Non
                                     worker_url = str(data[k]).strip()
                                     break
                         if secret is None:
-                            for k in ("GMAIL_RELAY_SECRET", "gmail_relay_secret", "ATURUANG_SYNC_SECRET", "aturuang_sync_secret", "EDGE_SYNC_SECRET", "edge_sync_secret", "CLOUDFLARE_SYNC_SECRET", "cloudflare_sync_secret", "sync_secret"):
+                            for k in ("STAGING_ADMIN_TOKEN", "staging_admin_token", "GMAIL_RELAY_SECRET", "gmail_relay_secret", "ATURUANG_SYNC_SECRET", "aturuang_sync_secret", "EDGE_SYNC_SECRET", "edge_sync_secret", "CLOUDFLARE_SYNC_SECRET", "cloudflare_sync_secret", "sync_secret"):
                                 if data.get(k):
                                     secret = str(data[k]).strip()
                                     break
@@ -332,6 +333,7 @@ def sync_edge_inbox(
     sig = hmac.new(clean_secret.encode("utf-8"), payload_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
     req_headers = {
+        "Authorization": f"Bearer {clean_secret}",
         "X-Timestamp": str(now_ms),
         "X-Nonce": nonce,
         "X-Signature": sig,
@@ -339,34 +341,41 @@ def sync_edge_inbox(
         "User-Agent": "AturUang-EdgeSync/1.0",
     }
 
-    try:
-        get_req = urllib.request.Request(f"{clean_url}/api/sync/gmail", headers=req_headers, method="GET")
-        with urllib.request.urlopen(get_req, timeout=10) as resp:
-            resp_bytes = resp.read()
-            resp_data = json.loads(resp_bytes.decode("utf-8") or "[]")
-    except urllib.error.HTTPError as http_err:
-        err_msg = f"HTTP {http_err.code} dari Cloudflare Worker: {http_err.reason}"
+    target_endpoints = [
+        f"{clean_url}/api/sync/gmail",
+        f"{clean_url}/api/ingestion/pending",
+    ]
+    resp_data = None
+    last_err = None
+
+    for ep in target_endpoints:
+        try:
+            get_req = urllib.request.Request(ep, headers=req_headers, method="GET")
+            with urllib.request.urlopen(get_req, timeout=10) as resp:
+                resp_bytes = resp.read()
+                resp_data = json.loads(resp_bytes.decode("utf-8") or "[]")
+                last_err = None
+                break
+        except urllib.error.HTTPError as http_err:
+            last_err = http_err
+            # If 404 Not Found or 401 Unauthorized on non-final endpoint, try next endpoint
+            if http_err.code in (401, 404) and ep != target_endpoints[-1]:
+                continue
+            break
+        except Exception as net_err:
+            last_err = net_err
+            break
+
+    if last_err is not None:
+        if isinstance(last_err, urllib.error.HTTPError):
+            err_msg = f"HTTP {last_err.code} dari Cloudflare Worker: {last_err.reason}"
+            reason_code = "http_error"
+        else:
+            err_msg = f"Tidak dapat terhubung ke Cloudflare Worker ({clean_url}): {last_err}"
+            reason_code = "network_error"
         res = {
             "status": "unreachable",
-            "reason": "http_error",
-            "message": err_msg,
-            "fetched_count": 0,
-            "staged_count": 0,
-            "acknowledged_count": 0,
-            "auto_applied_count": 0,
-            "review_required_count": 0,
-        }
-        _last_edge_sync_info = {
-            "status": "error",
-            "last_sync_at": dt.datetime.now().isoformat(),
-            "last_result": res,
-        }
-        return res
-    except Exception as net_err:
-        err_msg = f"Tidak dapat terhubung ke Cloudflare Worker ({clean_url}): {net_err}"
-        res = {
-            "status": "unreachable",
-            "reason": "network_error",
+            "reason": reason_code,
             "message": err_msg,
             "fetched_count": 0,
             "staged_count": 0,
@@ -497,12 +506,12 @@ def sync_edge_inbox(
                         amt = Decimal(str(amt_raw))
                         tx_date = str(cand_data.get("date") or dt.date.today().isoformat())
                         tx_time = str(cand_data.get("time") or dt.datetime.now().strftime("%H:%M:%S"))
-                        tx_type = str(cand_data.get("transaction_type") or cand_data.get("type") or "Expense")
+                        tx_type = str(cand_data.get("transaction_type") or cand_data.get("type") or cand_data.get("tx_type") or "Expense")
                         if tx_type not in ("Income", "Expense", "Transfer", "Adjustment"):
                             tx_type = "Expense"
                         acc_from = str(cand_data.get("account_from") or cand_data.get("account") or "BCA Main")
                         acc_to = str(cand_data.get("account_to") or cand_data.get("to_account") or "Merchant External")
-                        desc = str(cand_data.get("description") or item.get("subject") or "Sync from Cloudflare Edge")
+                        desc = str(cand_data.get("description") or item.get("subject") or cand_data.get("reasons") or "Sync from Cloudflare Edge")
                         cat = str(cand_data.get("category") or "Other")
                         tier = str(item.get("match_tier") or cand_data.get("match_tier") or item.get("tier") or "EXACT").upper()
                         recon = str(item.get("reconciliation_status") or cand_data.get("reconciliation_status") or item.get("recon") or "RECONCILED").upper()
