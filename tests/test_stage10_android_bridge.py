@@ -371,6 +371,149 @@ class TestStage10AndroidBridge(unittest.TestCase):
             f"Production DB altered! Expected {EXPECTED_PRODUCTION_DB_SHA256}, got {current_hash}",
         )
 
+    # 16. test_bridge_persistent_nonce_across_restarts
+    def test_bridge_persistent_nonce_across_restarts(self) -> None:
+        """Asserts that nonces persisted in SQLite prevent replays even after process/bridge restart."""
+        nonce_str = "nonce_persisted_restart_test_01"
+        payload = self._build_payload(nonce=nonce_str)
+        res1 = self.bridge.ingest_notification(payload)
+        self.assertTrue(res1["success"])
+        self.assertEqual(res1["status"], "STAGED_FOR_REVIEW")
+
+        # Simulate a full server restart: instantiate brand new bridge instance with empty in-memory cache
+        new_bridge = AndroidNotificationBridge(self.db_path)
+        new_bridge.register_device(self.device_id, self.device_secret)
+        self.assertEqual(len(new_bridge._nonce_cache), 0)
+
+        # Attempt to replay same payload on new bridge instance
+        res2 = new_bridge.ingest_notification(payload)
+        self.assertFalse(res2["success"])
+        self.assertEqual(res2["error_code"], "NONCE_REPLAYED")
+
+    # 17. test_bridge_unconfigured_secret_fails_closed
+    def test_bridge_unconfigured_secret_fails_closed(self) -> None:
+        """Rejects notification with UNCONFIGURED_SECRET when no secret is configured."""
+        import os
+        # Ensure no env var is present
+        old_env = os.environ.pop("ATURUANG_ANDROID_BRIDGE_SECRET", None)
+        try:
+            unconfigured_bridge = AndroidNotificationBridge(self.db_path, default_device_secret=None)
+            payload = self._build_payload(device_id="DEV_UNREGISTERED_999", secret="any-secret-value")
+            res = unconfigured_bridge.ingest_notification(payload)
+            self.assertFalse(res["success"])
+            self.assertEqual(res["error_code"], "UNCONFIGURED_SECRET")
+        finally:
+            if old_env is not None:
+                os.environ["ATURUANG_ANDROID_BRIDGE_SECRET"] = old_env
+
+    # 18. test_bridge_realistic_bca_notifications
+    def test_bridge_realistic_bca_notifications(self) -> None:
+        """Parses realistic synthetic BCA notification fixtures (Debit, Kredit, QRIS)."""
+        # 1. BCA Debit transfer
+        parsed_debit = self.bridge.parse_notification(
+            package_name="mybca",
+            title="m-Transfer Berhasil",
+            text="Transfer ke BUDI UTOMO Rp 750.000,00 dari Rekening 1234567890 berhasil.",
+        )
+        self.assertEqual(parsed_debit.transaction_type, "Expense")
+        self.assertEqual(parsed_debit.amount, Decimal("750000.00"))
+        self.assertEqual(parsed_debit.account_from, "BCA")
+        self.assertIn("Budi Utomo", parsed_debit.description)
+
+        # 2. BCA Kredit / incoming transfer
+        parsed_kredit = self.bridge.parse_notification(
+            package_name="com.bca",
+            title="BCA mobile",
+            text="Transfer dr PT MAJU JAYA Rp 12.500.000,00 ke Rekening 1234567890 berhasil.",
+        )
+        self.assertEqual(parsed_kredit.transaction_type, "Income")
+        self.assertEqual(parsed_kredit.amount, Decimal("12500000.00"))
+        self.assertEqual(parsed_kredit.account_to, "BCA")
+        self.assertIn("Pt Maju Jaya", parsed_kredit.description)
+
+        # 3. BCA QRIS payment
+        parsed_qris = self.bridge.parse_notification(
+            package_name="com.bca",
+            title="BCA mobile",
+            text="Pembayaran QRIS di INDOMARET Rp 62.500,00 berhasil.",
+        )
+        self.assertEqual(parsed_qris.transaction_type, "Expense")
+        self.assertEqual(parsed_qris.amount, Decimal("62500.00"))
+        self.assertEqual(parsed_qris.account_from, "BCA")
+        self.assertIn("Indomaret", parsed_qris.description)
+
+    # 19. test_bridge_realistic_gopay_notifications
+    def test_bridge_realistic_gopay_notifications(self) -> None:
+        """Parses realistic synthetic GoPay notification fixtures (QRIS payment, top up, cashback)."""
+        # 1. QRIS / Merchant payment
+        parsed_qris = self.bridge.parse_notification(
+            package_name="com.gojek.app",
+            title="GoPay",
+            text="Kamu telah membayar Rp 38.000 ke Kopi Kenangan menggunakan GoPay",
+        )
+        self.assertEqual(parsed_qris.transaction_type, "Expense")
+        self.assertEqual(parsed_qris.amount, Decimal("38000.00"))
+        self.assertEqual(parsed_qris.account_from, "GoPay")
+        self.assertIn("Kopi Kenangan", parsed_qris.description)
+
+        # 2. Top-up / incoming saldo
+        parsed_topup = self.bridge.parse_notification(
+            package_name="com.gopay.app",
+            title="GoPay",
+            text="Top up saldo GoPay sebesar Rp 200.000 dari BCA berhasil",
+        )
+        self.assertEqual(parsed_topup.transaction_type, "Income")
+        self.assertEqual(parsed_topup.amount, Decimal("200000.00"))
+        self.assertEqual(parsed_topup.account_to, "GoPay")
+        self.assertIn("Bca", parsed_topup.description)
+
+        # 3. Cashback
+        parsed_cashback = self.bridge.parse_notification(
+            package_name="com.gopay.app",
+            title="GoPay",
+            text="Kamu dapat cashback Rp 5.000 dari promo GoPay",
+        )
+        self.assertEqual(parsed_cashback.transaction_type, "Income")
+        self.assertEqual(parsed_cashback.amount, Decimal("5000.00"))
+        self.assertEqual(parsed_cashback.account_to, "GoPay")
+        self.assertEqual(parsed_cashback.description, "Cashback GoPay")
+
+    # 20. test_bridge_realistic_seabank_notifications
+    def test_bridge_realistic_seabank_notifications(self) -> None:
+        """Parses realistic synthetic SeaBank notification fixtures (bunga tabungan, transfer masuk, transfer keluar)."""
+        # 1. Bunga tabungan cair
+        parsed_bunga = self.bridge.parse_notification(
+            package_name="com.seabank.mobile",
+            title="SeaBank",
+            text="Bunga tabungan SeaBank sebesar Rp 1.450 telah cair ke rekeningmu",
+        )
+        self.assertEqual(parsed_bunga.transaction_type, "Income")
+        self.assertEqual(parsed_bunga.amount, Decimal("1450.00"))
+        self.assertEqual(parsed_bunga.account_to, "SeaBank")
+        self.assertEqual(parsed_bunga.description, "Bunga tabungan SeaBank")
+
+        # 2. Transfer masuk
+        parsed_masuk = self.bridge.parse_notification(
+            package_name="com.seabank.mobile",
+            title="SeaBank",
+            text="Transfer Masuk Rp 2.500.000 dari Bank Mandiri berhasil",
+        )
+        self.assertEqual(parsed_masuk.transaction_type, "Income")
+        self.assertEqual(parsed_masuk.amount, Decimal("2500000.00"))
+        self.assertEqual(parsed_masuk.account_to, "SeaBank")
+        self.assertIn("Bank Mandiri", parsed_masuk.description)
+
+        # 3. Transfer keluar
+        parsed_keluar = self.bridge.parse_notification(
+            package_name="com.seabank.mobile",
+            title="SeaBank",
+            text="Transfer Keluar Rp 450.000 ke Rekening BCA 0123456789 berhasil",
+        )
+        self.assertEqual(parsed_keluar.transaction_type, "Expense")
+        self.assertEqual(parsed_keluar.amount, Decimal("450000.00"))
+        self.assertEqual(parsed_keluar.account_from, "SeaBank")
+        self.assertIn("Rekening Bca", parsed_keluar.description)
+
 
 if __name__ == "__main__":
     unittest.main()

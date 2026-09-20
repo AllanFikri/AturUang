@@ -52,6 +52,36 @@ def get_gemini_api_key() -> str:
 
     return ""
 
+
+BRIDGE_ACCOUNT_NAME = "android_bridge_secret"
+
+
+def get_bridge_secret(db_path: Path | str | None = None) -> str:
+    """Retrieves Android Bridge shared secret: OS Credential Manager -> env var -> local secrets.json."""
+    kr = _get_keyring()
+    if kr:
+        try:
+            val = kr.get_password(SERVICE_NAME, BRIDGE_ACCOUNT_NAME)
+            if val and val.strip():
+                return val.strip()
+        except Exception:
+            pass
+
+    env_val = os.getenv("ATURUANG_ANDROID_BRIDGE_SECRET", "").strip()
+    if env_val:
+        return env_val
+
+    if FALLBACK_SECRET_PATH.exists():
+        try:
+            data = json.loads(FALLBACK_SECRET_PATH.read_text(encoding="utf-8"))
+            val = data.get("android_bridge_secret", "").strip()
+            if val:
+                return val
+        except Exception:
+            pass
+
+    return ""
+
 def save_gemini_api_key(key: str, con: sqlite3.Connection | None = None) -> bool:
     """Saves API Key securely into OS Credential Manager and purges any DB plain text key."""
     clean_key = key.strip()

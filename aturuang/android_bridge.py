@@ -16,8 +16,10 @@ import datetime as dt
 from decimal import Decimal
 import hashlib
 import hmac
+import os
 from pathlib import Path
 import re
+import sqlite3
 import time
 from typing import Any
 
@@ -136,22 +138,97 @@ class AndroidNotificationBridge:
         self,
         db_path: Path | str,
         review_manager: ReviewQueueManager | None = None,
-        default_device_secret: str = "aturuang-bridge-secret-2026",
+        default_device_secret: str | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.review_manager = review_manager or ReviewQueueManager(self.db_path)
         self.device_secrets: dict[str, str] = {}
-        self.default_device_secret = default_device_secret
+
+        # Priority: explicit param -> ATURUANG_ANDROID_BRIDGE_SECRET env var -> credential store
+        resolved_secret = default_device_secret or os.getenv("ATURUANG_ANDROID_BRIDGE_SECRET")
+        if not resolved_secret:
+            try:
+                from aturuang.ai_key_manager import get_bridge_secret
+                resolved_secret = get_bridge_secret(self.db_path) or None
+            except Exception:
+                resolved_secret = None
+
+        self.default_device_secret: str | None = resolved_secret
         self._nonce_cache: set[str] = set()
         self.max_drift_seconds: int = 300  # 5 minutes
+        self._init_nonce_store()
+
+    def _init_nonce_store(self) -> None:
+        """Initializes persistent SQLite nonce replay store with TTL index."""
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS android_bridge_nonces (
+                        nonce_key TEXT PRIMARY KEY,
+                        created_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_nonces_created_at ON android_bridge_nonces(created_at)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    def _is_nonce_seen(self, nonce_key: str, current_time: int) -> bool:
+        """Checks if nonce was processed within TTL window across restarts."""
+        if nonce_key in self._nonce_cache:
+            return True
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            try:
+                cutoff = current_time - self.max_drift_seconds
+                conn.execute("DELETE FROM android_bridge_nonces WHERE created_at < ?", (cutoff,))
+                conn.commit()
+                row = conn.execute(
+                    "SELECT 1 FROM android_bridge_nonces WHERE nonce_key = ?",
+                    (nonce_key,),
+                ).fetchone()
+                if row:
+                    self._nonce_cache.add(nonce_key)
+                    return True
+            finally:
+                conn.close()
+        except Exception:
+            pass
+        return False
+
+    def _record_nonce(self, nonce_key: str, current_time: int) -> None:
+        """Persists nonce to SQLite table and local cache."""
+        self._nonce_cache.add(nonce_key)
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO android_bridge_nonces (nonce_key, created_at) VALUES (?, ?)",
+                    (nonce_key, current_time),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
 
     def register_device(self, device_id: str, secret: str) -> None:
         """Registers an authorized Android device and its shared HMAC secret."""
         self.device_secrets[device_id] = secret
 
     def get_device_secret(self, device_id: str) -> str:
-        """Returns the shared secret for a registered device, or fallback to default."""
-        return self.device_secrets.get(device_id, self.default_device_secret)
+        """Returns the shared secret for a registered device, or fallback to configured secret."""
+        sec = self.device_secrets.get(device_id) or self.default_device_secret or os.getenv("ATURUANG_ANDROID_BRIDGE_SECRET")
+        if not sec:
+            raise HMACVerificationError(f"No shared secret configured for device '{device_id}' (fail-closed)")
+        return sec
 
     def verify_payload(
         self,
@@ -185,19 +262,23 @@ class AndroidNotificationBridge:
         if abs(now - ts) > self.max_drift_seconds:
             return False, f"Timestamp drift exceeds {self.max_drift_seconds}s", "EXPIRED_TIMESTAMP"
 
-        # 3. Nonce replay check
+        # 3. Nonce replay check (Persistent SQLite & Memory Cache)
         nonce_key = f"{device_id}:{nonce}"
-        if nonce_key in self._nonce_cache:
+        if self._is_nonce_seen(nonce_key, now):
             return False, f"Nonce '{nonce}' has already been processed", "NONCE_REPLAYED"
 
-        # 4. HMAC signature check
-        secret = self.get_device_secret(device_id)
+        # 4. HMAC signature check (Fail-Closed)
+        try:
+            secret = self.get_device_secret(device_id)
+        except HMACVerificationError as e:
+            return False, str(e), "UNCONFIGURED_SECRET"
+
         expected_sig = compute_hmac_signature(secret, device_id, ts, nonce, pkg, title, text)
         if not hmac.compare_digest(expected_sig.lower(), sig.lower()):
             return False, "Invalid HMAC-SHA256 signature", "UNAUTHORIZED"
 
-        # Mark nonce as processed
-        self._nonce_cache.add(nonce_key)
+        # Mark nonce as processed persistently
+        self._record_nonce(nonce_key, now)
         return True, "Valid", "OK"
 
     def parse_notification(
@@ -238,6 +319,12 @@ class AndroidNotificationBridge:
             "cashback",
             "diterima",
             "masuk sebesar",
+            "bunga tabungan",
+            "bunga",
+            "telah cair",
+            "cair ke",
+            "kredit",
+            "dapat transfer",
         )
         is_income = any(token in full_text_lower for token in income_tokens)
 
@@ -245,14 +332,39 @@ class AndroidNotificationBridge:
             tx_type = "Income"
             account_from = ""
             account_to = account_name
-            sender_match = re.search(r"(?:dari|dr)\s+([A-Za-z0-9\s\.\,\-]+?)(?:\s+Rp|\s+sebesar|\s+ke|\s+berhasil|\.|$)", full_text_lower)
-            desc = f"Transfer masuk dari {sender_match.group(1).title().strip()}" if sender_match else f"Dana masuk {account_name}"
+            if "bunga" in full_text_lower:
+                desc = f"Bunga tabungan {account_name}"
+            elif "cashback" in full_text_lower:
+                desc = f"Cashback {account_name}"
+            else:
+                sender_match = re.search(
+                    r"(?:dari|dr)\s+([A-Za-z0-9\s\.\,\-]+?)(?:\s+(?:rp|sebesar|ke|berhasil|masuk|telah)|[\.\,]|$)",
+                    full_text_lower,
+                )
+                desc = f"Transfer masuk dari {sender_match.group(1).title().strip()}" if sender_match else f"Dana masuk {account_name}"
         else:
             tx_type = "Expense"
             account_from = account_name
             account_to = "Merchant External"
-            recip_match = re.search(r"(?:ke|untuk)\s+([A-Za-z0-9\s\.\,\-]+?)(?:\s+Rp|\s+sebesar|\s+dari|\s+berhasil|\.|$)", full_text_lower)
-            desc = f"Pembayaran ke {recip_match.group(1).title().strip()}" if recip_match else f"Transaksi {account_name}"
+            recip_match = re.search(
+                r"(?:ke|untuk|di|pada|kepada)\s+([A-Za-z0-9\s\.\,\-]+?)(?:\s+(?:rp|sebesar|dari|berhasil|menggunakan)|[\.\,]|$)",
+                full_text_lower,
+            )
+            if not recip_match:
+                recip_match = re.search(
+                    r"membayar\s+([A-Za-z0-9\s\.\,\-]+?)\s+(?:sebesar|rp)",
+                    full_text_lower,
+                )
+            if recip_match:
+                party = recip_match.group(1).title().strip()
+                if "transfer" in full_text_lower or party.lower().startswith("rekening"):
+                    desc = f"Transfer ke {party}"
+                elif " di " in f" {full_text_lower} ":
+                    desc = f"Pembayaran di {party}"
+                else:
+                    desc = f"Pembayaran ke {party}"
+            else:
+                desc = f"Transaksi {account_name}"
 
         if timestamp:
             dt_obj = dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc)
