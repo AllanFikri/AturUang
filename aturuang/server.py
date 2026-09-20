@@ -183,6 +183,34 @@ def set_composer(composer) -> None:
     _composer_instance = composer
 
 
+_watched_folder_instance = None
+
+
+def get_watched_folder_scanner():
+    global _watched_folder_instance
+    if _watched_folder_instance is None:
+        try:
+            from aturuang.watched_folder import WatchedFolderScanner
+            composer = get_composer()
+            rev_mgr = composer.review_manager if composer else None
+            imp_mgr = composer.import_manager if composer else None
+            db_target = composer.db_path if composer else DB_FILE
+            _watched_folder_instance = WatchedFolderScanner(
+                db_path=db_target,
+                review_manager=rev_mgr,
+                import_manager=imp_mgr,
+            )
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to initialize WatchedFolderScanner: {e}\n")
+            _watched_folder_instance = None
+    return _watched_folder_instance
+
+
+def set_watched_folder_scanner(scanner) -> None:
+    global _watched_folder_instance
+    _watched_folder_instance = scanner
+
+
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -265,6 +293,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+
+        if path == "/api/watched-folder/status":
+            scanner = get_watched_folder_scanner()
+            if scanner:
+                return self.send_json(scanner.get_status())
+            return self.send_json({
+                "active": False,
+                "watched_path": "",
+                "total_scanned_files": 0,
+                "processed_files_count": 0,
+                "skipped_files_count": 0,
+                "last_scan_timestamp": None,
+            })
 
         # Static assets
         if path in {"/", "/index.html"}:
@@ -505,6 +546,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+
+        if path == "/api/watched-folder/scan-now":
+            scanner = get_watched_folder_scanner()
+            if scanner:
+                res = scanner.scan_now()
+                return self.send_json(res)
+            return self.send_json({"success": False, "error": "Scanner not initialized"}, 500)
 
         try:
             payload = self.read_json()
@@ -1220,7 +1268,17 @@ run_server = run_app
 main = run_app
 RequestHandler = Handler
 
-__all__ = ["main", "run_server", "run_app", "RequestHandler", "Handler", "get_composer", "set_composer"]
+__all__ = [
+    "main",
+    "run_server",
+    "run_app",
+    "RequestHandler",
+    "Handler",
+    "get_composer",
+    "set_composer",
+    "get_watched_folder_scanner",
+    "set_watched_folder_scanner",
+]
 
 
 if __name__ == "__main__":

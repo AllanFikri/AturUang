@@ -783,6 +783,21 @@
       <button class="btn primary" style="margin-top:12px" onclick="uploadImportFile()">Unggah &amp; Analisis</button>
       <div id="importResultArea" style="margin-top:16px;display:none"></div>
     </div>
+    <div class="card" id="watchedFolderCard" style="max-width:640px;margin-top:16px">
+      <div class="between" style="margin-bottom:8px">
+        <h3 style="margin:0;font-size:16px">Folder Google Drive / Watched Folder</h3>
+        <span id="watchedFolderStatusBadge" class="pill">Memeriksa...</span>
+      </div>
+      <div class="small muted" id="watchedFolderPathDisplay" style="margin-bottom:12px">
+        Lokasi: <code>H:\My Drive\Money Tracks</code>
+      </div>
+      <div class="small" id="watchedFolderStats" style="margin-bottom:12px">
+        Terakhir dipindai: <span id="watchedFolderLastScan">—</span> &bull;
+        Berkas diproses: <strong id="watchedFolderProcessedCount">0</strong>
+      </div>
+      <button class="btn small" id="scanFolderBtn" onclick="scanWatchedFolderNow()">Pindai Folder Sekarang</button>
+      <div id="scanFolderResultArea" style="margin-top:12px;display:none"></div>
+    </div>
   </section>
 
   <section id="review" class="page">

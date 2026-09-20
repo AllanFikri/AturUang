@@ -257,6 +257,7 @@ function goPage(page) {
   if (page === 'reports') loadReports();
   if (page === 'updates') loadUpdates();
   if (page === 'review') loadReviewQueue();
+  if (page === 'import') loadWatchedFolderStatus();
 }
 
 document.querySelectorAll('#nav button').forEach((b) => (b.onclick = () => goPage(b.dataset.page)));
@@ -4017,6 +4018,83 @@ function renderImportResult(res, containerEl) {
       </div>
     </div>
   `;
+}
+
+// --- Watched Folder Automation ---
+async function loadWatchedFolderStatus() {
+  const badgeEl = $('watchedFolderStatusBadge');
+  const pathEl = $('watchedFolderPathDisplay');
+  const lastScanEl = $('watchedFolderLastScan');
+  const countEl = $('watchedFolderProcessedCount');
+  if (!badgeEl) return;
+
+  try {
+    const res = await api('/api/watched-folder/status');
+    if (res.active) {
+      badgeEl.className = 'pill ready';
+      badgeEl.textContent = 'Aktif';
+    } else {
+      badgeEl.className = 'pill pending';
+      badgeEl.textContent = 'Siaga';
+    }
+    if (pathEl && res.watched_path) {
+      pathEl.innerHTML = `Lokasi: <code>${esc(res.watched_path)}</code>`;
+    }
+    if (lastScanEl) {
+      lastScanEl.textContent = res.last_scan_timestamp ? new Date(res.last_scan_timestamp).toLocaleString('id-ID') : 'Belum pernah';
+    }
+    if (countEl) {
+      countEl.textContent = String(res.processed_files_count ?? 0);
+    }
+  } catch (err) {
+    if (badgeEl) {
+      badgeEl.className = 'pill rejected';
+      badgeEl.textContent = 'Nonaktif';
+    }
+  }
+}
+
+async function scanWatchedFolderNow() {
+  const btn = $('scanFolderBtn');
+  const resArea = $('scanFolderResultArea');
+  if (!btn || !resArea) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Memindai Folder...';
+  resArea.style.display = 'block';
+  resArea.innerHTML = '<div class="small muted">Memindai berkas mutasi di folder Google Drive...</div>';
+
+  try {
+    const res = await api('/api/watched-folder/scan-now', { method: 'POST' });
+    const scanned = res.scanned_files ?? 0;
+    const newFiles = res.new_files ?? 0;
+    const skipped = res.skipped_files ?? 0;
+    const queued = res.items_queued ?? 0;
+
+    resArea.innerHTML = `
+      <div style="background:rgba(255,255,255,0.03);border:1px solid var(--line);border-radius:12px;padding:12px">
+        <div style="font-weight:600;color:var(--green);margin-bottom:4px">Pemindaian Folder Selesai</div>
+        <div class="small" style="margin-bottom:8px">
+          Berkas dipindai: <strong>${scanned}</strong> &bull;
+          Berkas baru: <strong style="color:var(--green)">${newFiles}</strong> &bull;
+          Duplikat (dilewati): <strong style="color:var(--muted)">${skipped}</strong> &bull;
+          Antrean tinjauan: <strong style="color:var(--amber)">${queued}</strong>
+        </div>
+        ${queued > 0 ? '<button class="btn primary tiny" onclick="goPage(\'review\')">Buka Antrean Tinjauan</button>' : ''}
+      </div>
+    `;
+    await loadWatchedFolderStatus();
+  } catch (err) {
+    resArea.innerHTML = `
+      <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:12px;padding:12px">
+        <div class="small" style="color:var(--red);font-weight:600">Gagal memindai folder</div>
+        <div class="tiny muted" style="margin-top:4px">${esc(err.message)}</div>
+      </div>
+    `;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Pindai Folder Sekarang';
+  }
 }
 
 // --- Review Queue ---
