@@ -30,6 +30,7 @@ from aturuang.query_service import get_account_balances, get_monthly_summary, ge
 from aturuang.import_center import ImportCenterManager, ImportBatch, ImportBatchItem
 from aturuang.review_queue_ui import ReviewQueueManager, ReviewItem
 from aturuang.receipt_ocr import ReceiptOCRManager, ReceiptDraft
+from aturuang.pwa_assets import get_manifest_json, get_service_worker_js, get_icon_svg
 
 
 def _decimal_default(obj: Any) -> Any:
@@ -330,6 +331,19 @@ class QuickCaptureComposer:
             html_content = self.render_html()
             return 200, {"Content-Type": "text/html; charset=utf-8"}, html_content.encode("utf-8")
 
+        # PWA Manifest, Service Worker, and Icon routes
+        if m == "GET" and (p in ("/manifest.webmanifest", "/manifest.json")):
+            return 200, {"Content-Type": "application/manifest+json; charset=utf-8"}, get_manifest_json().encode("utf-8")
+
+        if m == "GET" and p == "/sw.js":
+            return 200, {
+                "Content-Type": "application/javascript; charset=utf-8",
+                "Service-Worker-Allowed": "/",
+            }, get_service_worker_js().encode("utf-8")
+
+        if m == "GET" and p == "/icon.svg":
+            return 200, {"Content-Type": "image/svg+xml; charset=utf-8"}, get_icon_svg().encode("utf-8")
+
         if m == "GET" and p == "/api/quick-capture/preview":
             raw_q = q.get("q", [""])[0]
             def_acc = q.get("account", ["Cash"])[0]
@@ -465,7 +479,15 @@ class QuickCaptureComposer:
 <html lang="id">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#1e293b">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="AturUang">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="apple-touch-icon" href="/icon.svg">
   <title>AturUang — Pusat Impor & Catat Cepat</title>
   <style>
     :root {
@@ -497,6 +519,7 @@ class QuickCaptureComposer:
       margin-bottom: 24px;
       border-bottom: 1px solid var(--border);
       padding-bottom: 12px;
+      align-items: center;
     }
     .tab-btn {
       background: none;
@@ -568,21 +591,72 @@ class QuickCaptureComposer:
       border-bottom: 1px solid var(--border);
       text-align: left;
     }
+    .quick-capture-box {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    @media (max-width: 640px) {
+      body {
+        padding: 12px;
+      }
+      .container {
+        width: 100%;
+      }
+      .nav-tabs {
+        overflow-x: auto;
+        white-space: nowrap;
+        gap: 8px;
+        -webkit-overflow-scrolling: touch;
+        padding-bottom: 8px;
+      }
+      .tab-btn {
+        flex-shrink: 0;
+        padding: 10px 14px;
+        min-height: 44px;
+        font-size: 14px;
+      }
+      .card {
+        padding: 14px;
+        border-radius: 10px;
+      }
+      .btn {
+        min-height: 44px;
+        padding: 10px 16px;
+        font-size: 14px;
+        touch-action: manipulation;
+      }
+      input[type="text"], input[type="number"], input[type="date"], select, textarea {
+        min-height: 44px;
+        font-size: 16px;
+        box-sizing: border-box;
+      }
+      .table-responsive {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+    }
   </style>
 </head>
 <body>
+  <div id="offlineIndicator" style="display:none; background:#ef4444; color:#fff; text-align:center; padding:8px 12px; font-weight:600; font-size:13px; position:sticky; top:0; z-index:1000;">
+    Anda sedang offline. Data keuangan hanya dapat disinkronkan saat online.
+  </div>
   <div class="container">
     <div class="nav-tabs">
       <button class="tab-btn active" onclick="switchTab('quick')">Catat Cepat</button>
       <button class="tab-btn" onclick="switchTab('import')">Pusat Impor</button>
       <button class="tab-btn" onclick="switchTab('review')">Antrean Tinjauan</button>
       <button class="tab-btn" onclick="switchTab('receipt')">Pindai Struk</button>
+      <button id="pwaInstallBtn" class="btn" style="display:none; margin-left:auto; background:#3b82f6;" onclick="installPwa()">Pasang Aplikasi</button>
     </div>
 
     <!-- Tab 1: Catat Cepat -->
     <div id="tab-quick" class="tab-pane active">
       <div class="card">
-        <input type="text" id="captureInput" placeholder='Ketik transaksi, misal: -25rb makan bakso gopay' autocomplete="off">
+        <div class="quick-capture-box">
+          <input type="text" id="captureInput" placeholder='Ketik transaksi, misal: -25rb makan bakso gopay' autocomplete="off">
+        </div>
         <div id="previewArea" style="margin-top: 16px; display: none;"></div>
       </div>
     </div>
@@ -914,6 +988,49 @@ class QuickCaptureComposer:
         debounceTimer = setTimeout(updatePreview, 250);
       });
     }
+
+    // PWA Install Prompt Hook
+    let deferredPrompt = null;
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPrompt = e;
+      const pwaBtn = document.getElementById('pwaInstallBtn');
+      if (pwaBtn) {
+        pwaBtn.style.display = 'inline-block';
+      }
+    });
+
+    async function installPwa() {
+      if (!deferredPrompt) return;
+      deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      deferredPrompt = null;
+      const pwaBtn = document.getElementById('pwaInstallBtn');
+      if (pwaBtn) {
+        pwaBtn.style.display = 'none';
+      }
+    }
+
+    // Service Worker Registration
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js', { scope: '/' })
+          .catch((err) => {
+            console.error('ServiceWorker registration error:', err);
+          });
+      });
+    }
+
+    // Online / Offline Indicator Listener
+    window.addEventListener('online', updateOnlineStatus);
+    window.addEventListener('offline', updateOnlineStatus);
+    function updateOnlineStatus() {
+      const el = document.getElementById('offlineIndicator');
+      if (el) {
+        el.style.display = navigator.onLine ? 'none' : 'block';
+      }
+    }
+    updateOnlineStatus();
 
     loadBalances();
   </script>
