@@ -243,33 +243,49 @@ def init_edge_sync_schema(con: sqlite3.Connection) -> None:
 
 def get_edge_sync_config(worker_url: str | None = None, secret: str | None = None) -> tuple[str, str]:
     """Resolves Cloudflare Worker URL and secret from arguments, environment variables, or local secure store."""
-    if not worker_url:
+    if worker_url is None:
         worker_url = (
             os.environ.get("CLOUDFLARE_WORKER_URL")
             or os.environ.get("EDGE_WORKER_URL")
             or os.environ.get("WORKER_URL")
-            or ""
+            or None
         )
-    if not secret:
+    if secret is None:
         secret = (
             os.environ.get("GMAIL_RELAY_SECRET")
             or os.environ.get("ATURUANG_SYNC_SECRET")
             or os.environ.get("EDGE_SYNC_SECRET")
             or os.environ.get("CLOUDFLARE_SYNC_SECRET")
-            or ""
+            or None
         )
-    if not worker_url or not secret:
-        fallback_secret_path = Path.home() / ".money_tracks" / "secrets.json"
-        if fallback_secret_path.exists():
-            try:
-                data = json.loads(fallback_secret_path.read_text(encoding="utf-8"))
-                if not worker_url:
-                    worker_url = data.get("cloudflare_worker_url") or data.get("worker_url") or ""
-                if not secret:
-                    secret = data.get("gmail_relay_secret") or data.get("sync_secret") or ""
-            except Exception:
-                pass
-    return str(worker_url).strip().rstrip("/"), str(secret).strip()
+    if worker_url is None or secret is None:
+        candidate_paths = [
+            Path.cwd() / "secrets.json",
+            Path.cwd() / "runtime" / "secrets.json",
+            Path(__file__).resolve().parent.parent / "secrets.json",
+            Path(__file__).resolve().parent.parent / "runtime" / "secrets.json",
+            Path.home() / ".money_tracks" / "secrets.json",
+        ]
+        for sp in candidate_paths:
+            if sp.exists():
+                try:
+                    data = json.loads(sp.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        if worker_url is None:
+                            for k in ("WORKER_URL", "worker_url", "CLOUDFLARE_WORKER_URL", "cloudflare_worker_url", "EDGE_WORKER_URL", "edge_worker_url"):
+                                if data.get(k):
+                                    worker_url = str(data[k]).strip()
+                                    break
+                        if secret is None:
+                            for k in ("GMAIL_RELAY_SECRET", "gmail_relay_secret", "ATURUANG_SYNC_SECRET", "aturuang_sync_secret", "EDGE_SYNC_SECRET", "edge_sync_secret", "CLOUDFLARE_SYNC_SECRET", "cloudflare_sync_secret", "sync_secret"):
+                                if data.get(k):
+                                    secret = str(data[k]).strip()
+                                    break
+                except Exception:
+                    pass
+            if worker_url is not None and secret is not None:
+                break
+    return str(worker_url or "").strip().rstrip("/"), str(secret or "").strip()
 
 
 def sync_edge_inbox(

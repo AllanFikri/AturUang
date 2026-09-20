@@ -19,6 +19,8 @@ scratch/
 .dev.vars.*
 *.pem
 *.key
+secrets.json
+runtime/secrets.json
 
 # Sensitive data seeds & exports
 canonical_ledger_seed.csv
