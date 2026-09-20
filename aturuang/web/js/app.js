@@ -4335,9 +4335,15 @@ async function pullFromCloud() {
     });
     if (res && res.status === 'success') {
       const count = res.staged_count || 0;
+      const applied = res.auto_applied_count || 0;
       if (badge) {
-        badge.textContent = `Cloud: Sinkron (${count} baru)`;
+        if (applied > 0) {
+          badge.textContent = `Cloud: Sinkron (${applied} auto-apply)`;
+        } else {
+          badge.textContent = `Cloud: Sinkron (${count} baru)`;
+        }
         badge.style.color = '#10b981';
+        badge.title = `Berhasil menarik ${count} bukti. ${applied} transaksi diterapkan otomatis.`;
       }
       await load();
       if (state.page === 'transactions') await loadTransactions();
@@ -4346,17 +4352,26 @@ async function pullFromCloud() {
       if (badge) {
         badge.textContent = 'Cloud: Belum Dikonfigurasi';
         badge.style.color = '#eab308';
+        badge.title = res.message || 'Worker URL atau secret belum dikonfigurasi';
+      }
+    } else if (res && res.status === 'unreachable') {
+      if (badge) {
+        badge.textContent = 'Cloud: Tidak Terjangkau';
+        badge.style.color = '#f97316';
+        badge.title = res.message || 'Tidak dapat terhubung ke Cloudflare Worker';
       }
     } else {
       if (badge) {
         badge.textContent = 'Cloud: Gagal';
         badge.style.color = '#ef4444';
+        badge.title = (res && res.message) ? res.message : 'Sinkronisasi cloud gagal';
       }
     }
   } catch (err) {
     if (badge) {
       badge.textContent = 'Cloud: Error';
       badge.style.color = '#ef4444';
+      badge.title = err.message || 'Terjadi kesalahan sistem';
     }
     console.warn('Pull cloud sync failed:', err);
   } finally {

@@ -348,6 +348,80 @@ class EdgeSyncAndAutoApplyTests(unittest.TestCase):
         finally:
             con2.close()
 
+    def test_edge_sync_unconfigured_skips_cleanly(self) -> None:
+        """Assert unconfigured worker URL or secret skips sync gracefully with status 200 payload."""
+        res = sync_edge_inbox(worker_url="", secret="", db_path=self.db_path)
+        self.assertEqual(res["status"], "skipped")
+        self.assertEqual(res["staged_count"], 0)
+        self.assertIn("belum dikonfigurasi", res["message"])
+
+    def test_edge_sync_unreachable_network_error_handled_gracefully(self) -> None:
+        """Assert network connection failure returns 'unreachable' status without throwing 500 error."""
+        import urllib.error
+
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection refused")):
+            res = sync_edge_inbox(
+                worker_url="https://unreachable.worker.dev",
+                secret="some_secret_123",
+                db_path=self.db_path,
+            )
+            self.assertEqual(res["status"], "unreachable")
+            self.assertEqual(res["staged_count"], 0)
+            self.assertIn("Tidak dapat terhubung", res["message"])
+
+    def test_edge_sync_auto_applies_exact_match_evidence(self) -> None:
+        """Assert pull-cloud auto-applies exact matches and updates edge_synced_messages status to AUTO_APPLIED."""
+        mock_messages = [
+            {
+                "message_id": "gmail_auto_999",
+                "from": "ebanking@bca.co.id",
+                "subject": "Transaksi Rekening Tabungan BCA",
+                "amount": 125000.0,
+                "account_from": "BCA Main",
+                "account_to": "Merchant External",
+                "description": "Pembayaran Toko Buku",
+                "category": "Education",
+                "match_tier": "EXACT",
+                "reconciliation_status": "RECONCILED",
+            }
+        ]
+
+        def mock_urlopen(request, *args, **kwargs):
+            resp = MagicMock()
+            url = request.full_url if hasattr(request, "full_url") else str(request)
+            if "/api/sync/gmail" in url:
+                resp.read.return_value = json.dumps(mock_messages).encode("utf-8")
+            else:
+                resp.read.return_value = b"{}"
+            resp.status = 200
+            resp.__enter__.return_value = resp
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            res = sync_edge_inbox(
+                worker_url="https://cf-worker.internal",
+                secret="test_secret_123",
+                db_path=self.db_path,
+                apply_engine=self.engine,
+                review_manager=self.review_manager,
+            )
+            self.assertEqual(res["status"], "success")
+            self.assertEqual(res["staged_count"], 1)
+            self.assertEqual(res["auto_applied_count"], 1)
+
+            # Verify transaction written
+            con = sqlite3.connect(str(self.db_path))
+            try:
+                tx = con.execute("SELECT amount, description FROM transactions WHERE canonical_id='EDGE_gmail_auto_999'").fetchone()
+                self.assertIsNotNone(tx)
+                self.assertAlmostEqual(tx[0], 125000.0, places=2)
+
+                # Verify message marked AUTO_APPLIED
+                st = con.execute("SELECT status FROM edge_synced_messages WHERE message_id='gmail_auto_999'").fetchone()
+                self.assertEqual(st[0], "AUTO_APPLIED")
+            finally:
+                con.close()
+
     def test_production_db_hash_untouched_during_tests(self) -> None:
         """Assert production DB hash remains strictly untouched."""
         prod_path = _find_production_db()

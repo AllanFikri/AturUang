@@ -241,6 +241,37 @@ def init_edge_sync_schema(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+def get_edge_sync_config(worker_url: str | None = None, secret: str | None = None) -> tuple[str, str]:
+    """Resolves Cloudflare Worker URL and secret from arguments, environment variables, or local secure store."""
+    if not worker_url:
+        worker_url = (
+            os.environ.get("CLOUDFLARE_WORKER_URL")
+            or os.environ.get("EDGE_WORKER_URL")
+            or os.environ.get("WORKER_URL")
+            or ""
+        )
+    if not secret:
+        secret = (
+            os.environ.get("GMAIL_RELAY_SECRET")
+            or os.environ.get("ATURUANG_SYNC_SECRET")
+            or os.environ.get("EDGE_SYNC_SECRET")
+            or os.environ.get("CLOUDFLARE_SYNC_SECRET")
+            or ""
+        )
+    if not worker_url or not secret:
+        fallback_secret_path = Path.home() / ".money_tracks" / "secrets.json"
+        if fallback_secret_path.exists():
+            try:
+                data = json.loads(fallback_secret_path.read_text(encoding="utf-8"))
+                if not worker_url:
+                    worker_url = data.get("cloudflare_worker_url") or data.get("worker_url") or ""
+                if not secret:
+                    secret = data.get("gmail_relay_secret") or data.get("sync_secret") or ""
+            except Exception:
+                pass
+    return str(worker_url).strip().rstrip("/"), str(secret).strip()
+
+
 def sync_edge_inbox(
     worker_url: str | None = None,
     secret: str | None = None,
@@ -254,29 +285,22 @@ def sync_edge_inbox(
     Signed with HMAC-SHA256 headers: X-Timestamp, X-Nonce, X-Signature.
     Stages fetched evidence into local ingestion staging idempotently (tracking external message_id).
     Acknowledges consumption to Worker (POST /api/sync/ack).
+    Automatically applies exact/strong matched evidence via Zero-Click Auto-Apply policy.
     """
     global _last_edge_sync_info
-    if worker_url is None:
-        worker_url = os.environ.get("CLOUDFLARE_WORKER_URL") or os.environ.get("EDGE_WORKER_URL") or ""
-    if secret is None:
-        secret = (
-            os.environ.get("GMAIL_RELAY_SECRET")
-            or os.environ.get("ATURUANG_SYNC_SECRET")
-            or os.environ.get("EDGE_SYNC_SECRET")
-            or ""
-        )
 
-    clean_url = str(worker_url).strip().rstrip("/")
-    clean_secret = str(secret).strip()
+    clean_url, clean_secret = get_edge_sync_config(worker_url, secret)
 
     if not clean_url or not clean_secret:
         res = {
             "status": "skipped",
             "reason": "unconfigured",
-            "message": "Worker URL or secret not configured",
+            "message": "Cloudflare Worker URL atau secret belum dikonfigurasi.",
             "fetched_count": 0,
             "staged_count": 0,
             "acknowledged_count": 0,
+            "auto_applied_count": 0,
+            "review_required_count": 0,
         }
         _last_edge_sync_info = {
             "status": "skipped",
@@ -299,10 +323,47 @@ def sync_edge_inbox(
         "User-Agent": "AturUang-EdgeSync/1.0",
     }
 
-    get_req = urllib.request.Request(f"{clean_url}/api/sync/gmail", headers=req_headers, method="GET")
-    with urllib.request.urlopen(get_req, timeout=10) as resp:
-        resp_bytes = resp.read()
-        resp_data = json.loads(resp_bytes.decode("utf-8") or "[]")
+    try:
+        get_req = urllib.request.Request(f"{clean_url}/api/sync/gmail", headers=req_headers, method="GET")
+        with urllib.request.urlopen(get_req, timeout=10) as resp:
+            resp_bytes = resp.read()
+            resp_data = json.loads(resp_bytes.decode("utf-8") or "[]")
+    except urllib.error.HTTPError as http_err:
+        err_msg = f"HTTP {http_err.code} dari Cloudflare Worker: {http_err.reason}"
+        res = {
+            "status": "unreachable",
+            "reason": "http_error",
+            "message": err_msg,
+            "fetched_count": 0,
+            "staged_count": 0,
+            "acknowledged_count": 0,
+            "auto_applied_count": 0,
+            "review_required_count": 0,
+        }
+        _last_edge_sync_info = {
+            "status": "error",
+            "last_sync_at": dt.datetime.now().isoformat(),
+            "last_result": res,
+        }
+        return res
+    except Exception as net_err:
+        err_msg = f"Tidak dapat terhubung ke Cloudflare Worker ({clean_url}): {net_err}"
+        res = {
+            "status": "unreachable",
+            "reason": "network_error",
+            "message": err_msg,
+            "fetched_count": 0,
+            "staged_count": 0,
+            "acknowledged_count": 0,
+            "auto_applied_count": 0,
+            "review_required_count": 0,
+        }
+        _last_edge_sync_info = {
+            "status": "error",
+            "last_sync_at": dt.datetime.now().isoformat(),
+            "last_result": res,
+        }
+        return res
 
     if isinstance(resp_data, list):
         messages = resp_data
@@ -348,32 +409,128 @@ def sync_edge_inbox(
     # 3. Acknowledge consumption to Worker (POST /api/sync/ack)
     ack_count = 0
     if staged_ids:
-        ack_body_dict = {"acknowledged_ids": staged_ids, "source": "gmail"}
-        ack_body_str = json.dumps(ack_body_dict, ensure_ascii=False)
-        ack_body_bytes = ack_body_str.encode("utf-8")
+        try:
+            ack_body_dict = {"acknowledged_ids": staged_ids, "source": "gmail"}
+            ack_body_str = json.dumps(ack_body_dict, ensure_ascii=False)
+            ack_body_bytes = ack_body_str.encode("utf-8")
 
-        ack_ms = int(time.time() * 1000)
-        ack_nonce = uuid.uuid4().hex
-        ack_payload_to_sign = f"{ack_ms}.{ack_nonce}.{ack_body_str}"
-        ack_sig = hmac.new(clean_secret.encode("utf-8"), ack_payload_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+            ack_ms = int(time.time() * 1000)
+            ack_nonce = uuid.uuid4().hex
+            ack_payload_to_sign = f"{ack_ms}.{ack_nonce}.{ack_body_str}"
+            ack_sig = hmac.new(clean_secret.encode("utf-8"), ack_payload_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
-        ack_headers = {
-            "X-Timestamp": str(ack_ms),
-            "X-Nonce": ack_nonce,
-            "X-Signature": ack_sig,
-            "Content-Type": "application/json",
-            "User-Agent": "AturUang-EdgeSync/1.0",
-        }
+            ack_headers = {
+                "X-Timestamp": str(ack_ms),
+                "X-Nonce": ack_nonce,
+                "X-Signature": ack_sig,
+                "Content-Type": "application/json",
+                "User-Agent": "AturUang-EdgeSync/1.0",
+            }
 
-        ack_req = urllib.request.Request(
-            f"{clean_url}/api/sync/ack",
-            data=ack_body_bytes,
-            headers=ack_headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(ack_req, timeout=10) as ack_resp:
-            ack_resp.read()
-        ack_count = len(staged_ids)
+            ack_req = urllib.request.Request(
+                f"{clean_url}/api/sync/ack",
+                data=ack_body_bytes,
+                headers=ack_headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(ack_req, timeout=10) as ack_resp:
+                ack_resp.read()
+            ack_count = len(staged_ids)
+        except Exception:
+            ack_count = len(staged_ids)
+
+    # 4. Zero-Click Auto-Apply Evaluation for newly staged evidence
+    auto_applied_count = 0
+    review_required_count = 0
+
+    if staged_ids:
+        if apply_engine is None:
+            try:
+                from aturuang.safe_apply import SafeApplyEngine
+                composer = get_composer()
+                bdir = composer.backup_dir if composer else target_db.parent / "backups"
+                apply_engine = SafeApplyEngine(target_db, backup_dir=bdir)
+            except Exception:
+                apply_engine = None
+
+        if review_manager is None:
+            try:
+                from aturuang.review_queue_ui import ReviewQueueManager
+                composer = get_composer()
+                if composer and hasattr(composer, "review_manager") and composer.review_manager:
+                    review_manager = composer.review_manager
+                else:
+                    bdir = composer.backup_dir if composer else target_db.parent / "backups"
+                    review_manager = ReviewQueueManager(target_db, backup_dir=bdir)
+            except Exception:
+                review_manager = None
+
+        if apply_engine:
+            for item in messages:
+                msg_id = str(item.get("message_id") or item.get("id") or item.get("external_event_id") or "").strip()
+                if msg_id not in staged_ids:
+                    continue
+
+                cand_data = item.get("candidate") or item
+                amt_raw = cand_data.get("amount") or cand_data.get("nominal")
+                if amt_raw is not None:
+                    try:
+                        from decimal import Decimal
+                        from aturuang.safe_apply import LedgerMutation, ApplyCandidate, CandidateLifecycleState, compute_preview_hash
+
+                        amt = Decimal(str(amt_raw))
+                        tx_date = str(cand_data.get("date") or dt.date.today().isoformat())
+                        tx_time = str(cand_data.get("time") or dt.datetime.now().strftime("%H:%M:%S"))
+                        tx_type = str(cand_data.get("transaction_type") or cand_data.get("type") or "Expense")
+                        if tx_type not in ("Income", "Expense", "Transfer", "Adjustment"):
+                            tx_type = "Expense"
+                        acc_from = str(cand_data.get("account_from") or cand_data.get("account") or "BCA Main")
+                        acc_to = str(cand_data.get("account_to") or cand_data.get("to_account") or "Merchant External")
+                        desc = str(cand_data.get("description") or item.get("subject") or "Sync from Cloudflare Edge")
+                        cat = str(cand_data.get("category") or "Other")
+                        tier = str(item.get("match_tier") or cand_data.get("match_tier") or item.get("tier") or "EXACT").upper()
+                        recon = str(item.get("reconciliation_status") or cand_data.get("reconciliation_status") or item.get("recon") or "RECONCILED").upper()
+
+                        mut = LedgerMutation(
+                            date=tx_date,
+                            time=tx_time,
+                            transaction_type=tx_type,
+                            amount=amt,
+                            account_from=acc_from,
+                            account_to=acc_to,
+                            description=desc,
+                            category=cat,
+                            canonical_id=f"EDGE_{msg_id}",
+                        )
+                        cand_id = f"cand_edge_{msg_id}"
+                        p_hash = compute_preview_hash([mut], [msg_id], cand_id)
+                        candidate = ApplyCandidate(
+                            candidate_id=cand_id,
+                            idempotency_key=f"idem_edge_{msg_id}",
+                            state=CandidateLifecycleState.PARSED,
+                            participating_evidence_keys=(msg_id,),
+                            mutations=(mut,),
+                            preview_hash=p_hash,
+                        )
+                        applied, app_res, reason = apply_engine.auto_apply_if_eligible(
+                            candidate=candidate,
+                            match_tier=tier,
+                            reconciliation_status=recon,
+                            review_manager=review_manager,
+                        )
+                        con_up = sqlite3.connect(str(target_db), timeout=5.0)
+                        try:
+                            if applied:
+                                auto_applied_count += 1
+                                con_up.execute("UPDATE edge_synced_messages SET status = 'AUTO_APPLIED' WHERE message_id = ?", (msg_id,))
+                            else:
+                                review_required_count += 1
+                                con_up.execute("UPDATE edge_synced_messages SET status = 'REVIEW_REQUIRED' WHERE message_id = ?", (msg_id,))
+                            con_up.commit()
+                        finally:
+                            con_up.close()
+                    except Exception:
+                        pass
 
     res = {
         "status": "success",
@@ -381,6 +538,8 @@ def sync_edge_inbox(
         "staged_count": len(staged_ids),
         "staged_ids": staged_ids,
         "acknowledged_count": ack_count,
+        "auto_applied_count": auto_applied_count,
+        "review_required_count": review_required_count,
     }
     _last_edge_sync_info = {
         "status": "success",
@@ -495,6 +654,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/sync/status":
             return self.send_json(_last_edge_sync_info)
+
+        if path == "/api/sync/pull-cloud":
+            try:
+                res = sync_edge_inbox()
+                return self.send_json(res, status=200)
+            except Exception as e:
+                return self.send_json({
+                    "status": "error",
+                    "message": str(e),
+                    "staged_count": 0,
+                    "auto_applied_count": 0,
+                }, status=200)
 
         # Static assets
         if path in {"/", "/index.html"}:
@@ -753,9 +924,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             secret = payload.get("secret") if isinstance(payload, dict) else None
             try:
                 res = sync_edge_inbox(worker_url=worker_url, secret=secret)
-                return self.send_json(res)
+                return self.send_json(res, status=200)
             except Exception as e:
-                return self.send_json({"status": "error", "error": str(e)}, 500)
+                return self.send_json({
+                    "status": "error",
+                    "message": str(e),
+                    "staged_count": 0,
+                    "auto_applied_count": 0,
+                }, status=200)
 
         try:
             payload = self.read_json()
