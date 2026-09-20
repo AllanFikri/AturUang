@@ -227,7 +227,7 @@ function closeModal(id) {
 function goPage(page) {
   state.page = page;
   document.querySelectorAll('.page').forEach((x) => x.classList.toggle('active', x.id === page));
-  const sub = ['upcoming', 'thirdparty', 'provisional', 'updates', 'quick-capture', 'import', 'review', 'receipt'];
+  const sub = ['upcoming', 'thirdparty', 'provisional', 'updates'];
   const navPage = sub.includes(page) ? 'more' : page;
   document
     .querySelectorAll('#nav button')

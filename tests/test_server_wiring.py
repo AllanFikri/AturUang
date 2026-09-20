@@ -139,8 +139,12 @@ class TestUnifiedServerWiring(unittest.TestCase):
         html = body.decode("utf-8")
         self.assertIn("Catat Cepat", html)
         self.assertIn("Pusat Impor", html)
-        self.assertIn("Antrean Tinjauan", html)
+        self.assertIn("Tinjauan", html)
         self.assertIn("Pindai Struk", html)
+        self.assertIn('data-page="quick-capture"', html)
+        self.assertIn('data-page="import"', html)
+        self.assertIn('data-page="review"', html)
+        self.assertIn('data-page="receipt"', html)
         self.assertIn("manifest.webmanifest", html)
 
         # Check app.js includes Universal Ingestion wiring
