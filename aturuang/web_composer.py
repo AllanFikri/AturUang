@@ -381,8 +381,12 @@ class QuickCaptureComposer:
                     raw_str = body.decode("utf-8") if isinstance(body, bytes) else body
                     payload = json.loads(raw_str)
                 filename = payload.get("filename", "upload.csv")
-                content_str = payload.get("content", "")
-                content_bytes = content_str.encode("utf-8") if isinstance(content_str, str) else b""
+                if "content_base64" in payload:
+                    import base64
+                    content_bytes = base64.b64decode(payload["content_base64"])
+                else:
+                    content_str = payload.get("content", "")
+                    content_bytes = content_str.encode("utf-8") if isinstance(content_str, str) else (bytes(content_str) if content_str else b"")
                 summary = self.upload_file(filename, content_bytes)
                 return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(summary).encode("utf-8")
             except Exception as e:
@@ -426,16 +430,24 @@ class QuickCaptureComposer:
                         try:
                             payload = json.loads(body.decode("utf-8"))
                             filename = payload.get("filename", "receipt.png")
-                            c_raw = payload.get("content", "")
-                            content_bytes = c_raw.encode("latin-1") if isinstance(c_raw, str) else bytes(c_raw)
+                            if "content_base64" in payload:
+                                import base64
+                                content_bytes = base64.b64decode(payload["content_base64"])
+                            else:
+                                c_raw = payload.get("content", "")
+                                content_bytes = c_raw.encode("latin-1") if isinstance(c_raw, str) else bytes(c_raw)
                         except Exception:
                             filename = q.get("filename", ["receipt.png"])[0]
                             content_bytes = body
                     else:
                         payload = json.loads(body)
                         filename = payload.get("filename", "receipt.png")
-                        c_raw = payload.get("content", "")
-                        content_bytes = c_raw.encode("latin-1") if isinstance(c_raw, str) else bytes(c_raw)
+                        if "content_base64" in payload:
+                            import base64
+                            content_bytes = base64.b64decode(payload["content_base64"])
+                        else:
+                            c_raw = payload.get("content", "")
+                            content_bytes = c_raw.encode("latin-1") if isinstance(c_raw, str) else bytes(c_raw)
 
                 out = self.process_receipt_upload(filename, content_bytes)
                 return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(out).encode("utf-8")
@@ -1059,3 +1071,61 @@ class QuickCaptureComposer:
   </script>
 </body>
 </html>"""
+
+
+def make_handler(composer: QuickCaptureComposer):
+    """Factory creating BaseHTTPRequestHandler wired to QuickCaptureComposer dispatch."""
+    from http.server import BaseHTTPRequestHandler
+    import sys
+    import urllib.parse
+
+    class WebComposerHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            status, headers, body = composer.handle_request("GET", parsed.path, query=query)
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            content_len = int(self.headers.get("Content-Length", 0))
+            body_bytes = self.rfile.read(content_len) if content_len > 0 else b""
+            status, headers, body = composer.handle_request("POST", parsed.path, query=query, body=body_bytes)
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            sys.stderr.write("%s - - [%s] %s\n" % (self.address_string(), self.log_date_time_string(), format % args))
+
+    return WebComposerHandler
+
+
+def run_server(port: int = 8000, host: str = "127.0.0.1", db_path: Path | str | None = None) -> None:
+    """Runs a local HTTP server exposing the QuickCaptureComposer web UI and JSON endpoints."""
+    from http.server import HTTPServer
+    from aturuang.config import DB_FILE
+
+    target_db = Path(db_path) if db_path else DB_FILE
+    composer = QuickCaptureComposer(target_db)
+    handler_cls = make_handler(composer)
+    server = HTTPServer((host, port), handler_cls)
+    print(f"AturUang Web Composer aktif di http://{host}:{port}/", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    import sys
+    server_port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    run_server(port=server_port)
+

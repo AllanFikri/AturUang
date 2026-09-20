@@ -23,7 +23,6 @@ from pathlib import Path
 
 try:
     from aturuang import ingestion
-    from aturuang import statement
     from aturuang import ai_key_manager
     from aturuang.config import PROJECT_ROOT as BASE_DIR, DB_FILE, WEB_ROOT, BACKUP_ROOT
     from aturuang.db import (
@@ -145,13 +144,43 @@ except ImportError:
     get_source_freshness,
     get_all_insights,
 )
-from ai_key_manager import get_ai_status, save_gemini_api_key, delete_gemini_api_key, test_gemini_connection
-from statement import statement_html
+try:
+    from aturuang.ai_key_manager import get_ai_status, save_gemini_api_key, delete_gemini_api_key, test_gemini_connection
+except ImportError:
+    from ai_key_manager import get_ai_status, save_gemini_api_key, delete_gemini_api_key, test_gemini_connection
+
+try:
+    from aturuang.statement import statement_html
+except ImportError:
+    try:
+        from statement import statement_html
+    except ImportError:
+        def statement_html(con, month: str) -> str:
+            return f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Statement {month}</title></head><body><h1>Rekening Koran {month}</h1></body></html>"
 
 DEFAULT_PORT = 5050
 CSS_FILE = WEB_ROOT / "css" / "styles.css"
 JS_FILE = WEB_ROOT / "js" / "app.js"
 CORE_JS_FILE = WEB_ROOT / "js" / "core.js"
+
+_composer_instance = None
+
+
+def get_composer():
+    global _composer_instance
+    if _composer_instance is None:
+        try:
+            from aturuang.web_composer import QuickCaptureComposer
+            _composer_instance = QuickCaptureComposer(DB_FILE, backup_dir=BACKUP_ROOT)
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to initialize QuickCaptureComposer: {e}\n")
+            _composer_instance = None
+    return _composer_instance
+
+
+def set_composer(composer) -> None:
+    global _composer_instance
+    _composer_instance = composer
 
 
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -199,6 +228,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
+
+        composer = get_composer()
+        if composer is not None:
+            # PWA assets & endpoints
+            if path in ("/manifest.webmanifest", "/manifest.json", "/sw.js", "/icon.svg"):
+                status, headers, body = composer.handle_request("GET", path, query=qs)
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            # Ingestion API routes
+            if (
+                path.startswith("/api/quick-capture/")
+                or path.startswith("/api/import/")
+                or path.startswith("/api/review-queue/")
+                or path.startswith("/api/receipt/")
+            ):
+                status, headers, body = composer.handle_request("GET", path, query=qs)
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            # Standalone ingestion UI routes
+            if path in ("/quick-capture", "/import", "/review", "/receipt"):
+                status, headers, body = composer.handle_request("GET", path, query=qs)
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+                return
 
         # Static assets
         if path in {"/", "/index.html"}:
@@ -417,7 +483,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_error(404, "Not Found")
 
     def do_POST(self) -> None:
-        path = urllib.parse.urlparse(self.path).path
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        composer = get_composer()
+        if composer is not None:
+            if (
+                path.startswith("/api/quick-capture/")
+                or path.startswith("/api/import/")
+                or path.startswith("/api/review-queue/")
+                or path.startswith("/api/receipt/")
+                or path == "/api/ingest/android-notification"
+            ):
+                content_len = int(self.headers.get("Content-Length", 0) or 0)
+                body_bytes = self.rfile.read(content_len) if content_len > 0 else b""
+                status, headers, body = composer.handle_request("POST", path, query=qs, body=body_bytes)
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
         try:
             payload = self.read_json()
         except Exception as e:
@@ -1131,6 +1219,8 @@ def run_app(port: int = DEFAULT_PORT, open_browser: bool = True) -> None:
 run_server = run_app
 main = run_app
 RequestHandler = Handler
+
+__all__ = ["main", "run_server", "run_app", "RequestHandler", "Handler", "get_composer", "set_composer"]
 
 
 if __name__ == "__main__":

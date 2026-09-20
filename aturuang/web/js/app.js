@@ -227,7 +227,7 @@ function closeModal(id) {
 function goPage(page) {
   state.page = page;
   document.querySelectorAll('.page').forEach((x) => x.classList.toggle('active', x.id === page));
-  const sub = ['upcoming', 'thirdparty', 'provisional', 'updates'];
+  const sub = ['upcoming', 'thirdparty', 'provisional', 'updates', 'quick-capture', 'import', 'review', 'receipt'];
   const navPage = sub.includes(page) ? 'more' : page;
   document
     .querySelectorAll('#nav button')
@@ -256,6 +256,7 @@ function goPage(page) {
   if (page === 'provisional') loadProvisional();
   if (page === 'reports') loadReports();
   if (page === 'updates') loadUpdates();
+  if (page === 'review') loadReviewQueue();
 }
 
 document.querySelectorAll('#nav button').forEach((b) => (b.onclick = () => goPage(b.dataset.page)));
@@ -3789,3 +3790,455 @@ async function reverseDebtEventAction(eventId) {
     alert('Gagal mereversal event: ' + err.message);
   }
 }
+
+/* ==========================================================================
+   Universal Ingestion — Quick Capture, Import Center, Review Queue, Receipt OCR & PWA
+   ========================================================================== */
+
+// --- Quick Capture ---
+let _qcDebounceTimer = null;
+let _lastQcPreviewData = null;
+
+function openQuickCaptureModal() {
+  openModal('quickCaptureModal');
+  const input = $('captureInputModal');
+  if (input) {
+    input.value = '';
+    input.focus();
+  }
+  const previewArea = $('previewAreaModal');
+  if (previewArea) {
+    previewArea.innerHTML = '';
+    previewArea.style.display = 'none';
+  }
+}
+
+function initQuickCapture() {
+  const modalInput = $('captureInputModal');
+  const modalArea = $('previewAreaModal');
+  if (modalInput && modalArea) {
+    modalInput.addEventListener('input', () => {
+      clearTimeout(_qcDebounceTimer);
+      _qcDebounceTimer = setTimeout(() => {
+        handleQuickCapturePreview(modalInput.value.trim(), modalArea, true);
+      }, 250);
+    });
+    modalInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && _lastQcPreviewData && (_lastQcPreviewData.status === 'SUCCESS' || _lastQcPreviewData.status === 'valid')) {
+        e.preventDefault();
+        applyQuickCapture(_lastQcPreviewData, true);
+      }
+    });
+  }
+
+  const pageInput = $('captureInputPage');
+  const pageArea = $('previewAreaPage');
+  if (pageInput && pageArea) {
+    pageInput.addEventListener('input', () => {
+      clearTimeout(_qcDebounceTimer);
+      _qcDebounceTimer = setTimeout(() => {
+        handleQuickCapturePreview(pageInput.value.trim(), pageArea, false);
+      }, 250);
+    });
+    pageInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && _lastQcPreviewData && (_lastQcPreviewData.status === 'SUCCESS' || _lastQcPreviewData.status === 'valid')) {
+        e.preventDefault();
+        applyQuickCapture(_lastQcPreviewData, false);
+      }
+    });
+  }
+}
+
+async function handleQuickCapturePreview(text, previewAreaEl, isModal) {
+  if (!text) {
+    previewAreaEl.innerHTML = '';
+    previewAreaEl.style.display = 'none';
+    _lastQcPreviewData = null;
+    return;
+  }
+
+  previewAreaEl.style.display = 'block';
+  previewAreaEl.innerHTML = '<div class="small muted">Menganalisis kalimat transaksi...</div>';
+
+  try {
+    const res = await api(`/api/quick-capture/preview?q=${encodeURIComponent(text)}`);
+    _lastQcPreviewData = res;
+
+    if (res.status === 'SUCCESS' || res.status === 'valid') {
+      const tType = String(res.transaction_type || '').toUpperCase();
+      const typeColor = tType === 'EXPENSE' ? 'var(--red)' : tType === 'INCOME' ? 'var(--green)' : 'var(--blue)';
+      const typeLabel = tType === 'EXPENSE' ? 'Pengeluaran' : tType === 'INCOME' ? 'Pemasukan' : 'Transfer Antar Rekening';
+      const hashShort = res.preview_hash ? res.preview_hash.slice(0, 12) + '...' : '—';
+      const targetAcc = res.account_to ? ` &rarr; ${esc(res.account_to)}` : '';
+
+      previewAreaEl.innerHTML = `
+        <div style="background:rgba(255,255,255,0.03);border:1px solid var(--line);border-radius:12px;padding:14px">
+          <div class="between" style="margin-bottom:8px">
+            <span class="pill" style="font-weight:700;color:${typeColor}">${esc(typeLabel)}</span>
+            <span class="tiny muted" title="Preview Hash SHA-256">Hash: ${esc(hashShort)}</span>
+          </div>
+          <div style="font-size:20px;font-weight:800;color:${typeColor};margin-bottom:6px">
+            ${money(res.amount)}
+          </div>
+          <div style="font-size:14px;color:var(--text);margin-bottom:4px">
+            <strong>${esc(res.description || '—')}</strong>
+          </div>
+          <div class="small muted" style="margin-bottom:12px">
+            Akun: <strong>${esc(res.account_from || 'Cash')}</strong>${targetAcc} &bull; Kategori: <strong>${esc(res.category || 'Lainnya')}</strong>
+          </div>
+          <div class="between">
+            <span class="tiny muted">${esc(res.date)} ${esc(res.time || '')}</span>
+            <button class="btn primary small" id="btnApplyQc" onclick="applyQuickCapture(_lastQcPreviewData, ${isModal})">
+              Terapkan (Safe Apply)
+            </button>
+          </div>
+        </div>
+      `;
+    } else {
+      const reason = res.diagnostic_reason || 'Format belum dikenali. Lengkapi nominal dan keterangan.';
+      previewAreaEl.innerHTML = `
+        <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:12px;padding:12px;color:var(--text)">
+          <div class="small" style="color:var(--red);font-weight:600;margin-bottom:4px">Belum Siap Diterapkan</div>
+          <div class="tiny muted">${esc(reason)}</div>
+        </div>
+      `;
+    }
+  } catch (err) {
+    previewAreaEl.innerHTML = `<div class="tiny" style="color:var(--red)">Gagal mengecek pratinjau: ${esc(err.message)}</div>`;
+  }
+}
+
+async function applyQuickCapture(previewData, isModal) {
+  if (!previewData || (previewData.status !== 'SUCCESS' && previewData.status !== 'valid')) return;
+  const btn = $('btnApplyQc');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Menyimpan...';
+  }
+
+  try {
+    const res = await api('/api/quick-capture/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(previewData),
+    });
+
+    if (res.success) {
+      alert('Transaksi berhasil dicatat dan diverifikasi dengan Safe Apply!');
+      if (isModal) {
+        closeModal('quickCaptureModal');
+      } else {
+        const pInput = $('captureInputPage');
+        if (pInput) pInput.value = '';
+        const pArea = $('previewAreaPage');
+        if (pArea) {
+          pArea.innerHTML = '';
+          pArea.style.display = 'none';
+        }
+      }
+      _lastQcPreviewData = null;
+      await load();
+      if (state.page === 'transactions') await loadTransactions();
+    } else {
+      alert('Gagal menerapkan: ' + (res.error || 'Terjadi kesalahan'));
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Terapkan (Safe Apply)';
+      }
+    }
+  } catch (err) {
+    alert('Gagal menerapkan transaksi: ' + err.message);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Terapkan (Safe Apply)';
+    }
+  }
+}
+
+// --- Import Center ---
+async function uploadImportFile() {
+  const fileInput = $('importFileInput');
+  const resultArea = $('importResultArea');
+  if (!fileInput || !fileInput.files.length) {
+    alert('Silakan pilih berkas mutasi rekening terlebih dahulu.');
+    return;
+  }
+
+  const file = fileInput.files[0];
+  resultArea.style.display = 'block';
+  resultArea.innerHTML = '<div class="small muted">Membaca dan memproses berkas mutasi...</div>';
+
+  const reader = new FileReader();
+  reader.onload = async function() {
+    try {
+      const dataUrl = reader.result;
+      const base64Data = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      const res = await api('/api/import/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          content_base64: base64Data,
+        }),
+      });
+
+      renderImportResult(res, resultArea);
+      await load();
+    } catch (err) {
+      resultArea.innerHTML = `
+        <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:12px;padding:12px">
+          <div class="small" style="color:var(--red);font-weight:600">Gagal mengunggah berkas</div>
+          <div class="tiny muted" style="margin-top:4px">${esc(err.message)}</div>
+        </div>
+      `;
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+function renderImportResult(res, containerEl) {
+  const total = res.total_items ?? res.total_rows ?? 0;
+  const imported = res.imported_count ?? res.accepted_count ?? 0;
+  const reviewCount = res.review_count ?? res.ambiguous_count ?? 0;
+  const dupCount = res.duplicate_count ?? 0;
+
+  containerEl.innerHTML = `
+    <div style="background:rgba(255,255,255,0.03);border:1px solid var(--line);border-radius:12px;padding:16px">
+      <div style="font-size:16px;font-weight:700;color:var(--green);margin-bottom:8px">Impor Selesai Diproses</div>
+      <div class="small" style="margin-bottom:12px">
+        Total baris: <strong>${total}</strong> &bull;
+        Dibukukan: <strong style="color:var(--green)">${imported}</strong> &bull;
+        Perlu Tinjauan: <strong style="color:var(--amber)">${reviewCount}</strong> &bull;
+        Duplikat: <strong style="color:var(--muted)">${dupCount}</strong>
+      </div>
+      <div class="row">
+        ${reviewCount > 0 ? '<button class="btn primary small" onclick="goPage(\'review\')">Buka Antrean Tinjauan</button>' : ''}
+        <button class="btn small" onclick="goPage(\'transactions\')">Lihat Transaksi</button>
+      </div>
+    </div>
+  `;
+}
+
+// --- Review Queue ---
+async function loadReviewQueue() {
+  const container = $('reviewQueueList');
+  if (!container) return;
+  container.innerHTML = '<div class="small muted">Memuat antrean tinjauan...</div>';
+
+  try {
+    const items = await api('/api/review-queue/pending');
+    if (!Array.isArray(items) || items.length === 0) {
+      container.innerHTML = `
+        <div style="padding:24px;text-align:center;color:var(--muted)">
+          <div style="font-size:24px;margin-bottom:8px">✓</div>
+          <div>Semua transaksi telah ditinjau. Tidak ada antrean tertunda.</div>
+        </div>
+      `;
+      return;
+    }
+
+    container.innerHTML = items.map((it) => {
+      const typeColor = it.transaction_type === 'Expense' ? 'var(--red)' : it.transaction_type === 'Income' ? 'var(--green)' : 'var(--blue)';
+      return `
+        <div class="card" style="margin-bottom:10px;padding:14px;border:1px solid var(--line)">
+          <div class="between" style="margin-bottom:6px">
+            <span class="pill small" style="color:${typeColor}">${esc(it.transaction_type || 'Transaksi')}</span>
+            <span class="tiny muted">${esc(it.date)} ${esc(it.time || '')}</span>
+          </div>
+          <div class="between" style="margin-bottom:6px">
+            <div style="font-size:16px;font-weight:700;color:var(--text)">${esc(it.description || '—')}</div>
+            <div style="font-size:16px;font-weight:800;color:${typeColor}">${money(it.amount)}</div>
+          </div>
+          <div class="tiny muted" style="margin-bottom:10px">
+            Akun: <strong>${esc(it.account_from || '—')}</strong> &bull; Kategori: <strong>${esc(it.category || '—')}</strong> &bull; Alasan: <em>${esc(it.reason || 'Perlu konfirmasi')}</em>
+          </div>
+          <div class="row" style="gap:8px">
+            <button class="btn primary tiny" onclick="handleReviewAction('${esc(it.item_id)}', 'approve')">Setujui</button>
+            <button class="btn tiny" onclick="handleReviewAction('${esc(it.item_id)}', 'reject')">Tolak</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (err) {
+    container.innerHTML = `<div class="small" style="color:var(--red)">Gagal memuat antrean tinjauan: ${esc(err.message)}</div>`;
+  }
+}
+
+async function handleReviewAction(itemId, action) {
+  try {
+    const res = await api('/api/review-queue/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ item_id: itemId, action: action }),
+    });
+    if (res.success) {
+      await loadReviewQueue();
+      await load();
+    } else {
+      alert('Gagal memproses tinjauan: ' + (res.error || 'Terjadi kesalahan'));
+    }
+  } catch (err) {
+    alert('Gagal memproses tinjauan: ' + err.message);
+  }
+}
+
+// --- Receipt OCR ---
+let _currentReceiptDraft = null;
+
+async function uploadReceiptFile() {
+  const fileInput = $('receiptFileInput');
+  const resultArea = $('receiptResultArea');
+  if (!fileInput || !fileInput.files.length) {
+    alert('Silakan pilih foto struk belanja terlebih dahulu.');
+    return;
+  }
+
+  const file = fileInput.files[0];
+  resultArea.style.display = 'block';
+  resultArea.innerHTML = '<div class="small muted">Mengekstraksi teks struk belanja (OCR)...</div>';
+
+  const reader = new FileReader();
+  reader.onload = async function() {
+    try {
+      const dataUrl = reader.result;
+      const base64Data = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+      const res = await api('/api/receipt/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          content_base64: base64Data,
+        }),
+      });
+
+      _currentReceiptDraft = res;
+      renderReceiptDraft(res, resultArea);
+    } catch (err) {
+      resultArea.innerHTML = `
+        <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:12px;padding:12px">
+          <div class="small" style="color:var(--red);font-weight:600">Gagal memproses struk</div>
+          <div class="tiny muted" style="margin-top:4px">${esc(err.message)}</div>
+        </div>
+      `;
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+function renderReceiptDraft(draft, containerEl) {
+  containerEl.innerHTML = `
+    <div style="background:rgba(255,255,255,0.03);border:1px solid var(--line);border-radius:12px;padding:16px">
+      <div class="between" style="margin-bottom:12px">
+        <span class="pill info small">Draf Hasil Pindai Struk</span>
+        <span class="tiny muted">Hash: ${esc((draft.preview_hash || '').slice(0, 12))}...</span>
+      </div>
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+        <div>
+          <label class="tiny muted" for="ocrMerchant">Nama Toko / Merchant:</label>
+          <input type="text" id="ocrMerchant" class="input small" value="${esc(draft.merchant || '')}">
+        </div>
+        <div>
+          <label class="tiny muted" for="ocrAmount">Total Nominal (Rp):</label>
+          <input type="text" id="ocrAmount" class="input small" value="${esc(draft.amount || '')}">
+        </div>
+        <div>
+          <label class="tiny muted" for="ocrDate">Tanggal:</label>
+          <input type="date" id="ocrDate" class="input small" value="${esc(draft.date || '')}">
+        </div>
+        <div>
+          <label class="tiny muted" for="ocrAccount">Akun Pembayaran:</label>
+          <input type="text" id="ocrAccount" class="input small" value="${esc(draft.account_from || 'Cash')}">
+        </div>
+      </div>
+      <div style="margin-bottom:12px">
+        <label class="tiny muted" for="ocrCategory">Kategori:</label>
+        <input type="text" id="ocrCategory" class="input small" value="${esc(draft.category || 'Makanan & Minuman')}">
+      </div>
+      <div class="row" style="gap:8px">
+        <button class="btn primary small" onclick="confirmReceiptDraft()">Terapkan Transaksi (Safe Apply)</button>
+        <button class="btn small" onclick="rejectReceiptDraft()">Batalkan</button>
+      </div>
+    </div>
+  `;
+}
+
+async function confirmReceiptDraft() {
+  if (!_currentReceiptDraft) return;
+  const merchant = $('ocrMerchant')?.value || _currentReceiptDraft.merchant;
+  const amount = $('ocrAmount')?.value || _currentReceiptDraft.amount;
+  const date = $('ocrDate')?.value || _currentReceiptDraft.date;
+  const account_from = $('ocrAccount')?.value || _currentReceiptDraft.account_from;
+  const category = $('ocrCategory')?.value || _currentReceiptDraft.category;
+
+  try {
+    const res = await api('/api/receipt/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        receipt_id: _currentReceiptDraft.receipt_id,
+        action: 'apply',
+        corrections: {
+          merchant,
+          amount,
+          date,
+          account_from,
+          category,
+        },
+      }),
+    });
+
+    if (res.success) {
+      alert('Struk berhasil dibukukan dengan Safe Apply!');
+      const area = $('receiptResultArea');
+      if (area) {
+        area.innerHTML = '';
+        area.style.display = 'none';
+      }
+      const fileInput = $('receiptFileInput');
+      if (fileInput) fileInput.value = '';
+      _currentReceiptDraft = null;
+      await load();
+      if (state.page === 'transactions') await loadTransactions();
+    } else {
+      alert('Gagal menerapkan struk: ' + (res.error || 'Terjadi kesalahan'));
+    }
+  } catch (err) {
+    alert('Gagal menerapkan struk: ' + err.message);
+  }
+}
+
+async function rejectReceiptDraft() {
+  if (!_currentReceiptDraft) return;
+  try {
+    await api('/api/receipt/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        receipt_id: _currentReceiptDraft.receipt_id,
+        action: 'reject',
+      }),
+    });
+    const area = $('receiptResultArea');
+    if (area) {
+      area.innerHTML = '';
+      area.style.display = 'none';
+    }
+    const fileInput = $('receiptFileInput');
+    if (fileInput) fileInput.value = '';
+    _currentReceiptDraft = null;
+  } catch (err) {
+    alert('Gagal membatalkan draf: ' + err.message);
+  }
+}
+
+// --- PWA Service Worker Registration ---
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch((err) => {
+      console.warn('Service Worker registration skipped or failed:', err);
+    });
+  });
+}
+
+// Initialize Quick Capture event bindings
+initQuickCapture();
