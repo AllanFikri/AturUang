@@ -31,6 +31,7 @@ from aturuang.import_center import ImportCenterManager, ImportBatch, ImportBatch
 from aturuang.review_queue_ui import ReviewQueueManager, ReviewItem
 from aturuang.receipt_ocr import ReceiptOCRManager, ReceiptDraft
 from aturuang.pwa_assets import get_manifest_json, get_service_worker_js, get_icon_svg
+from aturuang.android_bridge import AndroidNotificationBridge
 
 
 def _decimal_default(obj: Any) -> Any:
@@ -55,6 +56,7 @@ class QuickCaptureComposer:
         self.import_manager = ImportCenterManager(self.db_path, staging_dir=self.staging_dir)
         self.review_manager = ReviewQueueManager(self.db_path, backup_dir=self.backup_dir)
         self.receipt_manager = ReceiptOCRManager(self.db_path, backup_dir=self.backup_dir)
+        self.android_bridge = AndroidNotificationBridge(self.db_path, review_manager=self.review_manager)
 
     def preview(self, text: str, default_account: str = "Cash") -> dict[str, Any]:
         """Parses quick capture text, builds candidate, and returns structured preview with hash."""
@@ -470,6 +472,27 @@ class QuickCaptureComposer:
         if m == "GET" and p == "/api/quick-capture/pending":
             items = self.get_pending_reviews()
             return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(items, default=_decimal_default).encode("utf-8")
+
+        # Android Notification Bridge HTTP endpoint (Stage 10)
+        if m == "POST" and p == "/api/ingest/android-notification":
+            if not body:
+                return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"success": False, "error": "Empty body", "error_code": "MALFORMED_JSON"}).encode("utf-8")
+            try:
+                raw_str = body.decode("utf-8") if isinstance(body, bytes) else body
+                payload = json.loads(raw_str)
+            except Exception:
+                return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"success": False, "error": "Malformed JSON", "error_code": "MALFORMED_JSON"}).encode("utf-8")
+
+            if not isinstance(payload, dict):
+                return 400, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"success": False, "error": "Payload must be JSON object", "error_code": "MALFORMED_JSON"}).encode("utf-8")
+
+            res = self.android_bridge.ingest_notification(payload)
+            if res.get("success"):
+                return 200, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(res).encode("utf-8")
+            else:
+                err_code = res.get("error_code")
+                status_code = 401 if err_code == "UNAUTHORIZED" else 400
+                return status_code, {"Content-Type": "application/json; charset=utf-8"}, json.dumps(res).encode("utf-8")
 
         return 404, {"Content-Type": "text/plain"}, b"Not Found"
 
