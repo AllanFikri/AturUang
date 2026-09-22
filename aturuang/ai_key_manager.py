@@ -24,63 +24,82 @@ def _get_keyring():
         return None
 
 def get_gemini_api_key() -> str:
-    """Retrieves Gemini API Key with OS Credential Manager priority -> Env var fallback."""
-    # 1. OS Credential Manager (Windows Keyring)
-    kr = _get_keyring()
-    if kr:
-        try:
-            val = kr.get_password(SERVICE_NAME, ACCOUNT_NAME)
-            if val and val.strip():
-                return val.strip()
-        except Exception:
-            pass
+    """Retrieves Gemini API Key with documented precedence and conflict detection.
 
-    # 2. Environment Variable GEMINI_API_KEY
-    env_val = os.getenv("GEMINI_API_KEY", "").strip()
-    if env_val:
-        return env_val
-
-    # 3. Secure isolated local file fallback (~/.money_tracks/secrets.json)
+    Precedence:
+    1. OS Credential Manager (Windows Keyring)
+    2. Environment Variable GEMINI_API_KEY
+    3. Secure isolated local file fallback (~/.money_tracks/secrets.json)
+    """
+    file_val = ""
     if FALLBACK_SECRET_PATH.exists():
         try:
             data = json.loads(FALLBACK_SECRET_PATH.read_text(encoding="utf-8"))
-            val = data.get("gemini_api_key", "").strip()
-            if val:
-                return val
+            file_val = data.get("gemini_api_key", "").strip()
         except Exception:
             pass
 
-    return ""
+    env_val = os.getenv("GEMINI_API_KEY", "").strip()
+
+    keyring_val = ""
+    kr = _get_keyring()
+    if kr:
+        try:
+            kv = kr.get_password(SERVICE_NAME, ACCOUNT_NAME)
+            if kv and kv.strip():
+                keyring_val = kv.strip()
+        except Exception:
+            pass
+
+    # Conflict detection across configured stores
+    configured = [v for v in (keyring_val, env_val, file_val) if v]
+    if len(set(configured)) > 1:
+        import sys
+        sys.stderr.write("[KeyManager] WARNING: Conflicting Gemini API keys found across secret stores. Failing closed.\n")
+        return ""
+
+    return keyring_val or env_val or file_val
 
 
 BRIDGE_ACCOUNT_NAME = "android_bridge_secret"
 
 
 def get_bridge_secret(db_path: Path | str | None = None) -> str:
-    """Retrieves Android Bridge shared secret: OS Credential Manager -> env var -> local secrets.json."""
-    kr = _get_keyring()
-    if kr:
+    """Retrieves Android Bridge shared secret with documented precedence and conflict detection.
+
+    Precedence:
+    1. OS Credential Manager (Keyring)
+    2. Environment Variable ATURUANG_ANDROID_BRIDGE_SECRET
+    3. Secure isolated local file fallback (~/.money_tracks/secrets.json)
+    """
+    file_val = ""
+    if FALLBACK_SECRET_PATH.exists():
         try:
-            val = kr.get_password(SERVICE_NAME, BRIDGE_ACCOUNT_NAME)
-            if val and val.strip():
-                return val.strip()
+            data = json.loads(FALLBACK_SECRET_PATH.read_text(encoding="utf-8"))
+            file_val = data.get("android_bridge_secret", "").strip()
         except Exception:
             pass
 
     env_val = os.getenv("ATURUANG_ANDROID_BRIDGE_SECRET", "").strip()
-    if env_val:
-        return env_val
 
-    if FALLBACK_SECRET_PATH.exists():
+    keyring_val = ""
+    kr = _get_keyring()
+    if kr:
         try:
-            data = json.loads(FALLBACK_SECRET_PATH.read_text(encoding="utf-8"))
-            val = data.get("android_bridge_secret", "").strip()
-            if val:
-                return val
+            kv = kr.get_password(SERVICE_NAME, BRIDGE_ACCOUNT_NAME)
+            if kv and kv.strip():
+                keyring_val = kv.strip()
         except Exception:
             pass
 
-    return ""
+    # Conflict detection across configured stores
+    configured = [v for v in (keyring_val, env_val, file_val) if v]
+    if len(set(configured)) > 1:
+        import sys
+        sys.stderr.write("[KeyManager] WARNING: Conflicting Android bridge secrets found across secret stores. Failing closed.\n")
+        return ""
+
+    return keyring_val or env_val or file_val
 
 def save_gemini_api_key(key: str, con: sqlite3.Connection | None = None) -> bool:
     """Saves API Key securely into OS Credential Manager and purges any DB plain text key."""

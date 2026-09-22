@@ -242,51 +242,94 @@ def init_edge_sync_schema(con: sqlite3.Connection) -> None:
 
 
 def get_edge_sync_config(worker_url: str | None = None, secret: str | None = None) -> tuple[str, str]:
-    """Resolves Cloudflare Worker URL and secret from arguments, environment variables, or local secure store."""
-    if worker_url is None:
-        worker_url = (
-            os.environ.get("CLOUDFLARE_WORKER_URL")
-            or os.environ.get("EDGE_WORKER_URL")
-            or os.environ.get("WORKER_URL")
-            or None
-        )
-    if secret is None:
-        secret = (
-            os.environ.get("STAGING_ADMIN_TOKEN")
-            or os.environ.get("GMAIL_RELAY_SECRET")
-            or os.environ.get("ATURUANG_SYNC_SECRET")
-            or os.environ.get("EDGE_SYNC_SECRET")
-            or os.environ.get("CLOUDFLARE_SYNC_SECRET")
-            or None
-        )
-    if worker_url is None or secret is None:
-        candidate_paths = [
-            Path.cwd() / "secrets.json",
-            Path.cwd() / "runtime" / "secrets.json",
-            Path(__file__).resolve().parent.parent / "secrets.json",
-            Path(__file__).resolve().parent.parent / "runtime" / "secrets.json",
-            Path.home() / ".money_tracks" / "secrets.json",
-        ]
-        for sp in candidate_paths:
-            if sp.exists():
-                try:
-                    data = json.loads(sp.read_text(encoding="utf-8"))
-                    if isinstance(data, dict):
-                        if worker_url is None:
-                            for k in ("WORKER_URL", "worker_url", "CLOUDFLARE_WORKER_URL", "cloudflare_worker_url", "EDGE_WORKER_URL", "edge_worker_url"):
-                                if data.get(k):
-                                    worker_url = str(data[k]).strip()
-                                    break
-                        if secret is None:
-                            for k in ("STAGING_ADMIN_TOKEN", "staging_admin_token", "GMAIL_RELAY_SECRET", "gmail_relay_secret", "ATURUANG_SYNC_SECRET", "aturuang_sync_secret", "EDGE_SYNC_SECRET", "edge_sync_secret", "CLOUDFLARE_SYNC_SECRET", "cloudflare_sync_secret", "sync_secret"):
-                                if data.get(k):
-                                    secret = str(data[k]).strip()
-                                    break
-                except Exception:
-                    pass
-            if worker_url is not None and secret is not None:
-                break
-    return str(worker_url or "").strip().rstrip("/"), str(secret or "").strip()
+    """Resolves Cloudflare Worker URL and secret with documented precedence and conflict detection.
+
+    Precedence:
+    1. Explicit function arguments.
+    2. Environment variables (CLOUDFLARE_WORKER_URL, EDGE_SYNC_SECRET, etc.).
+    3. Secure local secrets file (runtime/secrets.json, secrets.json, ~/.money_tracks/secrets.json).
+
+    Conflict handling:
+    If multiple stores are configured with differing non-empty secrets or URLs,
+    logs a security warning and fails closed (returns "", "").
+    """
+    env_url = (
+        os.environ.get("CLOUDFLARE_WORKER_URL")
+        or os.environ.get("EDGE_WORKER_URL")
+        or os.environ.get("WORKER_URL")
+        or ""
+    ).strip()
+    env_secret = (
+        os.environ.get("STAGING_ADMIN_TOKEN")
+        or os.environ.get("GMAIL_RELAY_SECRET")
+        or os.environ.get("ATURUANG_SYNC_SECRET")
+        or os.environ.get("EDGE_SYNC_SECRET")
+        or os.environ.get("CLOUDFLARE_SYNC_SECRET")
+        or ""
+    ).strip()
+
+    file_url = ""
+    file_secret = ""
+    discovered_urls: set[str] = set()
+    discovered_secrets: set[str] = set()
+
+    candidate_paths = [
+        Path.cwd() / "runtime" / "secrets.json",
+        Path.cwd() / "secrets.json",
+        Path(__file__).resolve().parent.parent / "runtime" / "secrets.json",
+        Path(__file__).resolve().parent.parent / "secrets.json",
+        Path.home() / ".money_tracks" / "secrets.json",
+    ]
+    seen_files = set()
+    for sp in candidate_paths:
+        try:
+            resolved_sp = sp.resolve()
+        except Exception:
+            resolved_sp = sp
+        if resolved_sp in seen_files or not resolved_sp.exists():
+            continue
+        seen_files.add(resolved_sp)
+        try:
+            data = json.loads(resolved_sp.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for k in ("WORKER_URL", "worker_url", "CLOUDFLARE_WORKER_URL", "cloudflare_worker_url", "EDGE_WORKER_URL", "edge_worker_url"):
+                    if data.get(k):
+                        u = str(data[k]).strip()
+                        if u:
+                            discovered_urls.add(u)
+                            if not file_url:
+                                file_url = u
+                            break
+                for k in ("STAGING_ADMIN_TOKEN", "staging_admin_token", "GMAIL_RELAY_SECRET", "gmail_relay_secret", "ATURUANG_SYNC_SECRET", "aturuang_sync_secret", "EDGE_SYNC_SECRET", "edge_sync_secret", "CLOUDFLARE_SYNC_SECRET", "cloudflare_sync_secret", "sync_secret"):
+                    if data.get(k):
+                        s = str(data[k]).strip()
+                        if s:
+                            discovered_secrets.add(s)
+                            if not file_secret:
+                                file_secret = s
+                            break
+        except Exception:
+            pass
+
+    # Conflict detection across files
+    if len(discovered_urls) > 1:
+        sys.stderr.write("[Config] WARNING: Conflicting WORKER_URL values found across local secret stores. Failing closed.\n")
+        return "", ""
+    if len(discovered_secrets) > 1:
+        sys.stderr.write("[Config] WARNING: Conflicting sync secrets found across local secret stores. Failing closed.\n")
+        return "", ""
+
+    # Conflict detection between environment and file stores (when not explicitly overridden)
+    if worker_url is None and env_url and file_url and env_url != file_url:
+        sys.stderr.write("[Config] WARNING: Environment WORKER_URL conflicts with local secret store. Failing closed.\n")
+        return "", ""
+    if secret is None and env_secret and file_secret and env_secret != file_secret:
+        sys.stderr.write("[Config] WARNING: Environment sync secret conflicts with local secret store. Failing closed.\n")
+        return "", ""
+
+    final_url = worker_url or env_url or file_url
+    final_secret = secret or env_secret or file_secret
+    return str(final_url or "").strip().rstrip("/"), str(final_secret or "").strip()
 
 
 def sync_edge_inbox(
