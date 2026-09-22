@@ -702,8 +702,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/core.js" or path == "/js/core.js":
             return self.serve_file(CORE_JS_FILE, "application/javascript; charset=utf-8")
         if path.startswith("/assets/"):
-            rel_path = path.lstrip("/")
-            file_path = BASE_DIR / rel_path
+            rel_path = path[len("/assets/"):].lstrip("/\\")
+            assets_dir = (BASE_DIR / "assets").resolve()
+            # If assets_dir does not exist, fallback to web/assets
+            if not assets_dir.exists() and (WEB_ROOT / "assets").resolve().exists():
+                assets_dir = (WEB_ROOT / "assets").resolve()
+
+            file_path = (assets_dir / rel_path).resolve()
+            if ".." in path or not file_path.is_relative_to(assets_dir):
+                self.send_error(403, "Forbidden")
+                return
+
             if file_path.exists() and file_path.is_file():
                 ext = file_path.suffix.lower()
                 mimetypes = {
@@ -715,7 +724,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     ".css": "text/css; charset=utf-8",
                     ".js": "application/javascript; charset=utf-8",
                 }
-                return self.serve_file(file_path, mimetypes.get(ext, "application/octet-stream"))
+                if ext in mimetypes:
+                    return self.serve_file(file_path, mimetypes[ext])
+                self.send_error(403, "Forbidden")
+                return
+            self.send_error(404, "File Not Found")
+            return
 
         with db_connect() as con:
             time_ctx = get_time_context(con)
