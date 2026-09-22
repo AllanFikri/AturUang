@@ -2127,6 +2127,146 @@ export default {
     // =================================================================
     // 5. STAGING REVIEW API (Atomic D1 Batch Protected & Idempotent)
     // =================================================================
+    // GET /api/sync/gmail (Cursor-based edge inbox sync)
+    if (path === "/api/sync/gmail" && method === "GET") {
+      let cursor = 0;
+      const paramCursor = url.searchParams.get("cursor");
+      if (paramCursor !== null && paramCursor !== "") {
+        cursor = parseInt(paramCursor, 10) || 0;
+      } else {
+        try {
+          const syncRow = await env.DB.prepare(
+            "SELECT cursor FROM source_sync_state WHERE source = 'gmail'"
+          ).first<{ cursor: string }>();
+          if (syncRow && syncRow.cursor) {
+            cursor = parseInt(syncRow.cursor, 10) || 0;
+          }
+        } catch {}
+      }
+
+      const limit = Math.min(
+        parseInt(url.searchParams.get("limit") || "100", 10) || 100,
+        100
+      );
+
+      const rows = await env.DB.prepare(
+        `SELECT
+           r.id,
+           r.external_id AS message_id,
+           r.occurred_at,
+           r.payload_hash,
+           r.minimal_raw_payload,
+           ic.tx_type,
+           ic.amount,
+           ic.account,
+           ic.to_account,
+           ic.category,
+           ic.money_context,
+           ic.date,
+           ic.time,
+           ic.status AS candidate_status
+         FROM raw_events r
+         LEFT JOIN ingestion_candidates ic ON ic.raw_event_id = r.id
+         WHERE r.source = 'gmail' AND r.state = 'Parsed' AND r.id > ?
+         ORDER BY r.id ASC
+         LIMIT ?`
+      ).bind(cursor, limit).all<{
+        id: number;
+        message_id: string;
+        occurred_at: string | null;
+        payload_hash: string;
+        minimal_raw_payload: string | null;
+        tx_type: string | null;
+        amount: number | null;
+        account: string | null;
+        to_account: string | null;
+        category: string | null;
+        money_context: string | null;
+        date: string | null;
+        time: string | null;
+        candidate_status: string | null;
+      }>();
+
+      const results = (rows.results || []).map((row) => {
+        let minimal: any = {};
+        if (row.minimal_raw_payload) {
+          try {
+            minimal = JSON.parse(row.minimal_raw_payload);
+          } catch {}
+        }
+        return {
+          id: row.id,
+          cursor: String(row.id),
+          message_id: row.message_id,
+          source: "gmail",
+          occurred_at: row.occurred_at,
+          payload_hash: row.payload_hash,
+          from: minimal.sender || "ebanking@bca.co.id",
+          sender: minimal.sender || "ebanking@bca.co.id",
+          subject: minimal.subject || `Transaksi ${row.message_id}`,
+          amount: row.amount !== null ? row.amount : minimal.amount,
+          candidate: row.amount !== null ? {
+            tx_type: row.tx_type || "Expense",
+            amount: row.amount,
+            account: row.account || "BCA Main",
+            to_account: row.to_account,
+            category: row.category || "Other",
+            money_context: row.money_context || "Personal",
+            date: row.date || row.occurred_at?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+            time: row.time || "12:00:00",
+            match_tier: "EXACT",
+            reconciliation_status: "RECONCILED",
+          } : undefined,
+        };
+      });
+
+      return new Response(JSON.stringify(results), {
+        status: 200,
+        headers: getSecurityHeaders(),
+      });
+    }
+
+    // POST /api/sync/ack (Acknowledge receipt and advance sync cursor in D1)
+    if (path === "/api/sync/ack" && method === "POST") {
+      let ackBody: any = {};
+      try {
+        ackBody = await request.json();
+      } catch {
+        return new Response(
+          JSON.stringify({ status: "error", code: "BAD_REQUEST", message: "Payload JSON tidak valid." }),
+          { status: 400, headers: getSecurityHeaders() }
+        );
+      }
+
+      const source = ackBody.source || "gmail";
+      let newCursor = 0;
+      if (ackBody.cursor) {
+        newCursor = parseInt(String(ackBody.cursor), 10) || 0;
+      } else if (Array.isArray(ackBody.acknowledged_ids) && ackBody.acknowledged_ids.length > 0) {
+        const placeholders = ackBody.acknowledged_ids.map(() => "?").join(",");
+        const maxRow = await env.DB.prepare(
+          `SELECT MAX(id) as max_id FROM raw_events WHERE source = ? AND external_id IN (${placeholders})`
+        ).bind(source, ...ackBody.acknowledged_ids).first<{ max_id: number | null }>();
+        newCursor = maxRow?.max_id || 0;
+      }
+
+      if (newCursor > 0) {
+        await env.DB.prepare(
+          `INSERT INTO source_sync_state (source, last_attempt_at, last_success_at, cursor, status)
+           VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, 'OK')
+           ON CONFLICT(source) DO UPDATE SET
+             last_success_at = CURRENT_TIMESTAMP,
+             cursor = CASE WHEN CAST(excluded.cursor AS INTEGER) > CAST(COALESCE(source_sync_state.cursor, '0') AS INTEGER) THEN excluded.cursor ELSE source_sync_state.cursor END,
+             status = 'OK'`
+        ).bind(source, String(newCursor)).run();
+      }
+
+      return new Response(
+        JSON.stringify({ status: "acknowledged", cursor: String(newCursor) }),
+        { status: 200, headers: getSecurityHeaders() }
+      );
+    }
+
     // GET /api/ingestion/pending
     if (path === "/api/ingestion/pending" && method === "GET") {
       const candidates = await env.DB.prepare(

@@ -466,9 +466,29 @@ def sync_edge_inbox(
             "User-Agent": "AturUang-EdgeSync/1.0",
         }
 
+        target_db = Path(db_path) if db_path else DB_FILE
+        local_cursor = 0
+        if target_db.exists():
+            try:
+                con_cur = sqlite3.connect(str(target_db), timeout=5.0)
+                try:
+                    init_edge_sync_schema(con_cur)
+                    row_c = con_cur.execute(
+                        "SELECT MAX(CAST(COALESCE(json_extract(payload, '$.cursor'), json_extract(payload, '$.id')) AS INTEGER)) "
+                        "FROM edge_synced_messages "
+                        "WHERE json_extract(payload, '$.cursor') IS NOT NULL OR json_extract(payload, '$.id') IS NOT NULL"
+                    ).fetchone()
+                    if row_c and row_c[0]:
+                        local_cursor = int(row_c[0])
+                finally:
+                    con_cur.close()
+            except Exception:
+                pass
+
+        query_suffix = f"?cursor={local_cursor}&limit={MAX_PULL_BATCH_SIZE}" if local_cursor > 0 else f"?limit={MAX_PULL_BATCH_SIZE}"
         target_endpoints = [
-            f"{clean_url}/api/sync/gmail",
-            f"{clean_url}/api/ingestion/pending",
+            f"{clean_url}/api/sync/gmail{query_suffix}",
+            f"{clean_url}/api/ingestion/pending{query_suffix}",
         ]
         resp_data = None
         last_err = None
@@ -633,6 +653,8 @@ def sync_edge_inbox(
         # 2. Stage fetched evidence into local SQLite staging idempotently
         target_db = Path(db_path) if db_path else DB_FILE
         staged_ids = []
+        all_received_ids = []
+        max_batch_cursor = local_cursor
 
         con = sqlite3.connect(str(target_db), timeout=5.0)
         try:
@@ -641,6 +663,14 @@ def sync_edge_inbox(
                 msg_id = str(item.get("message_id") or item.get("id") or item.get("external_event_id") or "").strip()
                 if not msg_id:
                     continue
+                all_received_ids.append(msg_id)
+
+                item_cur = item.get("cursor") or item.get("id")
+                if item_cur is not None:
+                    try:
+                        max_batch_cursor = max(max_batch_cursor, int(item_cur))
+                    except (ValueError, TypeError):
+                        pass
 
                 payload_str = json.dumps(item, ensure_ascii=False)
                 content_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
@@ -671,9 +701,16 @@ def sync_edge_inbox(
 
         # 3. Acknowledge consumption to Worker (POST /api/sync/ack)
         ack_count = 0
-        if staged_ids:
+        ack_failed = False
+        if all_received_ids:
             try:
-                ack_body_dict = {"acknowledged_ids": staged_ids, "source": "gmail"}
+                ack_body_dict: dict[str, Any] = {
+                    "acknowledged_ids": all_received_ids,
+                    "source": "gmail",
+                }
+                if max_batch_cursor > local_cursor:
+                    ack_body_dict["cursor"] = str(max_batch_cursor)
+
                 ack_body_str = json.dumps(ack_body_dict, ensure_ascii=False)
                 ack_body_bytes = ack_body_str.encode("utf-8")
 
@@ -683,6 +720,7 @@ def sync_edge_inbox(
                 ack_sig = hmac.new(clean_secret.encode("utf-8"), ack_payload_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
                 ack_headers = {
+                    "Authorization": f"Bearer {clean_secret}",
                     "X-Timestamp": str(ack_ms),
                     "X-Nonce": ack_nonce,
                     "X-Signature": ack_sig,
@@ -697,10 +735,13 @@ def sync_edge_inbox(
                     method="POST",
                 )
                 with urllib.request.urlopen(ack_req, timeout=10) as ack_resp:
-                    ack_resp.read()
-                ack_count = len(staged_ids)
+                    if ack_resp.status in (200, 204):
+                        ack_count = len(all_received_ids)
+                    else:
+                        ack_failed = True
             except Exception:
-                ack_count = len(staged_ids)
+                ack_count = 0
+                ack_failed = True
 
         # 4. Zero-Click Auto-Apply Evaluation for newly staged evidence
         auto_applied_count = 0
@@ -798,7 +839,10 @@ def sync_edge_inbox(
             "acknowledged_count": ack_count,
             "auto_applied_count": auto_applied_count,
             "review_required_count": review_required_count,
+            "cursor": str(max_batch_cursor) if max_batch_cursor > 0 else None,
         }
+        if ack_failed:
+            res["ack_failed"] = True
         now_iso = dt.datetime.now().isoformat()
         now_wib_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S WIB")
         _last_edge_sync_info["status"] = "OK"

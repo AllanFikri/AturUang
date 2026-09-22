@@ -195,7 +195,7 @@ class EdgeSyncAndAutoApplyTests(unittest.TestCase):
             self.assertEqual(res2["status"], "success")
             self.assertEqual(res2["fetched_count"], 1)
             self.assertEqual(res2["staged_count"], 0)
-            self.assertEqual(res2["acknowledged_count"], 0)
+            self.assertEqual(res2["acknowledged_count"], 1)
 
             # Table still has exactly 1 row (no duplicates)
             con2 = sqlite3.connect(str(self.db_path))
