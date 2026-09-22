@@ -26,6 +26,7 @@ from aturuang.review_queue_ui import ReviewQueueManager, ReviewItem
 
 DEFAULT_WATCHED_ROOT = Path(os.getenv("ATURUANG_WATCHED_FOLDER_PATH", r"H:\My Drive\Money Tracks"))
 SUPPORTED_EXTENSIONS = frozenset({".csv", ".pdf"})
+MAX_WATCHED_FILE_SIZE = 50 * 1024 * 1024  # 50 MB safety limit to prevent OOM / DoS
 
 PROVIDER_SUBFOLDER_RULES: list[tuple[str, str]] = [
     ("riwayat transaksi shopee", "shopee_orders"),
@@ -212,6 +213,23 @@ class WatchedFolderScanner:
                 rel_path = file_path.relative_to(self.watched_dir)
             except ValueError:
                 rel_path = Path(file_path.name)
+
+            try:
+                file_size = file_path.stat().st_size
+                if file_size > MAX_WATCHED_FILE_SIZE:
+                    skipped_count += 1
+                    self.skipped_count += 1
+                    diagnostics.append(
+                        sanitize_diagnostics(
+                            f"SKIPPED_OVERSIZED: File '{file_path.name}' exceeds size limit ({file_size} bytes)"
+                        )
+                    )
+                    continue
+            except Exception as stat_err:
+                diagnostics.append(
+                    sanitize_diagnostics(f"STAT_ERROR: Could not inspect file '{file_path.name}': {str(stat_err)}")
+                )
+                continue
 
             try:
                 content = file_path.read_bytes()
