@@ -15,6 +15,7 @@ import hmac
 import http.server
 import io
 import json
+import logging
 import os
 import socketserver
 import sqlite3
@@ -168,6 +169,8 @@ DEFAULT_PORT = 5050
 CSS_FILE = WEB_ROOT / "css" / "styles.css"
 JS_FILE = WEB_ROOT / "js" / "app.js"
 CORE_JS_FILE = WEB_ROOT / "js" / "core.js"
+
+audit_logger = logging.getLogger("aturuang.security.audit")
 
 _composer_instance = None
 
@@ -975,7 +978,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_error(403, "Forbidden Cross-Site Access")
                     return
 
+                client_ip = self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1"
+                audit_logger.info("Audit: CSV export requested from client_ip=%s", client_ip)
+
                 rows = [rowdict(r) for r in con.execute("SELECT * FROM transactions WHERE is_deleted=0 ORDER BY date, time, id").fetchall()]
+                try:
+                    con.execute(
+                        "INSERT INTO transaction_audit_log (transaction_id, action, old_data, new_data) VALUES (?, ?, ?, ?)",
+                        (0, "CSV_EXPORT", f"client_ip={client_ip}", f"count={len(rows)}")
+                    )
+                    con.commit()
+                except Exception:
+                    pass
+
                 fields = [
                     "canonical_id", "date", "time", "transaction_type", "amount",
                     "account_from", "account_to", "description", "category", "for_with_whom",
@@ -1005,6 +1020,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if sec_site and sec_site not in ("same-origin", "none", "same-site"):
                     self.send_error(403, "Forbidden Cross-Site Access")
                     return
+
+                client_ip = self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1"
+                audit_logger.info("Audit: Database download requested from client_ip=%s", client_ip)
+                try:
+                    con.execute(
+                        "INSERT INTO transaction_audit_log (transaction_id, action, old_data, new_data) VALUES (?, ?, ?, ?)",
+                        (0, "DATABASE_DOWNLOAD", f"client_ip={client_ip}", "Full database downloaded")
+                    )
+                    con.commit()
+                except Exception:
+                    pass
 
                 body = DB_FILE.read_bytes()
                 self.send_response(200)
