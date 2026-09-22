@@ -592,11 +592,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stdout.write(f"{self.address_string()} - {fmt % args}\n")
 
+    def _get_allowed_origin(self) -> str | None:
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return None
+        try:
+            parsed = urllib.parse.urlparse(origin)
+            if parsed.scheme in ("http", "https") and parsed.hostname in ("localhost", "127.0.0.1"):
+                return origin
+        except Exception:
+            pass
+        return None
+
+    def _set_cors_headers(self) -> None:
+        allowed = self._get_allowed_origin()
+        if allowed:
+            self.send_header("Access-Control-Allow-Origin", allowed)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, Idempotency-Key, Accept")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Vary", "Origin")
+
+    def do_OPTIONS(self) -> None:
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin:
+            allowed = self._get_allowed_origin()
+            if not allowed:
+                self.send_error(403, "Forbidden Origin")
+                return
+            self.send_response(204)
+            self._set_cors_headers()
+            self.end_headers()
+        else:
+            self.send_response(204)
+            self.send_header("Allow", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
+            self.end_headers()
+
     def send_json(self, payload: dict | list, status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._set_cors_headers()
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
@@ -650,6 +687,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(status)
                 for k, v in headers.items():
                     self.send_header(k, v)
+                if "Access-Control-Allow-Origin" not in headers:
+                    self._set_cors_headers()
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -942,6 +981,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(status)
                 for k, v in headers.items():
                     self.send_header(k, v)
+                if "Access-Control-Allow-Origin" not in headers:
+                    self._set_cors_headers()
                 self.end_headers()
                 self.wfile.write(body)
                 return
