@@ -30,7 +30,8 @@ from aturuang.safe_apply import (
     compute_preview_hash,
 )
 from aturuang.review_queue_ui import ReviewQueueManager
-from aturuang.server import sync_edge_inbox, init_edge_sync_schema
+from aturuang.server import sync_edge_inbox, init_edge_sync_schema, Handler, get_edge_sync_config
+from aturuang.watched_folder import WatchedFolderScanner, MAX_WATCHED_FILE_SIZE
 
 EXPECTED_PRODUCTION_DB_SHA256 = "8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421"
 
@@ -421,6 +422,111 @@ class EdgeSyncAndAutoApplyTests(unittest.TestCase):
                 self.assertEqual(st[0], "AUTO_APPLIED")
             finally:
                 con.close()
+
+    def test_server_cors_headers_safe_origin_only(self) -> None:
+        """Assert local HTTP server reflects only trusted local loopback origins and never wildcard *."""
+        handler = Handler.__new__(Handler)
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+        handler.send_error = MagicMock()
+        handler.wfile = io.BytesIO()
+
+        # 1. Disallowed cross-origin preflight -> 403 Forbidden
+        handler.headers = {"Origin": "https://malicious-tracker.com"}
+        handler.do_OPTIONS()
+        handler.send_error.assert_called_with(403, "Forbidden Origin")
+
+        # 2. Allowed localhost preflight -> 204 with Origin reflected, NEVER wildcard *
+        handler.send_error.reset_mock()
+        handler.send_response.reset_mock()
+        handler.send_header.reset_mock()
+        handler.headers = {"Origin": "http://localhost:3000"}
+        handler.do_OPTIONS()
+        handler.send_response.assert_called_with(204)
+        opt_headers = {call[0][0]: call[0][1] for call in handler.send_header.call_args_list}
+        self.assertEqual(opt_headers.get("Access-Control-Allow-Origin"), "http://localhost:3000")
+        self.assertNotEqual(opt_headers.get("Access-Control-Allow-Origin"), "*")
+
+        # 3. Disallowed origin on send_json -> no CORS header
+        handler.send_response.reset_mock()
+        handler.send_header.reset_mock()
+        handler.headers = {"Origin": "https://evil.org"}
+        handler.send_json({"status": "ok"})
+        json_headers = {call[0][0]: call[0][1] for call in handler.send_header.call_args_list}
+        self.assertNotIn("Access-Control-Allow-Origin", json_headers)
+
+    def test_server_static_assets_path_traversal_blocked(self) -> None:
+        """Assert /assets/ route blocks path traversal attempts."""
+        handler = Handler.__new__(Handler)
+        handler.send_error = MagicMock()
+        handler.headers = {}
+        handler.path = "/assets/../secrets.json"
+        handler.do_GET()
+        handler.send_error.assert_called_with(403, "Forbidden")
+
+    def test_server_sensitive_endpoints_cross_origin_blocked(self) -> None:
+        """Assert sensitive local endpoints reject cross-origin requests."""
+        handler = Handler.__new__(Handler)
+        handler.send_error = MagicMock()
+        handler.send_json = MagicMock()
+        handler.headers = {"Origin": "https://malicious.com"}
+
+        # export_csv
+        handler.path = "/api/export_csv"
+        with patch("aturuang.server.db_connect"):
+            handler.do_GET()
+        handler.send_error.assert_called_with(403, "Forbidden Cross-Origin Access")
+
+        # pull-cloud
+        handler.path = "/api/sync/pull-cloud"
+        handler.do_POST()
+        handler.send_json.assert_called_with(
+            {"status": "error", "message": "Akses lintas-asal ditolak."},
+            status=403,
+        )
+
+    def test_watched_folder_skips_oversized_file(self) -> None:
+        """Assert watched folder skips files exceeding MAX_WATCHED_FILE_SIZE without reading into memory."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_p = Path(tmp_dir)
+            oversized = tmp_p / "huge_statement.pdf"
+            oversized.write_bytes(b"dummy")
+            scanner = WatchedFolderScanner(
+                db_path=self.db_path,
+                watched_dir=tmp_p,
+            )
+
+            with patch.object(Path, "stat") as mock_stat:
+                stat_res = MagicMock()
+                stat_res.st_size = MAX_WATCHED_FILE_SIZE + 1024
+                mock_stat.return_value = stat_res
+                res = scanner.scan_now()
+                self.assertEqual(res["skipped_files"], 1)
+                self.assertTrue(any("SKIPPED_OVERSIZED" in diag for diag in res.get("diagnostics", [])))
+
+    def test_secret_precedence_and_conflict_detection(self) -> None:
+        """Assert conflicting secret stores fail closed with empty strings."""
+        with patch.dict(
+            "os.environ",
+            {
+                "CLOUDFLARE_WORKER_URL": "https://worker-a.internal",
+                "EDGE_SYNC_SECRET": "secret_alpha",
+            },
+        ):
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                fake_sec = Path(tmp_dir) / "secrets.json"
+                fake_sec.write_text(
+                    json.dumps({
+                        "WORKER_URL": "https://worker-b.internal",
+                        "sync_secret": "secret_beta",
+                    }),
+                    encoding="utf-8",
+                )
+                with patch("aturuang.server.Path.cwd", return_value=Path(tmp_dir)):
+                    url, sec = get_edge_sync_config()
+                    self.assertEqual(url, "")
+                    self.assertEqual(sec, "")
 
     def test_production_db_hash_untouched_during_tests(self) -> None:
         """Assert production DB hash remains strictly untouched."""

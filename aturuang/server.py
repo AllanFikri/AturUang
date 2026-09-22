@@ -327,8 +327,8 @@ def get_edge_sync_config(worker_url: str | None = None, secret: str | None = Non
         sys.stderr.write("[Config] WARNING: Environment sync secret conflicts with local secret store. Failing closed.\n")
         return "", ""
 
-    final_url = worker_url or env_url or file_url
-    final_secret = secret or env_secret or file_secret
+    final_url = worker_url if worker_url is not None else (env_url or file_url)
+    final_secret = secret if secret is not None else (env_secret or file_secret)
     return str(final_url or "").strip().rstrip("/"), str(final_secret or "").strip()
 
 
