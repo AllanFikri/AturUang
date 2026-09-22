@@ -76,6 +76,52 @@ function syncCurrentMonthEmails() {
   processGmailQuery(query, workerUrl, relaySecret, 50);
 }
 
+const PDF_SYNC_PROP_PREFIX = "PDF_MSG_";
+const PDF_SYNC_INDEX_KEY = "PDF_SYNC_PROCESSED_INDEX";
+const MAX_PDF_SYNC_INDEX_ENTRIES = 200;
+
+function getPdfSyncMessageState_(props, msgId) {
+  const raw = props.getProperty(PDF_SYNC_PROP_PREFIX + msgId);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("PDF_SYNC_CORRUPT_STATE");
+    }
+    return parsed;
+  } catch (e) {
+    throw new Error("PDF_SYNC_CORRUPT_STATE");
+  }
+}
+
+function savePdfSyncMessageState_(props, msgId, state) {
+  props.setProperty(PDF_SYNC_PROP_PREFIX + msgId, JSON.stringify(state));
+
+  // Maintain bounded FIFO index of processed message keys to avoid unbounded property growth
+  try {
+    let indexList = [];
+    const rawIndex = props.getProperty(PDF_SYNC_INDEX_KEY);
+    if (rawIndex) {
+      indexList = JSON.parse(rawIndex);
+    }
+    if (!Array.isArray(indexList)) {
+      indexList = [];
+    }
+    if (indexList.indexOf(msgId) === -1) {
+      indexList.push(msgId);
+      if (indexList.length > MAX_PDF_SYNC_INDEX_ENTRIES) {
+        const toPrune = indexList.splice(0, indexList.length - MAX_PDF_SYNC_INDEX_ENTRIES);
+        for (let i = 0; i < toPrune.length; i++) {
+          props.deleteProperty(PDF_SYNC_PROP_PREFIX + toPrune[i]);
+        }
+      }
+      props.setProperty(PDF_SYNC_INDEX_KEY, JSON.stringify(indexList));
+    }
+  } catch (e) {
+    // Non-fatal if index maintenance fails, state is already persisted
+  }
+}
+
 /**
  * 1c. Sync PDF Attachments to Google Drive
  * Mengunggah lampiran PDF dari sender terpercaya ke folder Drive terkonfigurasi secara aman dan idempoten.
@@ -88,120 +134,176 @@ function syncEmailPdfAttachmentsToDrive() {
     throw new Error("PDF_FOLDER_CONFIG_MISSING");
   }
 
+  // Concurrency lock: prevent duplicate execution and race conditions
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    throw new Error("PDF_SYNC_CONCURRENT_LOCK_FAILED");
+  }
+
   let folder;
   try {
-    folder = DriveApp.getFolderById(folderId.trim());
-  } catch (e) {
-    throw new Error("PDF_DRIVE_FOLDER_NOT_FOUND");
-  }
-
-  if (!folder) {
-    throw new Error("PDF_DRIVE_FOLDER_NOT_FOUND");
-  }
-
-  const MAX_PDF_SIZE_BYTES = 15 * 1024 * 1024; // 15MB
-  const MAX_ATTACHMENTS_PER_MSG = 5;
-  const PDF_SYNC_LABEL = "aturuang/pdf-synced";
-
-  let pdfLabel = GmailApp.getUserLabelByName(PDF_SYNC_LABEL);
-  if (!pdfLabel) {
     try {
-      pdfLabel = GmailApp.createLabel(PDF_SYNC_LABEL);
+      folder = DriveApp.getFolderById(folderId.trim());
     } catch (e) {
-      console.warn("Gagal membuat label " + PDF_SYNC_LABEL + ": " + e);
+      throw new Error("PDF_DRIVE_FOLDER_NOT_FOUND");
     }
-  }
 
-  const query = "has:attachment filename:pdf -label:" + PDF_SYNC_LABEL + " " + TRUSTED_SENDER_QUERY;
-  const threads = GmailApp.search(query, 0, 20);
+    if (!folder) {
+      throw new Error("PDF_DRIVE_FOLDER_NOT_FOUND");
+    }
 
-  let totalUploaded = 0;
-  let totalSkipped = 0;
-  let messagesProcessed = 0;
+    const MAX_PDF_SIZE_BYTES = 15 * 1024 * 1024; // 15MB
+    const MAX_ATTACHMENTS_PER_MSG = 5;
+    const PDF_SYNC_LABEL = "aturuang/pdf-synced";
 
-  for (let t = 0; t < threads.length; t++) {
-    const thread = threads[t];
-    const messages = thread.getMessages();
-    let threadAllSuccess = true;
-
-    for (let m = 0; m < messages.length; m++) {
-      const msg = messages[m];
-      const fromHeader = msg.getFrom();
-
-      // Strict exact-sender validation
-      if (!isSenderExactTrusted(fromHeader)) {
-        continue;
+    let pdfLabel = GmailApp.getUserLabelByName(PDF_SYNC_LABEL);
+    if (!pdfLabel) {
+      try {
+        pdfLabel = GmailApp.createLabel(PDF_SYNC_LABEL);
+      } catch (e) {
+        console.warn("Gagal membuat label " + PDF_SYNC_LABEL + ": " + e);
       }
+    }
 
-      messagesProcessed++;
-      const attachments = msg.getAttachments({ includeInlineImages: false });
-      let pdfCount = 0;
-      let msgAllSuccess = true;
+    // Query messages directly from trusted senders without excluding labelled threads,
+    // so new messages in existing labelled threads are never skipped.
+    const query = "has:attachment filename:pdf newer_than:30d " + TRUSTED_SENDER_QUERY;
+    const threads = GmailApp.search(query, 0, 20);
 
-      for (let a = 0; a < attachments.length; a++) {
-        const att = attachments[a];
-        const contentType = (att.getContentType() || "").toLowerCase();
-        const name = (att.getName() || "").toLowerCase();
+    let totalUploaded = 0;
+    let totalSkipped = 0;
+    let messagesProcessed = 0;
 
-        // Validasi ekstensi dan mime type
-        if (contentType.indexOf("application/pdf") === -1 && !name.endsWith(".pdf")) {
+    for (let t = 0; t < threads.length; t++) {
+      const thread = threads[t];
+      const messages = thread.getMessages();
+      let threadAllMessagesCompleted = true;
+
+      for (let m = 0; m < messages.length; m++) {
+        const msg = messages[m];
+        const msgId = msg.getId();
+        const fromHeader = msg.getFrom();
+
+        // Strict exact-sender validation
+        if (!isSenderExactTrusted(fromHeader)) {
           continue;
         }
 
-        pdfCount++;
-        if (pdfCount > MAX_ATTACHMENTS_PER_MSG) {
-          console.warn("Batas lampiran PDF per pesan terlampaui (maks 5). Melewati sisa lampiran untuk msg: " + msg.getId());
-          break;
-        }
-
-        const size = att.getSize();
-        if (size > MAX_PDF_SIZE_BYTES) {
-          console.warn("OVERSIZED_ATTACHMENT: Ukuran berkas (" + size + " bytes) melebihi batas 15MB untuk msg: " + msg.getId());
-          msgAllSuccess = false;
+        // Persistent message-level idempotency source of truth
+        let msgState = getPdfSyncMessageState_(props, msgId);
+        if (msgState && msgState.status === "COMPLETED") {
+          // Entire message has already succeeded in a prior run
           continue;
         }
 
-        try {
-          // Hitung SHA-256 hash untuk idempotensi dan penamaan deterministik
-          const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, att.getBytes());
-          const hashHex = digest.map(function(b) {
-            return ("0" + (b & 0xFF).toString(16)).slice(-2);
-          }).join("");
-          const hashPrefix = hashHex.slice(0, 12);
+        messagesProcessed++;
+        const attachments = msg.getAttachments({ includeInlineImages: false });
 
-          const safeFileName = msg.getId() + "_att" + pdfCount + "_" + hashPrefix + ".pdf";
-
-          // Cek idempotensi: hindari duplikasi unggahan
-          const existingFiles = folder.getFilesByName(safeFileName);
-          if (existingFiles.hasNext()) {
-            totalSkipped++;
-          } else {
-            folder.createFile(att.copyBlob().setName(safeFileName));
-            totalUploaded++;
+        // Filter PDF attachments
+        const pdfAttachments = [];
+        for (let a = 0; a < attachments.length; a++) {
+          const att = attachments[a];
+          const contentType = (att.getContentType() || "").toLowerCase();
+          const name = (att.getName() || "").toLowerCase();
+          if (contentType.indexOf("application/pdf") !== -1 || name.endsWith(".pdf")) {
+            pdfAttachments.push(att);
           }
-        } catch (uploadErr) {
-          console.error("Gagal mengunggah lampiran PDF: " + uploadErr);
-          msgAllSuccess = false;
+        }
+
+        if (pdfAttachments.length === 0) {
+          // No PDF attachments in this message, mark complete
+          savePdfSyncMessageState_(props, msgId, {
+            status: "COMPLETED",
+            completed_attachments: [],
+            completed_at: new Date().toISOString()
+          });
+          continue;
+        }
+
+        let completedAtts = (msgState && Array.isArray(msgState.completed_attachments))
+          ? msgState.completed_attachments
+          : [];
+        let msgAllSuccess = true;
+        const totalToProcess = Math.min(pdfAttachments.length, MAX_ATTACHMENTS_PER_MSG);
+
+        for (let pIdx = 0; pIdx < totalToProcess; pIdx++) {
+          const att = pdfAttachments[pIdx];
+          const pdfCount = pIdx + 1;
+
+          const size = att.getSize();
+          if (size > MAX_PDF_SIZE_BYTES) {
+            console.warn("OVERSIZED_ATTACHMENT: Ukuran berkas (" + size + " bytes) melebihi batas 15MB untuk msg: " + msgId);
+            msgAllSuccess = false;
+            continue;
+          }
+
+          try {
+            // Compute deterministic SHA-256 hash of attachment content
+            const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, att.getBytes());
+            const hashHex = digest.map(function(b) {
+              return ("0" + (b & 0xFF).toString(16)).slice(-2);
+            }).join("");
+            const hashPrefix = hashHex.slice(0, 12);
+
+            // Deterministic identity: msgId + attachmentIndex + contentHash
+            const attIdentity = msgId + "_att" + pdfCount + "_" + hashPrefix;
+            const safeFileName = attIdentity + ".pdf";
+
+            // Check if already completed in persistent state (skip re-upload during retry)
+            if (completedAtts.indexOf(attIdentity) !== -1) {
+              totalSkipped++;
+              continue;
+            }
+
+            // Check Drive storage idempotency: never duplicate file if Drive upload already succeeded
+            const existingFiles = folder.getFilesByName(safeFileName);
+            if (existingFiles.hasNext()) {
+              totalSkipped++;
+            } else {
+              folder.createFile(att.copyBlob().setName(safeFileName));
+              totalUploaded++;
+            }
+
+            // Immediately persist attachment progress so failures or timeouts preserve partial success
+            completedAtts.push(attIdentity);
+            savePdfSyncMessageState_(props, msgId, {
+              status: "PARTIAL",
+              completed_attachments: completedAtts,
+              updated_at: new Date().toISOString()
+            });
+          } catch (uploadErr) {
+            console.error("Gagal mengunggah lampiran PDF (" + pdfCount + "): " + uploadErr);
+            msgAllSuccess = false;
+          }
+        }
+
+        // Only mark COMPLETED when all intended attachments have succeeded
+        if (msgAllSuccess && completedAtts.length >= totalToProcess) {
+          savePdfSyncMessageState_(props, msgId, {
+            status: "COMPLETED",
+            completed_attachments: completedAtts,
+            completed_at: new Date().toISOString()
+          });
+        } else {
+          threadAllMessagesCompleted = false;
         }
       }
 
-      if (!msgAllSuccess) {
-        threadAllSuccess = false;
+      // Add label as informational marker only if all messages in thread succeeded
+      if (threadAllMessagesCompleted && pdfLabel) {
+        thread.addLabel(pdfLabel);
       }
     }
 
-    // Labeli thread hanya jika seluruh lampiran berhasil diselaraskan
-    if (threadAllSuccess && pdfLabel) {
-      thread.addLabel(pdfLabel);
-    }
+    console.log("Sinkronisasi PDF selesai: diunggah=" + totalUploaded + ", dilewati (idempoten)=" + totalSkipped + ", pesan=" + messagesProcessed);
+    return {
+      uploaded: totalUploaded,
+      skipped: totalSkipped,
+      messages_processed: messagesProcessed
+    };
+  } finally {
+    lock.releaseLock();
   }
-
-  console.log("Sinkronisasi PDF selesai: diunggah=" + totalUploaded + ", dilewati (idempoten)=" + totalSkipped + ", pesan=" + messagesProcessed);
-  return {
-    uploaded: totalUploaded,
-    skipped: totalSkipped,
-    messages_processed: messagesProcessed
-  };
 }
 
 /**

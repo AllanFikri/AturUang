@@ -17,6 +17,8 @@ import io
 import json
 import logging
 import os
+import re
+import secrets
 import socketserver
 import sqlite3
 import sys
@@ -303,7 +305,7 @@ def get_edge_sync_config(worker_url: str | None = None, secret: str | None = Non
                             if not file_url:
                                 file_url = u
                             break
-                for k in ("STAGING_ADMIN_TOKEN", "staging_admin_token", "GMAIL_RELAY_SECRET", "gmail_relay_secret", "ATURUANG_SYNC_SECRET", "aturuang_sync_secret", "EDGE_SYNC_SECRET", "edge_sync_secret", "CLOUDFLARE_SYNC_SECRET", "cloudflare_sync_secret", "sync_secret"):
+                for k in ("STAGING_ADMIN_TOKEN", "staging_admin_token", "ATURUANG_SYNC_SECRET", "aturuang_sync_secret", "EDGE_SYNC_SECRET", "edge_sync_secret", "CLOUDFLARE_SYNC_SECRET", "cloudflare_sync_secret", "sync_secret"):
                     if data.get(k):
                         s = str(data[k]).strip()
                         if s:
@@ -622,6 +624,85 @@ _edge_sync_mod.init_edge_sync_schema = init_edge_sync_schema
 sys.modules["aturuang.edge_sync"] = _edge_sync_mod
 
 
+_local_auth_token: str | None = None
+
+
+def get_local_auth_token() -> str:
+    global _local_auth_token
+    if _local_auth_token:
+        return _local_auth_token
+    env_token = os.environ.get("ATURUANG_LOCAL_AUTH_TOKEN")
+    if env_token and env_token.strip():
+        _local_auth_token = env_token.strip()
+        return _local_auth_token
+    _local_auth_token = secrets.token_hex(32)
+    return _local_auth_token
+
+
+def set_local_auth_token(token: str | None) -> None:
+    global _local_auth_token
+    _local_auth_token = token
+
+
+def get_staging_admin_token() -> str:
+    env_token = os.environ.get("STAGING_ADMIN_TOKEN")
+    if env_token and env_token.strip():
+        return env_token.strip()
+    candidate_paths = [
+        Path.cwd() / "runtime" / "secrets.json",
+        Path.cwd() / "secrets.json",
+        Path(__file__).resolve().parent.parent / "runtime" / "secrets.json",
+        Path(__file__).resolve().parent.parent / "secrets.json",
+        Path.home() / ".money_tracks" / "secrets.json",
+    ]
+    for sp in candidate_paths:
+        if sp.exists():
+            try:
+                data = json.loads(sp.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    tok = data.get("STAGING_ADMIN_TOKEN") or data.get("staging_admin_token")
+                    if tok and str(tok).strip():
+                        return str(tok).strip()
+            except Exception:
+                pass
+    return ""
+
+
+def is_wrong_secret_type(candidate: str) -> bool:
+    if not candidate:
+        return False
+    cand_str = str(candidate).strip()
+    if cand_str.upper() in ("GMAIL_RELAY_SECRET", "REPAIR_SECRET"):
+        return True
+
+    gmail_relay = os.environ.get("GMAIL_RELAY_SECRET", "").strip()
+    repair_sec = os.environ.get("REPAIR_SECRET", "").strip()
+    candidate_paths = [
+        Path.cwd() / "runtime" / "secrets.json",
+        Path.cwd() / "secrets.json",
+        Path(__file__).resolve().parent.parent / "runtime" / "secrets.json",
+        Path(__file__).resolve().parent.parent / "secrets.json",
+        Path.home() / ".money_tracks" / "secrets.json",
+    ]
+    for sp in candidate_paths:
+        if sp.exists():
+            try:
+                data = json.loads(sp.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    if not gmail_relay:
+                        gmail_relay = str(data.get("GMAIL_RELAY_SECRET") or data.get("gmail_relay_secret") or "").strip()
+                    if not repair_sec:
+                        repair_sec = str(data.get("REPAIR_SECRET") or data.get("repair_secret") or "").strip()
+            except Exception:
+                pass
+
+    if gmail_relay and hmac.compare_digest(cand_str, gmail_relay):
+        return True
+    if repair_sec and hmac.compare_digest(cand_str, repair_sec):
+        return True
+    return False
+
+
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -639,11 +720,82 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         try:
             parsed = urllib.parse.urlparse(origin)
-            if parsed.scheme in ("http", "https") and parsed.hostname in ("localhost", "127.0.0.1"):
+            if parsed.scheme not in ("http", "https"):
+                return None
+
+            # Explicitly configured application origin
+            app_origin = os.environ.get("ATURUANG_APP_ORIGIN", "").strip()
+            if app_origin and origin.lower() == app_origin.lower():
                 return origin
+
+            # Host-bound loopback origin restriction
+            host = (self.headers.get("Host") or "").strip().lower()
+            if host:
+                if parsed.netloc.lower() == host and parsed.hostname in ("localhost", "127.0.0.1"):
+                    return origin
+            else:
+                if parsed.hostname in ("localhost", "127.0.0.1"):
+                    return origin
         except Exception:
             pass
         return None
+
+    def _check_local_auth(self) -> tuple[bool, str, int]:
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and not self._get_allowed_origin():
+            return False, "Forbidden Cross-Origin Access", 403
+
+        sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if sec_site and sec_site not in ("same-origin", "none", "same-site"):
+            return False, "Forbidden Cross-Site Access", 403
+
+        expected_token = get_local_auth_token()
+
+        # Check CSRF header
+        csrf_hdr = (self.headers.get("X-CSRF-Token") or "").strip()
+        if csrf_hdr:
+            if not hmac.compare_digest(csrf_hdr, expected_token):
+                return False, "Invalid CSRF token", 403
+            return True, "", 200
+
+        # Check Authorization header (Bearer token)
+        auth_hdr = (self.headers.get("Authorization") or "").strip()
+        if auth_hdr:
+            if auth_hdr.lower().startswith("bearer "):
+                tok = auth_hdr[7:].strip()
+                if not hmac.compare_digest(tok, expected_token):
+                    return False, "Invalid local authentication token", 401
+                return True, "", 200
+            return False, "Invalid authorization format", 401
+
+        # Check X-AturUang-Auth header
+        x_auth = (self.headers.get("X-AturUang-Auth") or "").strip()
+        if x_auth:
+            if not hmac.compare_digest(x_auth, expected_token):
+                return False, "Invalid local authentication token", 401
+            return True, "", 200
+
+        # Check URL query parameter ?token=...
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        token_qs = qs.get("token", [""])[0].strip()
+        if token_qs:
+            if not hmac.compare_digest(token_qs, expected_token):
+                return False, "Invalid local authentication token", 401
+            return True, "", 200
+
+        # Check Cookie session
+        cookie_hdr = (self.headers.get("Cookie") or "").strip()
+        if cookie_hdr:
+            for part in cookie_hdr.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    if k.strip() == "aturuang_session":
+                        if hmac.compare_digest(v.strip(), expected_token):
+                            return True, "", 200
+                        return False, "Invalid session token", 401
+
+        return False, "Missing local authentication", 401
 
     def _set_cors_headers(self) -> None:
         allowed = self._get_allowed_origin()
@@ -705,44 +857,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
 
-        composer = get_composer()
-        if composer is not None:
-            # PWA assets & endpoints
-            if path in ("/manifest.webmanifest", "/manifest.json", "/sw.js", "/icon.svg"):
-                status, headers, body = composer.handle_request("GET", path, query=qs)
-                self.send_response(status)
-                for k, v in headers.items():
-                    self.send_header(k, v)
-                self.end_headers()
-                self.wfile.write(body)
-                return
+        # Composer / PWA routes
+        if (
+            path in ("/manifest.webmanifest", "/manifest.json", "/sw.js", "/icon.svg", "/quick-capture", "/import", "/review", "/receipt")
+            or path.startswith("/api/quick-capture/")
+            or path.startswith("/api/import/")
+            or path.startswith("/api/review-queue/")
+            or path.startswith("/api/receipt/")
+        ):
+            composer = get_composer()
+            if composer is not None:
+                # PWA assets & endpoints
+                if path in ("/manifest.webmanifest", "/manifest.json", "/sw.js", "/icon.svg"):
+                    status, headers, body = composer.handle_request("GET", path, query=qs)
+                    self.send_response(status)
+                    for k, v in headers.items():
+                        self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
 
-            # Ingestion API routes
-            if (
-                path.startswith("/api/quick-capture/")
-                or path.startswith("/api/import/")
-                or path.startswith("/api/review-queue/")
-                or path.startswith("/api/receipt/")
-            ):
-                status, headers, body = composer.handle_request("GET", path, query=qs)
-                self.send_response(status)
-                for k, v in headers.items():
-                    self.send_header(k, v)
-                if "Access-Control-Allow-Origin" not in headers:
-                    self._set_cors_headers()
-                self.end_headers()
-                self.wfile.write(body)
-                return
+                # Ingestion API routes
+                if (
+                    path.startswith("/api/quick-capture/")
+                    or path.startswith("/api/import/")
+                    or path.startswith("/api/review-queue/")
+                    or path.startswith("/api/receipt/")
+                ):
+                    status, headers, body = composer.handle_request("GET", path, query=qs)
+                    self.send_response(status)
+                    for k, v in headers.items():
+                        self.send_header(k, v)
+                    if "Access-Control-Allow-Origin" not in headers:
+                        self._set_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
 
-            # Standalone ingestion UI routes
-            if path in ("/quick-capture", "/import", "/review", "/receipt"):
-                status, headers, body = composer.handle_request("GET", path, query=qs)
-                self.send_response(status)
-                for k, v in headers.items():
-                    self.send_header(k, v)
-                self.end_headers()
-                self.wfile.write(body)
-                return
+                # Standalone ingestion UI routes
+                if path in ("/quick-capture", "/import", "/review", "/receipt"):
+                    status, headers, body = composer.handle_request("GET", path, query=qs)
+                    self.send_response(status)
+                    for k, v in headers.items():
+                        self.send_header(k, v)
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
 
         if path == "/api/watched-folder/status":
             scanner = get_watched_folder_scanner()
@@ -761,19 +921,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(_last_edge_sync_info)
 
         if path == "/api/sync/pull-cloud":
-            try:
-                res = sync_edge_inbox()
-                return self.send_json(res, status=200)
-            except Exception as e:
-                return self.send_json({
-                    "status": "error",
-                    "message": str(e),
-                    "staged_count": 0,
-                    "auto_applied_count": 0,
-                }, status=200)
+            self.send_error(405, "Method Not Allowed")
+            return
 
         # Static assets
         if path in {"/", "/index.html"}:
+            token = get_local_auth_token()
+            if HTML_FILE.exists():
+                content = HTML_FILE.read_text(encoding="utf-8")
+                csrf_tag = f'<meta name="aturuang-csrf-token" content="{token}">\n<script>window.__ATURUANG_CSRF__="{token}";</script>\n'
+                if "</head>" in content:
+                    content = content.replace("</head>", csrf_tag + "</head>", 1)
+                body = content.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Set-Cookie", f"aturuang_session={token}; Path=/; SameSite=Strict; HttpOnly")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             return self.serve_file(HTML_FILE, "text/html; charset=utf-8")
         if path == "/styles.css" or path == "/css/styles.css":
             return self.serve_file(CSS_FILE, "text/css; charset=utf-8")
@@ -782,19 +949,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/core.js" or path == "/js/core.js":
             return self.serve_file(CORE_JS_FILE, "application/javascript; charset=utf-8")
         if path.startswith("/assets/"):
-            rel_path = path[len("/assets/"):].lstrip("/\\")
-            assets_dir = (BASE_DIR / "assets").resolve()
-            # If assets_dir does not exist, fallback to web/assets
-            if not assets_dir.exists() and (WEB_ROOT / "assets").resolve().exists():
-                assets_dir = (WEB_ROOT / "assets").resolve()
+            raw_url = self.path
+            unquoted_1 = urllib.parse.unquote(raw_url)
+            unquoted_2 = urllib.parse.unquote(unquoted_1)
 
-            file_path = (assets_dir / rel_path).resolve()
-            if ".." in path or not file_path.is_relative_to(assets_dir):
+            # Reject null bytes anywhere
+            if "\0" in raw_url or "\0" in unquoted_1 or "\0" in unquoted_2:
+                self.send_error(400, "Bad Request")
+                return
+
+            # Reject encoded, double-encoded, or literal parent traversal
+            if ".." in raw_url or ".." in unquoted_1 or ".." in unquoted_2:
                 self.send_error(403, "Forbidden")
                 return
 
-            if file_path.exists() and file_path.is_file():
-                ext = file_path.suffix.lower()
+            # Reject backslashes or alternate separators
+            if "\\" in raw_url or "\\" in unquoted_1 or "\\" in unquoted_2:
+                self.send_error(403, "Forbidden")
+                return
+
+            # Extract relative path
+            rel_unquoted = unquoted_2
+            if rel_unquoted.startswith("/assets/"):
+                rel_unquoted = rel_unquoted[len("/assets/"):]
+            elif rel_unquoted.startswith("assets/"):
+                rel_unquoted = rel_unquoted[len("assets/"):]
+
+            # Reject absolute paths or Windows drive letters
+            if rel_unquoted.startswith("/") or re.match(r"^[a-zA-Z]:", rel_unquoted):
+                self.send_error(403, "Forbidden")
+                return
+
+            assets_dir = (BASE_DIR / "assets").resolve()
+            if not assets_dir.exists() and (WEB_ROOT / "assets").resolve().exists():
+                assets_dir = (WEB_ROOT / "assets").resolve()
+
+            try:
+                target_path = assets_dir / rel_unquoted
+                resolved_path = target_path.resolve()
+                if not resolved_path.is_relative_to(assets_dir):
+                    self.send_error(403, "Forbidden")
+                    return
+            except Exception:
+                self.send_error(403, "Forbidden")
+                return
+
+            if resolved_path.exists() and resolved_path.is_file():
+                ext = resolved_path.suffix.lower()
                 mimetypes = {
                     ".jpg": "image/jpeg",
                     ".jpeg": "image/jpeg",
@@ -805,10 +1006,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     ".js": "application/javascript; charset=utf-8",
                 }
                 if ext in mimetypes:
-                    return self.serve_file(file_path, mimetypes[ext])
+                    return self.serve_file(resolved_path, mimetypes[ext])
                 self.send_error(403, "Forbidden")
                 return
             self.send_error(404, "File Not Found")
+        if path == "/api/export_csv":
+            ok, err, code = self._check_local_auth()
+            if not ok:
+                self.send_error(code, err)
+                return
+
+            client_ip = self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1"
+            audit_logger.info("Audit: CSV export requested from client_ip=%s", client_ip)
+
+            con = db_connect()
+            try:
+                rows = [rowdict(r) for r in con.execute("SELECT * FROM transactions WHERE is_deleted=0 ORDER BY date, time, id").fetchall()]
+            finally:
+                con.close()
+
+            fields = [
+                "canonical_id", "date", "time", "transaction_type", "amount",
+                "account_from", "account_to", "description", "category", "for_with_whom",
+                "money_context", "settlement_kind", "status", "confidence", "budget_effect",
+                "subtype", "source_refs", "notes",
+            ]
+            out = io.StringIO()
+            writer = csv.DictWriter(out, fieldnames=fields)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k, "") for k in fields})
+            body = out.getvalue().encode("utf-8-sig")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", "attachment; filename=money_tracks_canonical_export.csv")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path == "/api/download_db":
+            ok, err, code = self._check_local_auth()
+            if not ok:
+                self.send_error(code, err)
+                return
+
+            client_ip = self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1"
+            audit_logger.info("Audit: Database download requested from client_ip=%s", client_ip)
+
+            body = DB_FILE.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", "attachment; filename=money_tracks.db")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         with db_connect() as con:
@@ -968,79 +1220,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ]
                 return self.send_json({"reallocations": rows})
 
-            if path == "/api/export_csv":
-                origin = (self.headers.get("Origin") or "").strip()
-                if origin and not self._get_allowed_origin():
-                    self.send_error(403, "Forbidden Cross-Origin Access")
-                    return
-                sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
-                if sec_site and sec_site not in ("same-origin", "none", "same-site"):
-                    self.send_error(403, "Forbidden Cross-Site Access")
-                    return
-
-                client_ip = self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1"
-                audit_logger.info("Audit: CSV export requested from client_ip=%s", client_ip)
-
-                rows = [rowdict(r) for r in con.execute("SELECT * FROM transactions WHERE is_deleted=0 ORDER BY date, time, id").fetchall()]
-                try:
-                    con.execute(
-                        "INSERT INTO transaction_audit_log (transaction_id, action, old_data, new_data) VALUES (?, ?, ?, ?)",
-                        (0, "CSV_EXPORT", f"client_ip={client_ip}", f"count={len(rows)}")
-                    )
-                    con.commit()
-                except Exception:
-                    pass
-
-                fields = [
-                    "canonical_id", "date", "time", "transaction_type", "amount",
-                    "account_from", "account_to", "description", "category", "for_with_whom",
-                    "money_context", "settlement_kind", "status", "confidence", "budget_effect",
-                    "subtype", "source_refs", "notes",
-                ]
-                out = io.StringIO()
-                writer = csv.DictWriter(out, fieldnames=fields)
-                writer.writeheader()
-                for r in rows:
-                    writer.writerow({k: r.get(k, "") for k in fields})
-                body = out.getvalue().encode("utf-8-sig")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/csv; charset=utf-8")
-                self.send_header("Content-Disposition", "attachment; filename=money_tracks_canonical_export.csv")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-
-            if path == "/api/download_db":
-                origin = (self.headers.get("Origin") or "").strip()
-                if origin and not self._get_allowed_origin():
-                    self.send_error(403, "Forbidden Cross-Origin Access")
-                    return
-                sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
-                if sec_site and sec_site not in ("same-origin", "none", "same-site"):
-                    self.send_error(403, "Forbidden Cross-Site Access")
-                    return
-
-                client_ip = self.client_address[0] if getattr(self, "client_address", None) else "127.0.0.1"
-                audit_logger.info("Audit: Database download requested from client_ip=%s", client_ip)
-                try:
-                    con.execute(
-                        "INSERT INTO transaction_audit_log (transaction_id, action, old_data, new_data) VALUES (?, ?, ?, ?)",
-                        (0, "DATABASE_DOWNLOAD", f"client_ip={client_ip}", "Full database downloaded")
-                    )
-                    con.commit()
-                except Exception:
-                    pass
-
-                body = DB_FILE.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Disposition", "attachment; filename=money_tracks.db")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-
         self.send_error(404, "Not Found")
 
     def do_POST(self) -> None:
@@ -1048,15 +1227,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
 
-        composer = get_composer()
-        if composer is not None:
-            if (
-                path.startswith("/api/quick-capture/")
-                or path.startswith("/api/import/")
-                or path.startswith("/api/review-queue/")
-                or path.startswith("/api/receipt/")
-                or path == "/api/ingest/android-notification"
-            ):
+        if (
+            path.startswith("/api/quick-capture/")
+            or path.startswith("/api/import/")
+            or path.startswith("/api/review-queue/")
+            or path.startswith("/api/receipt/")
+            or path == "/api/ingest/android-notification"
+        ):
+            composer = get_composer()
+            if composer is not None:
                 content_len = int(self.headers.get("Content-Length", 0) or 0)
                 body_bytes = self.rfile.read(content_len) if content_len > 0 else b""
                 status, headers, body = composer.handle_request("POST", path, query=qs, body=body_bytes)
@@ -1084,9 +1263,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if sec_site and sec_site not in ("same-origin", "none", "same-site"):
                 return self.send_json({"status": "error", "message": "Akses lintas-situs ditolak."}, status=403)
 
+            # Extract staging admin credential
+            cred = ""
+            auth_hdr = (self.headers.get("Authorization") or "").strip()
+            if auth_hdr.lower().startswith("bearer "):
+                cred = auth_hdr[7:].strip()
+            if not cred:
+                cred = (self.headers.get("X-Staging-Admin-Token") or self.headers.get("X-Admin-Token") or "").strip()
+
+            content_len = int(self.headers.get("Content-Length", 0) or 0)
+            if not cred and content_len > 0:
+                try:
+                    payload = self.read_json()
+                    if isinstance(payload, dict):
+                        cred = (payload.get("staging_admin_token") or payload.get("staging_token") or payload.get("admin_token") or "").strip()
+                except Exception:
+                    pass
+
+            if not cred:
+                return self.send_json({
+                    "status": "error",
+                    "error": "MISSING_CREDENTIALS",
+                    "message": "Kredensial staging admin tidak ditemukan.",
+                }, status=401)
+
+            if is_wrong_secret_type(cred):
+                return self.send_json({
+                    "status": "error",
+                    "error": "WRONG_SECRET_TYPE",
+                    "message": "Tipe secret salah: bukan STAGING_ADMIN_TOKEN.",
+                }, status=401)
+
+            expected_staging_token = get_staging_admin_token()
+            if not expected_staging_token or not hmac.compare_digest(cred, expected_staging_token):
+                return self.send_json({
+                    "status": "error",
+                    "error": "INVALID_CREDENTIALS",
+                    "message": "Kredensial staging admin tidak valid.",
+                }, status=401)
+
             try:
-                # Always use local verified secret configuration; do not accept unauthenticated overrides
-                res = sync_edge_inbox()
+                res = sync_edge_inbox(secret=cred)
                 return self.send_json(res, status=200)
             except Exception as e:
                 return self.send_json({

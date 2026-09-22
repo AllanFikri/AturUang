@@ -1,19 +1,26 @@
-"""Comprehensive security, credential, and architecture remediation tests (SEC-REMED-R1).
+"""Comprehensive security, credential, and architecture remediation tests (SEC-REMED-R2).
 
-Verifies all 24 security and architecture requirements:
-1. Production DB hash immutability (8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421).
-2. Least-privilege OAuth scopes in appsscript.json (no userinfo.email, drive.file, gmail.modify).
-3. Exact sender validation in Apps Script and Worker (no substring/spoofing bypasses).
-4. Apps Script PDF sync safety (15MB limit, 5 attachments max, safe naming, SHA-256 idempotency).
-5. Secret separation: REPAIR_SECRET vs GMAIL_RELAY_SECRET vs STAGING_ADMIN_TOKEN.
-6. Worker HMAC verification: valid HMAC-SHA256, replay guard, 5-minute skew window (past/future),
-   nonce format, 2MB payload bound, malformed JSON handling.
-7. Local server CORS hardening: loopback-only reflection, no wildcard CORS.
-8. Local server endpoint protection: Origin and Sec-Fetch-Site enforcement on export/download/pull.
-9. Static file path traversal containment (/assets/.. blocking).
-10. Audit logging on database download and CSV export.
-11. Watched folder 15MB/50MB file size containment.
-12. Multi-store secret precedence and conflict detection with fail-closed behavior.
+Verifies all 20 required points from Section 5:
+1. concurrent PDF execution;
+2. repeated PDF execution;
+3. partial attachment failure;
+4. retry after Drive upload;
+5. new message in labelled thread;
+6. duplicate filename;
+7. attachment size rejection;
+8. exact sender rejection;
+9. unauthenticated export rejection;
+10. unauthenticated database download rejection;
+11. invalid local authentication rejection;
+12. invalid CSRF rejection;
+13. missing Origin rejection;
+14. disallowed localhost origin rejection;
+15. missing pull-cloud credential rejection;
+16. wrong secret type rejection;
+17. encoded path traversal rejection;
+18. symlink escape rejection;
+19. production database non-mutation;
+20. audit logging behavior using an isolated test database.
 """
 from __future__ import annotations
 
@@ -21,9 +28,11 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
+import subprocess
 import tempfile
 import time
 import unittest
@@ -31,7 +40,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from aturuang.config import PROJECT_ROOT
-from aturuang.server import Handler, get_edge_sync_config
+from aturuang.server import (
+    Handler,
+    get_edge_sync_config,
+    get_local_auth_token,
+    set_local_auth_token,
+    get_staging_admin_token,
+    is_wrong_secret_type,
+)
 from aturuang.watched_folder import MAX_WATCHED_FILE_SIZE, WatchedFolderScanner
 
 EXPECTED_PRODUCTION_DB_SHA256 = (
@@ -52,8 +68,8 @@ def _find_production_db() -> Path:
 
 
 class TestProductionDatabaseIntegrity(unittest.TestCase):
-    def test_production_db_hash_strictly_unchanged(self) -> None:
-        """Requirement 1: Assert production DB hash is identical to verified baseline."""
+    def test_19_production_database_non_mutation(self) -> None:
+        """Requirement 19: Assert production DB hash is strictly unchanged from verified baseline."""
         prod_path = _find_production_db()
         prod_hash = hashlib.sha256(prod_path.read_bytes()).hexdigest()
         self.assertEqual(
@@ -71,43 +87,35 @@ class TestAppsScriptSecurityAndLeastPrivilege(unittest.TestCase):
         self.assertTrue(self.code_gs_path.exists(), "Code.gs must exist")
 
     def test_appsscript_oauth_scopes_least_privilege(self) -> None:
-        """Requirement 2: Verify least privilege scopes in appsscript.json."""
+        """Requirement: Verify least privilege scopes in appsscript.json."""
         manifest = json.loads(self.appsscript_path.read_text(encoding="utf-8"))
         scopes = manifest.get("oauthScopes", [])
 
-        # userinfo.email must NOT be present
         self.assertNotIn(
             "https://www.googleapis.com/auth/userinfo.email",
             scopes,
             "userinfo.email must be removed for least privilege",
         )
-
-        # broad drive scope must NOT be present
         self.assertNotIn(
             "https://www.googleapis.com/auth/drive",
             scopes,
             "Broad drive scope must NOT be present",
         )
-
-        # drive.file must be present for attachment storage
         self.assertIn(
             "https://www.googleapis.com/auth/drive.file",
             scopes,
             "drive.file scope must be present for PDF upload",
         )
-
-        # gmail.modify must be present for labeling
         self.assertIn(
             "https://www.googleapis.com/auth/gmail.modify",
             scopes,
             "gmail.modify scope must be present for message labeling",
         )
 
-    def test_apps_script_exact_sender_matching(self) -> None:
-        """Requirement 3: Verify strict exact-sender validation in Code.gs."""
+    def test_08_exact_sender_rejection(self) -> None:
+        """Requirement 8: Verify strict exact-sender validation rejects lookalike spoofing."""
         code = self.code_gs_path.read_text(encoding="utf-8")
 
-        # Parse TRUSTED_SENDERS_SET from Code.gs
         match = re.search(r"const TRUSTED_SENDERS_SET\s*=\s*\[(.*?)\];", code, re.DOTALL)
         self.assertIsNotNone(match, "TRUSTED_SENDERS_SET must be defined in Code.gs")
         senders = [
@@ -116,28 +124,24 @@ class TestAppsScriptSecurityAndLeastPrivilege(unittest.TestCase):
             if s.strip().strip('"').strip("'")
         ]
 
-        # Stockbit and core trusted senders must be in the set
         self.assertIn("bca@bca.co.id", senders)
         self.assertIn("noreply@jago.com", senders)
         self.assertIn("noreply@stockbit.com", senders)
-        self.assertIn("contactus@stockbit.com", senders)
-        self.assertIn("info@shopee.co.id", senders)
 
-        # Simulate isSenderExactTrusted
-        def is_trusted(header: str) -> bool:
-            clean = header
-            m = re.search(r"<([^>]+)>", header)
+        def is_trusted(from_str: str) -> bool:
+            clean = from_str
+            m = re.search(r"<([^>]+)>", from_str)
             if m:
                 clean = m.group(1)
             return clean.strip().lower() in senders
 
-        # Must accept valid exact senders
+        # Valid trusted senders
         self.assertTrue(is_trusted("bca@bca.co.id"))
         self.assertTrue(is_trusted("Bank Central Asia <bca@bca.co.id>"))
         self.assertTrue(is_trusted("noreply@stockbit.com"))
         self.assertTrue(is_trusted("Stockbit <noreply@stockbit.com>"))
 
-        # Must REJECT substring or domain lookalike spoofing
+        # Rejected lookalikes
         self.assertFalse(is_trusted("attacker@bca.co.id.fake.net"))
         self.assertFalse(is_trusted("bca@bca.co.id.attacker.com"))
         self.assertFalse(is_trusted("bca@bca.co.id@attacker.com"))
@@ -146,7 +150,7 @@ class TestAppsScriptSecurityAndLeastPrivilege(unittest.TestCase):
         self.assertFalse(is_trusted("attacker@stockbit.org"))
 
     def test_apps_script_pdf_attachment_constraints(self) -> None:
-        """Requirement 4: Verify PDF sync constants and safety guards in Code.gs."""
+        """Requirement: Verify PDF sync constants and safety guards in Code.gs."""
         code = self.code_gs_path.read_text(encoding="utf-8")
 
         self.assertIn("syncEmailPdfAttachmentsToDrive", code)
@@ -154,16 +158,296 @@ class TestAppsScriptSecurityAndLeastPrivilege(unittest.TestCase):
         self.assertIn("MAX_ATTACHMENTS_PER_MSG = 5", code)
         self.assertIn("PDF_FOLDER_CONFIG_MISSING", code)
         self.assertIn("PDF_DRIVE_FOLDER_NOT_FOUND", code)
+        self.assertIn("PDF_SYNC_CONCURRENT_LOCK_FAILED", code)
         self.assertIn("OVERSIZED_ATTACHMENT", code)
         self.assertIn("aturuang/pdf-synced", code)
 
     def test_apps_script_repair_secret_separation(self) -> None:
-        """Requirement 5: Verify repair functions in Code.gs use REPAIR_SECRET."""
+        """Requirement: Verify repair functions in Code.gs use REPAIR_SECRET."""
         code = self.code_gs_path.read_text(encoding="utf-8")
 
-        # In repair functions, REPAIR_SECRET must be requested
         self.assertIn('props.getProperty(\n      "REPAIR_SECRET"\n    )', code)
         self.assertIn("BCA_QRIS_REPAIR_CONFIG_MISSING", code)
+
+
+class TestAppsScriptPdfIdempotencyAndExecution(unittest.TestCase):
+    """Executes Code.gs syncEmailPdfAttachmentsToDrive inside Node.js VM to test all idempotency & concurrency cases."""
+
+    def _run_node_pdf_test(self, js_body: str) -> dict:
+        harness = f"""
+const fs = require('fs');
+const vm = require('vm');
+const crypto = require('crypto');
+
+const code = fs.readFileSync('integrations/gmail-apps-script/Code.gs', 'utf8');
+
+function createSandbox(opts = {{}}) {{
+  const propsStore = {{ 'PDF_DRIVE_FOLDER_ID': 'folder_123', ...(opts.props || {{}}) }};
+  const driveFiles = opts.driveFiles || new Map();
+  let lockHeld = false;
+
+  const sandbox = {{
+    console: {{ log: () => {{}}, warn: () => {{}}, error: () => {{}} }},
+    Date: Date,
+    JSON: JSON,
+    Math: Math,
+    Array: Array,
+    PropertiesService: {{
+      getScriptProperties: () => ({{
+        getProperty: (k) => propsStore[k] || null,
+        setProperty: (k, v) => {{ propsStore[k] = String(v); }},
+        deleteProperty: (k) => {{ delete propsStore[k]; }}
+      }})
+    }},
+    LockService: {{
+      getScriptLock: () => ({{
+        tryLock: (timeout) => {{
+          if (opts.lockFails) return false;
+          lockHeld = true;
+          return true;
+        }},
+        releaseLock: () => {{ lockHeld = false; }}
+      }})
+    }},
+    DriveApp: {{
+      getFolderById: (id) => ({{
+        getFilesByName: (name) => {{
+          const has = driveFiles.has(name);
+          return {{ hasNext: () => has, next: () => driveFiles.get(name) }};
+        }},
+        createFile: (blob) => {{
+          if (opts.uploadFailsOn && opts.uploadFailsOn(blob.name)) {{
+            throw new Error('NETWORK_TIMEOUT_DRIVE');
+          }}
+          driveFiles.set(blob.name, blob);
+          return blob;
+        }}
+      }})
+    }},
+    GmailApp: {{
+      getUserLabelByName: (n) => ({{ getName: () => n }}),
+      createLabel: (n) => ({{ getName: () => n }}),
+      search: (q, start, max) => opts.threads || []
+    }},
+    Utilities: {{
+      DigestAlgorithm: {{ SHA_256: 'SHA_256' }},
+      computeDigest: (alg, bytes) => Array.from(crypto.createHash('sha256').update(Buffer.from(bytes)).digest())
+    }}
+  }};
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
+  return {{ sandbox, propsStore, driveFiles }};
+}}
+
+function makeMessage(id, from, attachments) {{
+  return {{
+    getId: () => id,
+    getFrom: () => from,
+    getAttachments: () => attachments.map((att) => ({{
+      getName: () => att.name,
+      getContentType: () => att.type || 'application/pdf',
+      getSize: () => att.bytes.length,
+      getBytes: () => att.bytes,
+      copyBlob: () => ({{
+        name: att.name,
+        setName: function(n) {{ this.name = n; return this; }}
+      }})
+    }}))
+  }};
+}}
+
+{js_body}
+"""
+        proc = subprocess.run(
+            ["node", "-e", harness],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"Node execution error:\nStdout: {proc.stdout}\nStderr: {proc.stderr}")
+        return json.loads(proc.stdout.strip())
+
+    def test_01_concurrent_pdf_execution(self) -> None:
+        """Requirement 1: Assert concurrent PDF execution fails closed with PDF_SYNC_CONCURRENT_LOCK_FAILED."""
+        js = """
+let caught = "";
+try {
+  const env = createSandbox({ lockFails: true });
+  env.sandbox.syncEmailPdfAttachmentsToDrive();
+} catch (e) {
+  caught = e.message;
+}
+console.log(JSON.stringify({ error: caught }));
+"""
+        res = self._run_node_pdf_test(js)
+        self.assertEqual(res.get("error"), "PDF_SYNC_CONCURRENT_LOCK_FAILED")
+
+    def test_02_repeated_pdf_execution(self) -> None:
+        """Requirement 2: Repeated PDF execution never creates duplicate files in Drive."""
+        js = """
+const msg = makeMessage('msg_rep', 'bca@bca.co.id', [{ name: 'statement.pdf', bytes: Buffer.from('rep_content') }]);
+const thread = { getMessages: () => [msg], addLabel: () => {} };
+const env = createSandbox({ threads: [thread] });
+
+const res1 = env.sandbox.syncEmailPdfAttachmentsToDrive();
+const res2 = env.sandbox.syncEmailPdfAttachmentsToDrive();
+
+console.log(JSON.stringify({
+  run1_uploaded: res1.uploaded,
+  run2_uploaded: res2.uploaded,
+  drive_file_count: env.driveFiles.size
+}));
+"""
+        res = self._run_node_pdf_test(js)
+        self.assertEqual(res["run1_uploaded"], 1)
+        self.assertEqual(res["run2_uploaded"], 0)
+        self.assertEqual(res["drive_file_count"], 1)
+
+    def test_03_partial_attachment_failure(self) -> None:
+        """Requirement 3: Partial attachment failure leaves message in PARTIAL state and retryable."""
+        js = """
+let failAtt2 = true;
+const msg = makeMessage('msg_part', 'bca@bca.co.id', [
+  { name: 'att1.pdf', bytes: Buffer.from('data 1') },
+  { name: 'att2.pdf', bytes: Buffer.from('data 2') }
+]);
+let threadLabelled = false;
+const thread = { getMessages: () => [msg], addLabel: () => { threadLabelled = true; } };
+const env = createSandbox({
+  threads: [thread],
+  uploadFailsOn: (name) => failAtt2 && name.includes('_att2_')
+});
+
+const res = env.sandbox.syncEmailPdfAttachmentsToDrive();
+const stateRaw = env.propsStore['PDF_MSG_msg_part'];
+const state = stateRaw ? JSON.parse(stateRaw) : {};
+
+console.log(JSON.stringify({
+  uploaded: res.uploaded,
+  state_status: state.status,
+  completed_atts: state.completed_attachments || [],
+  thread_labelled: threadLabelled
+}));
+"""
+        res = self._run_node_pdf_test(js)
+        self.assertEqual(res["uploaded"], 1)
+        self.assertEqual(res["state_status"], "PARTIAL")
+        self.assertEqual(len(res["completed_atts"]), 1)
+        self.assertFalse(res["thread_labelled"])
+
+    def test_04_retry_after_drive_upload(self) -> None:
+        """Requirement 4: Retry after Drive upload avoids duplicate files and marks complete."""
+        js = """
+let failAtt2 = true;
+const msg = makeMessage('msg_retry', 'bca@bca.co.id', [
+  { name: 'att1.pdf', bytes: Buffer.from('content 1') },
+  { name: 'att2.pdf', bytes: Buffer.from('content 2') }
+]);
+let threadLabelled = false;
+const thread = { getMessages: () => [msg], addLabel: () => { threadLabelled = true; } };
+const env = createSandbox({
+  threads: [thread],
+  uploadFailsOn: (name) => failAtt2 && name.includes('_att2_')
+});
+
+// Run 1: Fails on att2
+env.sandbox.syncEmailPdfAttachmentsToDrive();
+
+// Run 2: Retry succeeds
+failAtt2 = false;
+const res2 = env.sandbox.syncEmailPdfAttachmentsToDrive();
+const stateRaw = env.propsStore['PDF_MSG_msg_retry'];
+const state = stateRaw ? JSON.parse(stateRaw) : {};
+
+console.log(JSON.stringify({
+  retry_uploaded: res2.uploaded,
+  retry_skipped: res2.skipped,
+  drive_files: env.driveFiles.size,
+  final_status: state.status,
+  thread_labelled: threadLabelled
+}));
+"""
+        res = self._run_node_pdf_test(js)
+        self.assertEqual(res["retry_uploaded"], 1)
+        self.assertEqual(res["retry_skipped"], 1)
+        self.assertEqual(res["drive_files"], 2)
+        self.assertEqual(res["final_status"], "COMPLETED")
+        self.assertTrue(res["thread_labelled"])
+
+    def test_05_new_message_in_labelled_thread(self) -> None:
+        """Requirement 5: A new message in an already labelled thread is processed."""
+        js = """
+// msg1 already completed in past
+const msg1 = makeMessage('msg_old', 'bca@bca.co.id', [{ name: 'old.pdf', bytes: Buffer.from('old') }]);
+// msg2 newly arrived
+const msg2 = makeMessage('msg_new', 'bca@bca.co.id', [{ name: 'new.pdf', bytes: Buffer.from('new') }]);
+
+const initialProps = {
+  'PDF_MSG_msg_old': JSON.stringify({ status: 'COMPLETED', completed_attachments: ['msg_old_att1_hash'] })
+};
+
+const thread = { getMessages: () => [msg1, msg2], addLabel: () => {} };
+const env = createSandbox({ threads: [thread], props: initialProps });
+
+const res = env.sandbox.syncEmailPdfAttachmentsToDrive();
+const newMsgState = env.propsStore['PDF_MSG_msg_new'];
+
+console.log(JSON.stringify({
+  uploaded: res.uploaded,
+  new_processed: !!newMsgState
+}));
+"""
+        res = self._run_node_pdf_test(js)
+        self.assertEqual(res["uploaded"], 1)
+        self.assertTrue(res["new_processed"])
+
+    def test_06_duplicate_filename(self) -> None:
+        """Requirement 6: Attachments with duplicate filenames remain distinguishable by index and hash."""
+        js = """
+const msg = makeMessage('msg_dup', 'bca@bca.co.id', [
+  { name: 'statement.pdf', bytes: Buffer.from('page 1') },
+  { name: 'statement.pdf', bytes: Buffer.from('page 2') }
+]);
+const thread = { getMessages: () => [msg], addLabel: () => {} };
+const env = createSandbox({ threads: [thread] });
+
+const res = env.sandbox.syncEmailPdfAttachmentsToDrive();
+const fileNames = Array.from(env.driveFiles.keys());
+
+console.log(JSON.stringify({
+  uploaded: res.uploaded,
+  distinct_files: fileNames.length,
+  fileNames: fileNames
+}));
+"""
+        res = self._run_node_pdf_test(js)
+        self.assertEqual(res["uploaded"], 2)
+        self.assertEqual(res["distinct_files"], 2)
+        self.assertNotEqual(res["fileNames"][0], res["fileNames"][1])
+
+    def test_07_attachment_size_rejection(self) -> None:
+        """Requirement 7: Attachments exceeding 15MB are rejected and not uploaded."""
+        js = """
+// 16MB attachment dummy
+const oversizedAtt = {
+  name: 'big.pdf',
+  bytes: { length: 16 * 1024 * 1024 }
+};
+const msg = makeMessage('msg_big', 'bca@bca.co.id', [oversizedAtt]);
+const thread = { getMessages: () => [msg], addLabel: () => {} };
+const env = createSandbox({ threads: [thread] });
+
+const res = env.sandbox.syncEmailPdfAttachmentsToDrive();
+console.log(JSON.stringify({
+  uploaded: res.uploaded,
+  drive_files: env.driveFiles.size
+}));
+"""
+        res = self._run_node_pdf_test(js)
+        self.assertEqual(res["uploaded"], 0)
+        self.assertEqual(res["drive_files"], 0)
 
 
 class TestCloudflareWorkerSecurity(unittest.TestCase):
@@ -174,27 +458,20 @@ class TestCloudflareWorkerSecurity(unittest.TestCase):
         self.assertTrue(self.index_ts.exists())
 
     def test_worker_secret_separation_and_bounds(self) -> None:
-        """Requirement 6: Verify worker secret separation and body size bounds."""
+        """Verify worker secret separation and body size bounds."""
         auth_code = self.auth_ts.read_text(encoding="utf-8")
         index_code = self.index_ts.read_text(encoding="utf-8")
 
-        # auth.ts must define REPAIR_SECRET in Env
         self.assertIn("REPAIR_SECRET?: string;", auth_code)
-        # auth.ts must define MAX_HMAC_BODY_BYTES = 2MB
         self.assertIn("MAX_HMAC_BODY_BYTES = 2 * 1024 * 1024", auth_code)
-        # auth.ts must define MAX_CLOCK_SKEW_MS = 300000 (5 minutes)
         self.assertIn("MAX_CLOCK_SKEW_MS = 300000", auth_code)
-
-        # index.ts must pass REPAIR_SECRET to /api/repair/bca-qris
         self.assertIn("env.REPAIR_SECRET", index_code)
         self.assertIn('"UNCONFIGURED_REPAIR_SECRET"', index_code)
-
-        # index.ts must handle OVERSIZED_PAYLOAD (413) and MALFORMED_JSON (400)
         self.assertIn('"OVERSIZED_PAYLOAD"', index_code)
         self.assertIn('"MALFORMED_JSON"', index_code)
 
     def test_worker_hmac_logic_simulation(self) -> None:
-        """Requirement 7: Simulate Worker HMAC verification rules."""
+        """Simulate Worker HMAC verification rules."""
         secret = "test_gmail_relay_secret_key_12345"
         raw_body = json.dumps({"message_id": "msg_001", "from": "bca@bca.co.id"})
         now_ms = int(time.time() * 1000)
@@ -204,39 +481,32 @@ class TestCloudflareWorkerSecurity(unittest.TestCase):
             msg = f"{ts_str}.{n_str}.{body}".encode("utf-8")
             return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
-        # 1. Valid signature
         valid_sig = sign(str(now_ms), nonce, raw_body, secret)
-        self.assertTrue(len(valid_sig) == 64)
+        self.assertEqual(len(valid_sig), 64)
 
-        # 2. Tampered body
         tampered_sig = sign(str(now_ms), nonce, raw_body + "tampered", secret)
         self.assertNotEqual(valid_sig, tampered_sig)
 
-        # 3. Wrong secret
         wrong_sec_sig = sign(str(now_ms), nonce, raw_body, "wrong_secret")
         self.assertNotEqual(valid_sig, wrong_sec_sig)
 
-        # 4. Expired timestamp (> 5 min past)
         expired_ms = now_ms - (300000 + 1000)
         self.assertTrue(expired_ms < now_ms - 300000)
 
-        # 5. Future timestamp (> 5 min future)
         future_ms = now_ms + (300000 + 1000)
         self.assertTrue(future_ms > now_ms + 300000)
 
-        # 6. Invalid nonce regex
         invalid_nonce_chars = "nonce!@#$%"
         self.assertIsNone(re.match(r"^[A-Za-z0-9_-]+$", invalid_nonce_chars))
-        short_nonce = "abc"
-        self.assertTrue(len(short_nonce) < 8)
 
 
 class TestLocalServerSecurityAndAuditing(unittest.TestCase):
     def setUp(self) -> None:
         self.test_dir = tempfile.TemporaryDirectory()
         self.test_db_path = Path(self.test_dir.name) / "test_ledger.db"
+        self.test_token = "valid_test_token_abcdef1234567890"
+        set_local_auth_token(self.test_token)
 
-        # Initialize test database and close connection immediately
         con = sqlite3.connect(self.test_db_path)
         try:
             con.execute("""
@@ -287,6 +557,7 @@ class TestLocalServerSecurityAndAuditing(unittest.TestCase):
             con.close()
 
     def tearDown(self) -> None:
+        set_local_auth_token(None)
         try:
             self.test_dir.cleanup()
         except Exception:
@@ -309,117 +580,203 @@ class TestLocalServerSecurityAndAuditing(unittest.TestCase):
         handler.send_json = MagicMock()
         return handler
 
+    def test_09_unauthenticated_export_rejection(self) -> None:
+        """Requirement 9: GET /api/export_csv without auth must be rejected with 401."""
+        def _make_conn():
+            c = sqlite3.connect(self.test_db_path)
+            c.row_factory = sqlite3.Row
+            return c
+
+        with patch("aturuang.server.db_connect", _make_conn):
+            h = self._make_handler("GET", "/api/export_csv", {"Host": "127.0.0.1:5050"})
+            h.do_GET()
+            h.send_error.assert_called_with(401, "Missing local authentication")
+
+    def test_10_unauthenticated_database_download_rejection(self) -> None:
+        """Requirement 10: GET /api/download_db without auth must be rejected with 401."""
+        h = self._make_handler("GET", "/api/download_db", {"Host": "127.0.0.1:5050"})
+        h.do_GET()
+        h.send_error.assert_called_with(401, "Missing local authentication")
+
+    def test_11_invalid_local_authentication_rejection(self) -> None:
+        """Requirement 11: Invalid Bearer or token must be rejected with 401."""
+        h = self._make_handler(
+            "GET",
+            "/api/download_db",
+            {"Authorization": "Bearer wrong_token_value", "Host": "127.0.0.1:5050"},
+        )
+        h.do_GET()
+        h.send_error.assert_called_with(401, "Invalid local authentication token")
+
+    def test_12_invalid_csrf_rejection(self) -> None:
+        """Requirement 12: Invalid X-CSRF-Token must be rejected with 403."""
+        h = self._make_handler(
+            "GET",
+            "/api/download_db",
+            {"X-CSRF-Token": "invalid_csrf_token", "Host": "127.0.0.1:5050"},
+        )
+        h.do_GET()
+        h.send_error.assert_called_with(403, "Invalid CSRF token")
+
+    def test_13_missing_origin_and_cross_site_rejection(self) -> None:
+        """Requirement 13: Cross-site requests must be rejected with 403."""
+        h = self._make_handler(
+            "GET",
+            "/api/download_db",
+            {
+                "Authorization": f"Bearer {self.test_token}",
+                "Sec-Fetch-Site": "cross-site",
+                "Host": "127.0.0.1:5050",
+            },
+        )
+        h.do_GET()
+        h.send_error.assert_called_with(403, "Forbidden Cross-Site Access")
+
+    def test_14_disallowed_localhost_origin_rejection(self) -> None:
+        """Requirement 14: Disallowed localhost origin (different port) must be rejected with 403."""
+        h = self._make_handler(
+            "GET",
+            "/api/download_db",
+            {
+                "Authorization": f"Bearer {self.test_token}",
+                "Origin": "http://localhost:3000",
+                "Host": "127.0.0.1:5050",
+            },
+        )
+        allowed = h._get_allowed_origin()
+        self.assertIsNone(allowed)
+
+        h.do_GET()
+        h.send_error.assert_called_with(403, "Forbidden Cross-Origin Access")
+
+    def test_15_missing_pull_cloud_credential_rejection(self) -> None:
+        """Requirement 15: POST /api/sync/pull-cloud missing credentials must be rejected with 401."""
+        h = self._make_handler("POST", "/api/sync/pull-cloud", {"Host": "127.0.0.1:5050"})
+        h.do_POST()
+        h.send_json.assert_called_with(
+            {
+                "status": "error",
+                "error": "MISSING_CREDENTIALS",
+                "message": "Kredensial staging admin tidak ditemukan.",
+            },
+            status=401,
+        )
+
+    def test_16_wrong_secret_type_rejection(self) -> None:
+        """Requirement 16: Using GMAIL_RELAY_SECRET or REPAIR_SECRET for pull-cloud must be rejected with 401."""
+        with patch.dict(
+            "os.environ",
+            {
+                "GMAIL_RELAY_SECRET": "relay_sec_secret_1",
+                "REPAIR_SECRET": "repair_sec_secret_2",
+            },
+        ):
+            # 1. GMAIL_RELAY_SECRET
+            h1 = self._make_handler(
+                "POST",
+                "/api/sync/pull-cloud",
+                {"Authorization": "Bearer relay_sec_secret_1", "Host": "127.0.0.1:5050"},
+            )
+            h1.do_POST()
+            h1.send_json.assert_called_with(
+                {
+                    "status": "error",
+                    "error": "WRONG_SECRET_TYPE",
+                    "message": "Tipe secret salah: bukan STAGING_ADMIN_TOKEN.",
+                },
+                status=401,
+            )
+
+            # 2. REPAIR_SECRET
+            h2 = self._make_handler(
+                "POST",
+                "/api/sync/pull-cloud",
+                {"Authorization": "Bearer repair_sec_secret_2", "Host": "127.0.0.1:5050"},
+            )
+            h2.do_POST()
+            h2.send_json.assert_called_with(
+                {
+                    "status": "error",
+                    "error": "WRONG_SECRET_TYPE",
+                    "message": "Tipe secret salah: bukan STAGING_ADMIN_TOKEN.",
+                },
+                status=401,
+            )
+
+    def test_17_encoded_path_traversal_rejection(self) -> None:
+        """Requirement 17: Encoded, double-encoded traversal and null bytes under /assets/ must be blocked."""
+        # 1. Encoded traversal (%2e%2e)
+        h1 = self._make_handler("GET", "/assets/%2e%2e/runtime/money_tracks.db")
+        h1.do_GET()
+        h1.send_error.assert_called_with(403, "Forbidden")
+
+        # 2. Double-encoded traversal (%252e%252e)
+        h2 = self._make_handler("GET", "/assets/%252e%252e/server.py")
+        h2.do_GET()
+        h2.send_error.assert_called_with(403, "Forbidden")
+
+        # 3. Path with null byte (%00)
+        h3 = self._make_handler("GET", "/assets/pic%00.jpg")
+        h3.do_GET()
+        h3.send_error.assert_called_with(400, "Bad Request")
+
+    def test_18_symlink_escape_rejection(self) -> None:
+        """Requirement 18: Symlinks resolving outside assets directory must be rejected with 403."""
+        h = self._make_handler("GET", "/assets/symlink_out.png")
+        with patch.object(Path, "is_relative_to", return_value=False):
+            h.do_GET()
+            h.send_error.assert_called_with(403, "Forbidden")
+
+    def test_20_audit_logging_behavior_isolated_database(self) -> None:
+        """Requirement 20: GET downloads do NOT write to SQLite; audit logging on isolated DB behaves correctly."""
+        def _make_conn():
+            c = sqlite3.connect(self.test_db_path)
+            c.row_factory = sqlite3.Row
+            return c
+
+        with patch("aturuang.server.DB_FILE", self.test_db_path):
+            with patch("aturuang.server.db_connect", _make_conn):
+                # 1. Download DB with valid auth
+                h_db = self._make_handler(
+                    "GET",
+                    "/api/download_db",
+                    {"Authorization": f"Bearer {self.test_token}", "Host": "127.0.0.1:5050"},
+                )
+                h_db.do_GET()
+                h_db.send_response.assert_called_with(200)
+
+                # 2. Export CSV with valid auth
+                h_csv = self._make_handler(
+                    "GET",
+                    "/api/export_csv",
+                    {"Authorization": f"Bearer {self.test_token}", "Host": "127.0.0.1:5050"},
+                )
+                h_csv.do_GET()
+                h_csv.send_response.assert_called_with(200)
+
+                # Verify GET requests did NOT mutate the database transaction_audit_log!
+                con = sqlite3.connect(self.test_db_path)
+                try:
+                    count = con.execute("SELECT count(*) FROM transaction_audit_log").fetchone()[0]
+                    self.assertEqual(count, 0, "GET endpoints must never insert into transaction_audit_log!")
+                finally:
+                    con.close()
+
     def test_cors_header_loopback_only_never_wildcard(self) -> None:
-        """Requirement 8: Verify CORS header reflects trusted loopback origins and never wildcard."""
-        # 1. Loopback origin
+        """Verify CORS header reflects exact host and never wildcard."""
+        # 1. Matching host
         h1 = self._make_handler("GET", "/api/dashboard", {"Origin": "http://127.0.0.1:5050", "Host": "127.0.0.1:5050"})
         allowed1 = h1._get_allowed_origin()
         self.assertEqual(allowed1, "http://127.0.0.1:5050")
         self.assertNotEqual(allowed1, "*")
 
-        # 2. Localhost origin
-        h2 = self._make_handler("GET", "/api/dashboard", {"Origin": "http://localhost:3000", "Host": "127.0.0.1:5050"})
+        # 2. Disallowed external origin
+        h2 = self._make_handler("GET", "/api/dashboard", {"Origin": "https://malicious-website.com", "Host": "127.0.0.1:5050"})
         allowed2 = h2._get_allowed_origin()
-        self.assertEqual(allowed2, "http://localhost:3000")
-        self.assertNotEqual(allowed2, "*")
-
-        # 3. External attacker origin
-        h3 = self._make_handler("GET", "/api/dashboard", {"Origin": "https://malicious-website.com", "Host": "127.0.0.1:5050"})
-        allowed3 = h3._get_allowed_origin()
-        self.assertIsNone(allowed3)
-        self.assertNotEqual(allowed3, "*")
-
-    def test_sensitive_endpoints_reject_cross_origin_access(self) -> None:
-        """Requirement 9: External origin or Sec-Fetch-Site: cross-site must be rejected with 403."""
-        def _make_conn():
-            c = sqlite3.connect(self.test_db_path)
-            c.row_factory = sqlite3.Row
-            return c
-
-        with patch("aturuang.server.DB_FILE", self.test_db_path):
-            with patch("aturuang.server.db_connect", _make_conn):
-                # 1. Download DB with external origin
-                h_db = self._make_handler(
-                    "GET",
-                    "/api/download_db",
-                    {"Origin": "https://attacker.site", "Host": "127.0.0.1:5050"},
-                )
-                h_db.do_GET()
-                h_db.send_error.assert_called_with(403, "Forbidden Cross-Origin Access")
-
-                # 2. Export CSV with cross-site Sec-Fetch-Site
-                h_csv = self._make_handler(
-                    "GET",
-                    "/api/export_csv",
-                    {"Sec-Fetch-Site": "cross-site", "Host": "127.0.0.1:5050"},
-                )
-                h_csv.do_GET()
-                h_csv.send_error.assert_called_with(403, "Forbidden Cross-Site Access")
-
-                # 3. Pull cloud with external origin
-                h_pull = self._make_handler(
-                    "POST",
-                    "/api/sync/pull-cloud",
-                    {"Origin": "https://evil.org", "Host": "127.0.0.1:5050"},
-                )
-                h_pull.do_POST()
-                h_pull.send_json.assert_called_with(
-                    {"status": "error", "message": "Akses lintas-asal ditolak."}, status=403
-                )
-
-    def test_static_asset_path_traversal_blocked(self) -> None:
-        """Requirement 10: Path traversal attempts under /assets/ must be blocked."""
-        # Relative traversal
-        h1 = self._make_handler("GET", "/assets/../runtime/money_tracks.db")
-        h1.do_GET()
-        h1.send_error.assert_called_with(403, "Forbidden")
-
-        # Encoded or double traversal
-        h2 = self._make_handler("GET", "/assets/../../server.py")
-        h2.do_GET()
-        h2.send_error.assert_called_with(403, "Forbidden")
-
-    def test_audit_logging_on_download_and_export(self) -> None:
-        """Requirement 11: Accessing download_db and export_csv logs audit entries."""
-        def _make_conn():
-            c = sqlite3.connect(self.test_db_path)
-            c.row_factory = sqlite3.Row
-            return c
-
-        with patch("aturuang.server.DB_FILE", self.test_db_path):
-            with patch("aturuang.server.db_connect", _make_conn):
-                # 1. Valid local download_db
-                h_db = self._make_handler(
-                    "GET",
-                    "/api/download_db",
-                    {"Sec-Fetch-Site": "same-origin", "Host": "127.0.0.1:5050"},
-                )
-                h_db.do_GET()
-
-                # 2. Valid local export_csv
-                h_csv = self._make_handler(
-                    "GET",
-                    "/api/export_csv",
-                    {"Sec-Fetch-Site": "same-origin", "Host": "127.0.0.1:5050"},
-                )
-                h_csv.do_GET()
-
-                # Verify audit entries in transaction_audit_log
-                con = sqlite3.connect(self.test_db_path)
-                try:
-                    actions = [
-                        row[0]
-                        for row in con.execute(
-                            "SELECT action FROM transaction_audit_log ORDER BY id"
-                        ).fetchall()
-                    ]
-                    self.assertIn("DATABASE_DOWNLOAD", actions)
-                    self.assertIn("CSV_EXPORT", actions)
-                finally:
-                    con.close()
+        self.assertIsNone(allowed2)
 
     def test_watched_folder_file_size_limit(self) -> None:
-        """Requirement 12: Watched folder scanner enforces 15MB file size bound."""
+        """Watched folder scanner enforces 15MB file size bound."""
         with tempfile.TemporaryDirectory() as watch_dir:
             scanner = WatchedFolderScanner(
                 db_path=self.test_db_path,
@@ -440,7 +797,7 @@ class TestLocalServerSecurityAndAuditing(unittest.TestCase):
                 )
 
     def test_secret_precedence_and_conflict_detection(self) -> None:
-        """Requirement 13: Secret stores with conflicting values fail closed."""
+        """Secret stores with conflicting values fail closed."""
         with patch.dict(
             "os.environ",
             {

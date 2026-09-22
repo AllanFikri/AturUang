@@ -428,6 +428,18 @@ class SafeApplyEngine:
     def init_schema(self) -> None:
         """Ensures required tables for ledger, idempotency, and audit trail exist."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.db_path.exists() and self.db_path.stat().st_size > 0:
+            con_chk = sqlite3.connect(self.db_path)
+            try:
+                tables = {r[0] for r in con_chk.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                required = {"transactions", "safe_apply_journal", "source_evidence_payloads", "review_queue_items"}
+                if required.issubset(tables):
+                    return
+            except Exception:
+                pass
+            finally:
+                con_chk.close()
+
         con = sqlite3.connect(self.db_path, isolation_level=None)
         try:
             con.execute("PRAGMA foreign_keys=ON")

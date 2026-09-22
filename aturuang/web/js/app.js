@@ -416,8 +416,24 @@ function setFieldError(inputEl, msg) {
   inputEl.addEventListener('change', onClean);
 }
 
+function getLocalCsrfToken() {
+  if (typeof document !== 'undefined') {
+    const meta = document.querySelector('meta[name="aturuang-csrf-token"]');
+    if (meta && meta.content) return meta.content;
+  }
+  if (typeof window !== 'undefined' && window.__ATURUANG_CSRF__) {
+    return window.__ATURUANG_CSRF__;
+  }
+  return '';
+}
+
 async function api(url, opt = {}) {
   const headers = { ...(opt.headers || {}) };
+  const token = getLocalCsrfToken();
+  if (token) {
+    if (!headers['X-CSRF-Token']) headers['X-CSRF-Token'] = token;
+    if (!headers['X-AturUang-Auth']) headers['X-AturUang-Auth'] = token;
+  }
   if (opt.method && opt.method.toUpperCase() === 'POST') {
     if (!headers['Idempotency-Key'] && !headers['idempotency-key']) {
       const key = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : ('idemp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8));
@@ -1779,11 +1795,13 @@ async function deleteCurrentTx() {
 }
 
 function exportCSV() {
-  location.href = '/api/export_csv';
+  const token = getLocalCsrfToken();
+  location.href = '/api/export_csv' + (token ? '?token=' + encodeURIComponent(token) : '');
 }
 
 function downloadDB() {
-  location.href = '/api/download_db';
+  const token = getLocalCsrfToken();
+  location.href = '/api/download_db' + (token ? '?token=' + encodeURIComponent(token) : '');
 }
 
 async function loadBudget() {
@@ -4328,10 +4346,24 @@ async function pullFromCloud() {
     badge.style.color = '#38bdf8';
   }
   try {
+    let token = '';
+    if (typeof localStorage !== 'undefined') {
+      token = localStorage.getItem('aturuang_staging_token') || '';
+    }
+    if (!token && typeof prompt !== 'undefined') {
+      token = prompt('Masukkan Staging Admin Token:');
+      if (token && typeof localStorage !== 'undefined') {
+        localStorage.setItem('aturuang_staging_token', token.trim());
+      }
+    }
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) {
+      headers['Authorization'] = 'Bearer ' + token.trim();
+    }
     const res = await api('/api/sync/pull-cloud', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      headers,
+      body: JSON.stringify({ staging_admin_token: token ? token.trim() : '' }),
     });
     if (res && res.status === 'success') {
       const count = res.staged_count || 0;
