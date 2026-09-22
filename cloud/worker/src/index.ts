@@ -82,12 +82,19 @@ export default {
       const hmacCheck = await verifyGmailHmac(request, rawBody, env.GMAIL_RELAY_SECRET, env.DB);
       if (!hmacCheck.valid) {
         const errCode = hmacCheck.error || "HMAC_VERIFICATION_FAILED";
-        const statusCode = errCode === "REPLAY_GUARD_UNAVAILABLE" ? 503 : 401;
+        const statusCode =
+          errCode === "REPLAY_GUARD_UNAVAILABLE"
+            ? 503
+            : errCode === "OVERSIZED_PAYLOAD"
+            ? 413
+            : 401;
         const errMsg =
           errCode === "REPLAY_GUARD_UNAVAILABLE"
             ? "Layanan proteksi replay D1 tidak tersedia."
             : errCode === "NONCE_REPLAY"
             ? "Nonce replay terdeteksi."
+            : errCode === "OVERSIZED_PAYLOAD"
+            ? "Ukuran payload melebihi batas 2MB."
             : "Otentikasi Gmail relay ditolak.";
 
         return new Response(
@@ -100,8 +107,21 @@ export default {
         );
       }
 
+      let payload: any;
       try {
-        const payload = JSON.parse(rawBody);
+        payload = JSON.parse(rawBody);
+      } catch {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            code: "MALFORMED_JSON",
+            message: "Payload bukan format JSON yang valid.",
+          }),
+          { status: 400, headers: getSecurityHeaders() }
+        );
+      }
+
+      try {
         const { message_id, from, subject, body, internal_date } = payload;
 
         if (!message_id) {
@@ -477,8 +497,9 @@ export default {
       const hmacCheck = await verifyGmailHmac(
         request,
         rawBody,
-        env.GMAIL_RELAY_SECRET,
-        env.DB
+        env.REPAIR_SECRET,
+        env.DB,
+        "UNCONFIGURED_REPAIR_SECRET"
       );
 
       if (!hmacCheck.valid) {
@@ -489,6 +510,8 @@ export default {
         const statusCode =
           errCode === "REPLAY_GUARD_UNAVAILABLE"
             ? 503
+            : errCode === "OVERSIZED_PAYLOAD"
+            ? 413
             : 401;
 
         return new Response(

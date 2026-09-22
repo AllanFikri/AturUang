@@ -4,10 +4,14 @@ export interface Env {
   MODE?: string;
   STAGING_ADMIN_TOKEN?: string;
   GMAIL_RELAY_SECRET?: string;
+  REPAIR_SECRET?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_SECRET_TOKEN?: string;
   TELEGRAM_ALLOWED_USER_ID?: string;
 }
+
+export const MAX_HMAC_BODY_BYTES = 2 * 1024 * 1024; // 2MB strict bound
+export const MAX_CLOCK_SKEW_MS = 300000; // 5 minutes strict window
 
 export function getSecurityHeaders(): HeadersInit {
   return {
@@ -82,6 +86,8 @@ export const TRUSTED_SECONDARY_GMAIL_SENDERS = new Set<string>([
   "info@shopee.co.id",
   "info@mail.shopee.co.id",
   "noreply@cx.byu.id",
+  "noreply@stockbit.com",
+  "contactus@stockbit.com",
 ]);
 
 export function extractCleanEmailAddress(fromHeader: string): string {
@@ -107,15 +113,21 @@ export async function verifyGmailHmac(
   request: Request,
   rawBody: string,
   secret?: string,
-  db?: D1Database
+  db?: D1Database,
+  missingSecretErrorCode: string = "UNCONFIGURED_GMAIL_SECRET"
 ): Promise<{ valid: boolean; error?: string }> {
-  // 1. Validasi secret
-  const cleanSecret = (secret || "").trim();
-  if (!cleanSecret) {
-    return { valid: false, error: "UNCONFIGURED_GMAIL_SECRET" };
+  // 1. Validasi body size
+  if (typeof rawBody === "string" && rawBody.length > MAX_HMAC_BODY_BYTES) {
+    return { valid: false, error: "OVERSIZED_PAYLOAD" };
   }
 
-  // 2. Validasi required headers
+  // 2. Validasi secret
+  const cleanSecret = (secret || "").trim();
+  if (!cleanSecret) {
+    return { valid: false, error: missingSecretErrorCode };
+  }
+
+  // 3. Validasi required headers
   const signature = request.headers.get("X-Signature") || "";
   const timestampStr = request.headers.get("X-Timestamp") || "";
   const nonce = request.headers.get("X-Nonce") || "";
@@ -124,15 +136,23 @@ export async function verifyGmailHmac(
     return { valid: false, error: "MISSING_HMAC_HEADERS" };
   }
 
-  // 3. Validasi timestamp / tolerance window (5 menit)
+  // 4. Validasi nonce format
+  if (nonce.length < 8 || nonce.length > 64 || !/^[A-Za-z0-9_-]+$/.test(nonce)) {
+    return { valid: false, error: "INVALID_NONCE" };
+  }
+
+  // 5. Validasi timestamp / tolerance window (5 menit, past and future)
   const timestamp = parseInt(timestampStr, 10);
-  if (isNaN(timestamp)) {
+  if (isNaN(timestamp) || !Number.isInteger(timestamp)) {
     return { valid: false, error: "INVALID_TIMESTAMP" };
   }
 
   const now = Date.now();
-  if (Math.abs(now - timestamp) > 300000) {
+  if (timestamp < now - MAX_CLOCK_SKEW_MS) {
     return { valid: false, error: "EXPIRED_TIMESTAMP" };
+  }
+  if (timestamp > now + MAX_CLOCK_SKEW_MS) {
+    return { valid: false, error: "FUTURE_TIMESTAMP" };
   }
 
   // 4. Hitung expected HMAC-SHA256
