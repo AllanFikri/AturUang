@@ -515,8 +515,7 @@ def sync_edge_inbox(
         if apply_engine is None:
             try:
                 from aturuang.safe_apply import SafeApplyEngine
-                composer = get_composer()
-                bdir = composer.backup_dir if composer else target_db.parent / "backups"
+                bdir = target_db.parent / "backups"
                 apply_engine = SafeApplyEngine(target_db, backup_dir=bdir)
             except Exception:
                 apply_engine = None
@@ -524,12 +523,8 @@ def sync_edge_inbox(
         if review_manager is None:
             try:
                 from aturuang.review_queue_ui import ReviewQueueManager
-                composer = get_composer()
-                if composer and hasattr(composer, "review_manager") and composer.review_manager:
-                    review_manager = composer.review_manager
-                else:
-                    bdir = composer.backup_dir if composer else target_db.parent / "backups"
-                    review_manager = ReviewQueueManager(target_db, backup_dir=bdir)
+                bdir = target_db.parent / "backups"
+                review_manager = ReviewQueueManager(target_db, backup_dir=bdir)
             except Exception:
                 review_manager = None
 

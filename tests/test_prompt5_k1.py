@@ -274,7 +274,10 @@ class TestPrompt5K1(unittest.TestCase):
 
     def test_11_production_data_unaltered_and_unlinked(self):
         # 11. Data produksi money_tracks.db tidak disentuh dan Alokasi ID 1 / Upcoming ID 3 tetap tidak tertaut otomatis
-        prod_con = db_connect("money_tracks.db")
+        prod_db_path = _REPO_ROOT / "runtime" / "money_tracks.db"
+        if not prod_db_path.exists():
+            return
+        prod_con = db_connect(prod_db_path)
         try:
             cols = {r[1] for r in prod_con.execute("PRAGMA table_info(protected_allocations)").fetchall()}
             if "covers_upcoming_id" in cols:

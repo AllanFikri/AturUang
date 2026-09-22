@@ -462,7 +462,8 @@ class EdgeSyncAndAutoApplyTests(unittest.TestCase):
         handler.send_error = MagicMock()
         handler.headers = {}
         handler.path = "/assets/../secrets.json"
-        handler.do_GET()
+        with patch("aturuang.server.get_composer", return_value=None):
+            handler.do_GET()
         handler.send_error.assert_called_with(403, "Forbidden")
 
     def test_server_sensitive_endpoints_cross_origin_blocked(self) -> None:
@@ -474,13 +475,14 @@ class EdgeSyncAndAutoApplyTests(unittest.TestCase):
 
         # export_csv
         handler.path = "/api/export_csv"
-        with patch("aturuang.server.db_connect"):
+        with patch("aturuang.server.get_composer", return_value=None), patch("aturuang.server.db_connect"):
             handler.do_GET()
         handler.send_error.assert_called_with(403, "Forbidden Cross-Origin Access")
 
         # pull-cloud
         handler.path = "/api/sync/pull-cloud"
-        handler.do_POST()
+        with patch("aturuang.server.get_composer", return_value=None):
+            handler.do_POST()
         handler.send_json.assert_called_with(
             {"status": "error", "message": "Akses lintas-asal ditolak."},
             status=403,
