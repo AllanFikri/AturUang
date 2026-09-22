@@ -4336,7 +4336,67 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-// --- Cloudflare Edge Inbox Sync ---
+// --- Cloudflare Edge Inbox Sync & Freshness Visibility ---
+async function fetchAndRenderSyncStatus() {
+  const badge = $('cloudSyncStatusBadge');
+  if (!badge) return;
+  try {
+    const res = await api('/api/sync/status', { method: 'GET' });
+    if (!res) return;
+    const status = (res.status || 'IDLE').toUpperCase();
+    const lastSynced = res.last_synced_at || res.last_sync_at;
+    const lastErr = res.last_error;
+    const isStale = !!res.is_stale;
+
+    let timeStr = '';
+    if (lastSynced) {
+      try {
+        const d = new Date(lastSynced);
+        timeStr = d.toLocaleDateString('id-ID') + ' ' + d.toLocaleTimeString('id-ID', { hour12: false }) + ' WIB';
+      } catch (_) {
+        timeStr = lastSynced + ' WIB';
+      }
+    }
+
+    if (status === 'PULLING') {
+      badge.textContent = 'Cloud: Menyinkronkan...';
+      badge.style.color = '#38bdf8';
+      badge.title = 'Sedang menarik bukti mutasi dari Cloudflare Edge...';
+    } else if (status === 'OK') {
+      if (isStale) {
+        badge.textContent = `Cloud: Terhubung (Usang - ${timeStr})`;
+        badge.style.color = '#eab308';
+        badge.title = `Sinkronisasi terakhir pada ${timeStr}. Data belum diperbarui lebih dari 30 menit.`;
+      } else {
+        badge.textContent = `Cloud: Sinkron (${timeStr})`;
+        badge.style.color = '#10b981';
+        badge.title = `Sinkronisasi terakhir pada ${timeStr}.`;
+      }
+    } else if (status === 'DISABLED') {
+      badge.textContent = 'Cloud: Nonaktif';
+      badge.style.color = '#94a3b8';
+      badge.title = lastErr ? `Auto-sync nonaktif (${lastErr})` : 'Worker URL atau token belum dikonfigurasi';
+    } else if (status === 'FAILED') {
+      const errLabel = lastErr || 'ERROR';
+      if (lastSynced) {
+        badge.textContent = `Cloud: Gagal (${errLabel}) - Data Usang`;
+        badge.style.color = '#ef4444';
+        badge.title = `Gagal menyinkronkan: ${errLabel}. Data terakhir ${timeStr} sudah usang.`;
+      } else {
+        badge.textContent = `Cloud: Gagal (${errLabel})`;
+        badge.style.color = '#ef4444';
+        badge.title = `Gagal menyinkronkan: ${errLabel}`;
+      }
+    } else {
+      badge.textContent = 'Cloud: Idle';
+      badge.style.color = 'var(--muted)';
+      badge.title = lastSynced ? `Terakhir sinkron: ${timeStr}` : 'Belum pernah sinkron';
+    }
+  } catch (e) {
+    console.warn('Failed to fetch sync status:', e);
+  }
+}
+
 async function pullFromCloud() {
   const btn = $('pullCloudBtn');
   const badge = $('cloudSyncStatusBadge');
@@ -4366,45 +4426,15 @@ async function pullFromCloud() {
       body: JSON.stringify({ staging_admin_token: token ? token.trim() : '' }),
     });
     if (res && res.status === 'success') {
-      const count = res.staged_count || 0;
-      const applied = res.auto_applied_count || 0;
-      if (badge) {
-        if (applied > 0) {
-          badge.textContent = `Cloud: Sinkron (${applied} auto-apply)`;
-        } else {
-          badge.textContent = `Cloud: Sinkron (${count} baru)`;
-        }
-        badge.style.color = '#10b981';
-        badge.title = `Berhasil menarik ${count} bukti. ${applied} transaksi diterapkan otomatis.`;
-      }
+      await fetchAndRenderSyncStatus();
       await load();
       if (state.page === 'transactions') await loadTransactions();
       if (state.page === 'review') await loadReviewQueue();
-    } else if (res && res.status === 'skipped') {
-      if (badge) {
-        badge.textContent = 'Cloud: Belum Dikonfigurasi';
-        badge.style.color = '#eab308';
-        badge.title = res.message || 'Worker URL atau secret belum dikonfigurasi';
-      }
-    } else if (res && res.status === 'unreachable') {
-      if (badge) {
-        badge.textContent = 'Cloud: Tidak Terjangkau';
-        badge.style.color = '#f97316';
-        badge.title = res.message || 'Tidak dapat terhubung ke Cloudflare Worker';
-      }
     } else {
-      if (badge) {
-        badge.textContent = 'Cloud: Gagal';
-        badge.style.color = '#ef4444';
-        badge.title = (res && res.message) ? res.message : 'Sinkronisasi cloud gagal';
-      }
+      await fetchAndRenderSyncStatus();
     }
   } catch (err) {
-    if (badge) {
-      badge.textContent = 'Cloud: Error';
-      badge.style.color = '#ef4444';
-      badge.title = err.message || 'Terjadi kesalahan sistem';
-    }
+    await fetchAndRenderSyncStatus();
     console.warn('Pull cloud sync failed:', err);
   } finally {
     if (btn) btn.disabled = false;
@@ -4413,3 +4443,9 @@ async function pullFromCloud() {
 
 // Initialize Quick Capture event bindings
 initQuickCapture();
+
+// Initialize Cloud Sync status and honest freshness monitoring
+if (typeof window !== 'undefined') {
+  fetchAndRenderSyncStatus();
+  setInterval(fetchAndRenderSyncStatus, 60000);
+}
