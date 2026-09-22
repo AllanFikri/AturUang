@@ -928,6 +928,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send_json({"reallocations": rows})
 
             if path == "/api/export_csv":
+                origin = (self.headers.get("Origin") or "").strip()
+                if origin and not self._get_allowed_origin():
+                    self.send_error(403, "Forbidden Cross-Origin Access")
+                    return
+                sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+                if sec_site and sec_site not in ("same-origin", "none", "same-site"):
+                    self.send_error(403, "Forbidden Cross-Site Access")
+                    return
+
                 rows = [rowdict(r) for r in con.execute("SELECT * FROM transactions WHERE is_deleted=0 ORDER BY date, time, id").fetchall()]
                 fields = [
                     "canonical_id", "date", "time", "transaction_type", "amount",
@@ -950,6 +959,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
 
             if path == "/api/download_db":
+                origin = (self.headers.get("Origin") or "").strip()
+                if origin and not self._get_allowed_origin():
+                    self.send_error(403, "Forbidden Cross-Origin Access")
+                    return
+                sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+                if sec_site and sec_site not in ("same-origin", "none", "same-site"):
+                    self.send_error(403, "Forbidden Cross-Site Access")
+                    return
+
                 body = DB_FILE.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
@@ -995,15 +1013,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json({"success": False, "error": "Scanner not initialized"}, 500)
 
         if path == "/api/sync/pull-cloud":
-            payload = {}
+            origin = (self.headers.get("Origin") or "").strip()
+            if origin and not self._get_allowed_origin():
+                return self.send_json({"status": "error", "message": "Akses lintas-asal ditolak."}, status=403)
+            sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if sec_site and sec_site not in ("same-origin", "none", "same-site"):
+                return self.send_json({"status": "error", "message": "Akses lintas-situs ditolak."}, status=403)
+
             try:
-                payload = self.read_json()
-            except Exception:
-                pass
-            worker_url = payload.get("worker_url") if isinstance(payload, dict) else None
-            secret = payload.get("secret") if isinstance(payload, dict) else None
-            try:
-                res = sync_edge_inbox(worker_url=worker_url, secret=secret)
+                # Always use local verified secret configuration; do not accept unauthenticated overrides
+                res = sync_edge_inbox()
                 return self.send_json(res, status=200)
             except Exception as e:
                 return self.send_json({
