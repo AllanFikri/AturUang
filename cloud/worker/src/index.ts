@@ -2156,6 +2156,8 @@ export default {
            r.occurred_at,
            r.payload_hash,
            r.minimal_raw_payload,
+           ic.id AS candidate_id,
+           ic.raw_event_id,
            ic.tx_type,
            ic.amount,
            ic.account,
@@ -2164,7 +2166,9 @@ export default {
            ic.money_context,
            ic.date,
            ic.time,
-           ic.status AS candidate_status
+           ic.status AS candidate_status,
+           ic.confidence_score,
+           ic.reasons
          FROM raw_events r
          LEFT JOIN ingestion_candidates ic ON ic.raw_event_id = r.id
          WHERE r.source = 'gmail' AND r.state = 'Parsed' AND r.id > ?
@@ -2176,6 +2180,8 @@ export default {
         occurred_at: string | null;
         payload_hash: string;
         minimal_raw_payload: string | null;
+        candidate_id: number | null;
+        raw_event_id: number | null;
         tx_type: string | null;
         amount: number | null;
         account: string | null;
@@ -2185,8 +2191,11 @@ export default {
         date: string | null;
         time: string | null;
         candidate_status: string | null;
+        confidence_score: number | null;
+        reasons: string | null;
       }>();
 
+      let filteredCount = 0;
       const results = (rows.results || []).map((row) => {
         let minimal: any = {};
         if (row.minimal_raw_payload) {
@@ -2194,6 +2203,48 @@ export default {
             minimal = JSON.parse(row.minimal_raw_payload);
           } catch {}
         }
+
+        const rawEventId = row.raw_event_id;
+        const candDate = row.date;
+        const candAmount = row.amount;
+        const candAccount = row.account;
+        const candTxType = row.tx_type;
+
+        let isCandValid = false;
+        if (
+          rawEventId !== null &&
+          rawEventId !== undefined &&
+          typeof rawEventId === "number" &&
+          rawEventId > 0 &&
+          candDate !== null &&
+          candDate !== undefined &&
+          typeof candDate === "string" &&
+          candDate.trim() !== "" &&
+          !isNaN(new Date(candDate.trim()).getTime()) &&
+          candAmount !== null &&
+          candAmount !== undefined &&
+          typeof candAmount === "number" &&
+          !isNaN(candAmount) &&
+          isFinite(candAmount) &&
+          candAmount > 0 &&
+          candAmount % 1 === 0 &&
+          candAccount !== null &&
+          candAccount !== undefined &&
+          typeof candAccount === "string" &&
+          candAccount.trim() !== "" &&
+          candTxType !== null &&
+          candTxType !== undefined &&
+          typeof candTxType === "string" &&
+          candTxType.trim() !== "" &&
+          ["Income", "Expense", "Transfer", "Adjustment"].includes(candTxType.trim())
+        ) {
+          isCandValid = true;
+        }
+
+        if (!isCandValid) {
+          filteredCount++;
+        }
+
         return {
           id: row.id,
           cursor: String(row.id),
@@ -2204,25 +2255,38 @@ export default {
           from: minimal.sender || "ebanking@bca.co.id",
           sender: minimal.sender || "ebanking@bca.co.id",
           subject: minimal.subject || `Transaksi ${row.message_id}`,
-          amount: row.amount !== null ? row.amount : minimal.amount,
-          candidate: row.amount !== null ? {
-            tx_type: row.tx_type || "Expense",
+          amount: isCandValid ? row.amount : (row.amount !== null ? row.amount : minimal.amount),
+          candidate: isCandValid ? {
+            raw_event_id: rawEventId,
+            tx_type: candTxType,
             amount: row.amount,
-            account: row.account || "BCA Main",
-            to_account: row.to_account,
+            account: candAccount,
+            to_account: row.to_account || undefined,
             category: row.category || "Other",
             money_context: row.money_context || "Personal",
-            date: row.date || row.occurred_at?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+            date: candDate,
             time: row.time || "12:00:00",
             match_tier: "EXACT",
             reconciliation_status: "RECONCILED",
+            confidence_score: row.confidence_score !== null && row.confidence_score !== undefined ? row.confidence_score : 1.0,
+            status: row.candidate_status || "Pending",
+            reasons: row.reasons || "Auto-parsed candidate",
           } : undefined,
         };
       });
 
-      return new Response(JSON.stringify(results), {
+      const responseBody = {
+        results,
+        candidates: results.filter((r) => r.candidate !== undefined).map((r) => r.candidate),
+        filtered_count: filteredCount,
+      };
+
+      return new Response(JSON.stringify(responseBody), {
         status: 200,
-        headers: getSecurityHeaders(),
+        headers: {
+          ...getSecurityHeaders(),
+          "X-Filtered-Candidates-Count": String(filteredCount),
+        },
       });
     }
 

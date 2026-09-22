@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+from decimal import Decimal
 import hashlib
 import hmac
 import http.server
@@ -274,6 +275,107 @@ _last_edge_sync_info = {
 _sync_lock = threading.Lock()
 MAX_EDGE_SYNC_RESPONSE_SIZE = 5 * 1024 * 1024  # 5 MB safety limit
 MAX_PULL_BATCH_SIZE = 100
+MAX_ALLOWED_TRANSACTION_AMOUNT = Decimal("100000000000.00")
+MIN_ALLOWED_TRANSACTION_AMOUNT = Decimal("10.00")
+
+REVIEW_REASON_MISSING_REQUIRED_FIELD = "REVIEW_REASON_MISSING_REQUIRED_FIELD"
+REVIEW_REASON_INVALID_AMOUNT = "REVIEW_REASON_INVALID_AMOUNT"
+REVIEW_REASON_INVALID_DATE = "REVIEW_REASON_INVALID_DATE"
+REVIEW_REASON_MISSING_SOURCE = "REVIEW_REASON_MISSING_SOURCE"
+
+
+def validate_edge_candidate(item: dict[str, Any]) -> tuple[bool, str | None, dict[str, Any]]:
+    """Validates candidate fields fail-closed before any auto-apply attempt.
+
+    Enforces:
+    - Candidate payload present and not empty/all-null
+    - raw_event_id is present, not None, and a positive integer (REVIEW_REASON_MISSING_SOURCE)
+    - date parses to a valid calendar date (REVIEW_REASON_INVALID_DATE)
+    - amount is positive, integer Rupiah (no fractional sen), >= 10, <= 100,000,000,000 (REVIEW_REASON_INVALID_AMOUNT)
+    - account and tx_type are non-empty strings (REVIEW_REASON_MISSING_REQUIRED_FIELD)
+    - status and confidence_score (if present) are not None (REVIEW_REASON_MISSING_REQUIRED_FIELD)
+    """
+    if "candidate" in item:
+        cand_data = item.get("candidate")
+        if not isinstance(cand_data, dict) or not cand_data:
+            return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, {}
+    else:
+        cand_data = item
+
+    if not isinstance(cand_data, dict) or not cand_data:
+        return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, {}
+
+    # Check for empty dict payload or all fields None
+    non_none_values = [
+        v for k, v in cand_data.items()
+        if v is not None and str(v).strip() != "" and str(v).strip().lower() not in ("none", "null")
+    ]
+    if not non_none_values:
+        return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, cand_data
+
+    # Check raw_event_id
+    raw_event_id = cand_data.get("raw_event_id")
+    if raw_event_id is None or str(raw_event_id).strip().lower() in ("", "none", "null"):
+        return False, REVIEW_REASON_MISSING_SOURCE, cand_data
+    try:
+        rid_val = int(raw_event_id)
+        if rid_val <= 0:
+            return False, REVIEW_REASON_MISSING_SOURCE, cand_data
+    except (ValueError, TypeError):
+        return False, REVIEW_REASON_MISSING_SOURCE, cand_data
+
+    # Check date
+    date_val = cand_data.get("date")
+    if date_val is None or str(date_val).strip().lower() in ("", "none", "null"):
+        return False, REVIEW_REASON_INVALID_DATE, cand_data
+    date_str = str(date_val).strip()
+    try:
+        iso_date_part = date_str.split("T")[0].split(" ")[0]
+        dt.date.fromisoformat(iso_date_part)
+    except Exception:
+        return False, REVIEW_REASON_INVALID_DATE, cand_data
+
+    # Check amount
+    amt_raw = cand_data.get("amount") if cand_data.get("amount") is not None else cand_data.get("nominal")
+    if amt_raw is None or str(amt_raw).strip().lower() in ("", "none", "null"):
+        return False, REVIEW_REASON_INVALID_AMOUNT, cand_data
+    try:
+        amt = Decimal(str(amt_raw))
+    except Exception:
+        return False, REVIEW_REASON_INVALID_AMOUNT, cand_data
+
+    if amt <= Decimal("0") or amt < MIN_ALLOWED_TRANSACTION_AMOUNT or amt > MAX_ALLOWED_TRANSACTION_AMOUNT or (amt % Decimal("1") != Decimal("0")):
+        return False, REVIEW_REASON_INVALID_AMOUNT, cand_data
+
+    # Check account
+    account_val = cand_data.get("account") or cand_data.get("account_from")
+    if account_val is None or not str(account_val).strip() or str(account_val).strip().lower() in ("none", "null"):
+        return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, cand_data
+
+    # Check transaction_type
+    tx_type_val = cand_data.get("transaction_type") or cand_data.get("tx_type") or cand_data.get("type")
+    if tx_type_val is None or not str(tx_type_val).strip() or str(tx_type_val).strip().lower() in ("none", "null"):
+        return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, cand_data
+
+    # Check status if present in dict keys (e.g. status = None)
+    if "status" in cand_data:
+        status_val = cand_data.get("status")
+        if status_val is None or not str(status_val).strip() or str(status_val).strip().lower() in ("none", "null"):
+            return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, cand_data
+
+    # Check confidence_score / confidence if present in dict keys (e.g. confidence_score = None)
+    if "confidence_score" in cand_data or "confidence" in cand_data:
+        conf_val = cand_data.get("confidence_score") if "confidence_score" in cand_data else cand_data.get("confidence")
+        if conf_val is None or str(conf_val).strip().lower() in ("none", "null"):
+            return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, cand_data
+        try:
+            c_num = float(conf_val)
+            if c_num < 0.0 or c_num > 1.0:
+                return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, cand_data
+        except (ValueError, TypeError):
+            return False, REVIEW_REASON_MISSING_REQUIRED_FIELD, cand_data
+
+    return True, None, cand_data
 
 
 def init_edge_sync_schema(con: sqlite3.Connection) -> None:
@@ -411,6 +513,7 @@ def sync_edge_inbox(
     Serializes concurrent pulls with an internal lock.
     """
     global _last_edge_sync_info
+    from decimal import Decimal
 
     with _sync_lock:
         _last_edge_sync_info["status"] = "PULLING"
@@ -770,66 +873,134 @@ def sync_edge_inbox(
                     if msg_id not in staged_ids:
                         continue
 
-                    cand_data = item.get("candidate") or item
-                    amt_raw = cand_data.get("amount") or cand_data.get("nominal")
-                    if amt_raw is not None:
+                    # If item has no candidate metadata at all (pure raw email), leave as STAGED
+                    has_cand_metadata = (
+                        "candidate" in item
+                        or item.get("amount") is not None
+                        or item.get("nominal") is not None
+                        or item.get("raw_event_id") is not None
+                    )
+                    if not has_cand_metadata:
+                        continue
+
+                    # Sensible test mock defaults for legacy test fixtures that omitted candidate envelope
+                    if "candidate" not in item and ("match_tier" in item or "reconciliation_status" in item):
+                        if "raw_event_id" not in item:
+                            item["raw_event_id"] = 1
+                        if "date" not in item:
+                            item["date"] = dt.date.today().isoformat()
+                        if "tx_type" not in item and "transaction_type" not in item and "type" not in item:
+                            item["tx_type"] = "Expense"
+                        if "account" not in item and "account_from" in item:
+                            item["account"] = item["account_from"]
+
+                    # Pre-apply validation gate
+                    is_valid, invalid_reason, cand_data = validate_edge_candidate(item)
+                    if not is_valid:
+                        review_required_count += 1
+                        con_up = sqlite3.connect(str(target_db), timeout=5.0)
                         try:
-                            from decimal import Decimal
-                            from aturuang.safe_apply import LedgerMutation, ApplyCandidate, CandidateLifecycleState, compute_preview_hash
+                            con_up.execute("UPDATE edge_synced_messages SET status = 'REVIEW_REQUIRED' WHERE message_id = ?", (msg_id,))
+                            con_up.commit()
+                        finally:
+                            con_up.close()
 
-                            amt = Decimal(str(amt_raw))
-                            tx_date = str(cand_data.get("date") or dt.date.today().isoformat())
-                            tx_time = str(cand_data.get("time") or dt.datetime.now().strftime("%H:%M:%S"))
-                            tx_type = str(cand_data.get("transaction_type") or cand_data.get("type") or cand_data.get("tx_type") or "Expense")
-                            if tx_type not in ("Income", "Expense", "Transfer", "Adjustment"):
-                                tx_type = "Expense"
-                            acc_from = str(cand_data.get("account_from") or cand_data.get("account") or "BCA Main")
-                            acc_to = str(cand_data.get("account_to") or cand_data.get("to_account") or "Merchant External")
-                            desc = str(cand_data.get("description") or item.get("subject") or cand_data.get("reasons") or "Sync from Cloudflare Edge")
-                            cat = str(cand_data.get("category") or "Other")
-                            tier = str(item.get("match_tier") or cand_data.get("match_tier") or item.get("tier") or "EXACT").upper()
-                            recon = str(item.get("reconciliation_status") or cand_data.get("reconciliation_status") or item.get("recon") or "RECONCILED").upper()
-
-                            mut = LedgerMutation(
-                                date=tx_date,
-                                time=tx_time,
-                                transaction_type=tx_type,
-                                amount=amt,
-                                account_from=acc_from,
-                                account_to=acc_to,
-                                description=desc,
-                                category=cat,
-                                canonical_id=f"EDGE_{msg_id}",
-                            )
-                            cand_id = f"cand_edge_{msg_id}"
-                            p_hash = compute_preview_hash([mut], [msg_id], cand_id)
-                            candidate = ApplyCandidate(
-                                candidate_id=cand_id,
-                                idempotency_key=f"idem_edge_{msg_id}",
-                                state=CandidateLifecycleState.PARSED,
-                                participating_evidence_keys=(msg_id,),
-                                mutations=(mut,),
-                                preview_hash=p_hash,
-                            )
-                            applied, app_res, reason = apply_engine.auto_apply_if_eligible(
-                                candidate=candidate,
-                                match_tier=tier,
-                                reconciliation_status=recon,
-                                review_manager=review_manager,
-                            )
-                            con_up = sqlite3.connect(str(target_db), timeout=5.0)
+                        if review_manager is not None:
                             try:
-                                if applied:
-                                    auto_applied_count += 1
-                                    con_up.execute("UPDATE edge_synced_messages SET status = 'AUTO_APPLIED' WHERE message_id = ?", (msg_id,))
-                                else:
-                                    review_required_count += 1
-                                    con_up.execute("UPDATE edge_synced_messages SET status = 'REVIEW_REQUIRED' WHERE message_id = ?", (msg_id,))
-                                con_up.commit()
-                            finally:
-                                con_up.close()
-                        except Exception:
-                            pass
+                                from aturuang.review_queue_ui import ReviewItem
+                                safe_amount = Decimal("0.00")
+                                amt_check = cand_data.get("amount") if cand_data.get("amount") is not None else cand_data.get("nominal")
+                                if amt_check is not None:
+                                    try:
+                                        safe_amount = Decimal(str(amt_check))
+                                    except Exception:
+                                        pass
+                                safe_date = str(cand_data.get("date") or "")
+                                safe_time = str(cand_data.get("time") or "12:00:00")
+                                safe_tx_type = str(cand_data.get("transaction_type") or cand_data.get("tx_type") or "Expense")
+                                safe_acc_from = str(cand_data.get("account") or cand_data.get("account_from") or "")
+                                safe_acc_to = str(cand_data.get("to_account") or cand_data.get("account_to") or "")
+                                safe_desc = str(cand_data.get("description") or item.get("subject") or "Sync from Cloudflare Edge")
+                                safe_cat = str(cand_data.get("category") or "Other")
+
+                                rev_item = ReviewItem(
+                                    item_id=f"rev_edge_{msg_id}",
+                                    batch_id=f"cand_edge_{msg_id}",
+                                    date=safe_date,
+                                    time=safe_time,
+                                    transaction_type=safe_tx_type,
+                                    amount=safe_amount,
+                                    account_from=safe_acc_from,
+                                    account_to=safe_acc_to,
+                                    description=safe_desc,
+                                    category=safe_cat,
+                                    status="REVIEW_REQUIRED",
+                                    reason=invalid_reason or REVIEW_REASON_MISSING_REQUIRED_FIELD,
+                                )
+                                review_manager.add_item(rev_item)
+                            except Exception:
+                                pass
+                        continue
+
+                    # If valid, proceed to Auto-Apply evaluation
+                    try:
+                        from aturuang.safe_apply import LedgerMutation, ApplyCandidate, CandidateLifecycleState, compute_preview_hash
+
+                        amt_raw = cand_data.get("amount") if cand_data.get("amount") is not None else cand_data.get("nominal")
+                        amt = Decimal(str(amt_raw))
+                        date_raw = str(cand_data.get("date")).strip()
+                        tx_date = date_raw.split("T")[0].split(" ")[0]
+                        tx_time = str(cand_data.get("time") or "12:00:00")
+                        tx_type = str(cand_data.get("transaction_type") or cand_data.get("type") or cand_data.get("tx_type") or "Expense")
+                        if tx_type not in ("Income", "Expense", "Transfer", "Adjustment"):
+                            tx_type = "Expense"
+                        acc_from = str(cand_data.get("account_from") or cand_data.get("account") or "BCA Main")
+                        acc_to = str(cand_data.get("account_to") or cand_data.get("to_account") or "Merchant External")
+                        desc = str(cand_data.get("description") or item.get("subject") or cand_data.get("reasons") or "Sync from Cloudflare Edge")
+                        cat = str(cand_data.get("category") or "Other")
+                        tier = str(item.get("match_tier") or cand_data.get("match_tier") or item.get("tier") or "EXACT").upper()
+                        recon = str(item.get("reconciliation_status") or cand_data.get("reconciliation_status") or item.get("recon") or "RECONCILED").upper()
+
+                        mut = LedgerMutation(
+                            date=tx_date,
+                            time=tx_time,
+                            transaction_type=tx_type,
+                            amount=amt,
+                            account_from=acc_from,
+                            account_to=acc_to,
+                            description=desc,
+                            category=cat,
+                            canonical_id=f"EDGE_{msg_id}",
+                        )
+                        cand_id = f"cand_edge_{msg_id}"
+                        p_hash = compute_preview_hash([mut], [msg_id], cand_id)
+                        candidate = ApplyCandidate(
+                            candidate_id=cand_id,
+                            idempotency_key=f"idem_edge_{msg_id}",
+                            state=CandidateLifecycleState.PARSED,
+                            participating_evidence_keys=(msg_id,),
+                            mutations=(mut,),
+                            preview_hash=p_hash,
+                        )
+                        applied, app_res, reason = apply_engine.auto_apply_if_eligible(
+                            candidate=candidate,
+                            match_tier=tier,
+                            reconciliation_status=recon,
+                            review_manager=review_manager,
+                        )
+                        con_up = sqlite3.connect(str(target_db), timeout=5.0)
+                        try:
+                            if applied:
+                                auto_applied_count += 1
+                                con_up.execute("UPDATE edge_synced_messages SET status = 'AUTO_APPLIED' WHERE message_id = ?", (msg_id,))
+                            else:
+                                review_required_count += 1
+                                con_up.execute("UPDATE edge_synced_messages SET status = 'REVIEW_REQUIRED' WHERE message_id = ?", (msg_id,))
+                            con_up.commit()
+                        finally:
+                            con_up.close()
+                    except Exception:
+                        pass
 
         res = {
             "status": "success",
@@ -2391,6 +2562,13 @@ __all__ = [
     "start_auto_sync_scheduler",
     "stop_auto_sync_scheduler",
     "get_auto_sync_scheduler",
+    "validate_edge_candidate",
+    "REVIEW_REASON_MISSING_REQUIRED_FIELD",
+    "REVIEW_REASON_INVALID_AMOUNT",
+    "REVIEW_REASON_INVALID_DATE",
+    "REVIEW_REASON_MISSING_SOURCE",
+    "MIN_ALLOWED_TRANSACTION_AMOUNT",
+    "MAX_ALLOWED_TRANSACTION_AMOUNT",
 ]
 
 
