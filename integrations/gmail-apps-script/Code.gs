@@ -8,7 +8,7 @@
  */
 
 // Exact evidence-backed senders
-const TRUSTED_SENDER_QUERY = 'from:(bca@bca.co.id OR noreply@jago.com OR no-reply@flip.id OR googleplay-noreply@google.com OR noreply@byu.id OR no-reply@mailer-esb.com OR info@shopee.co.id OR info@mail.shopee.co.id OR noreply@cx.byu.id)';
+const TRUSTED_SENDER_QUERY = 'from:(bca@bca.co.id OR noreply@jago.com OR no-reply@flip.id OR googleplay-noreply@google.com OR noreply@byu.id OR no-reply@mailer-esb.com OR info@shopee.co.id OR info@mail.shopee.co.id OR noreply@cx.byu.id OR noreply@stockbit.com OR contactus@stockbit.com)';
 
 const TRUSTED_SENDERS_SET = [
   "bca@bca.co.id",
@@ -19,7 +19,9 @@ const TRUSTED_SENDERS_SET = [
   "no-reply@mailer-esb.com",
   "info@shopee.co.id",
   "info@mail.shopee.co.id",
-  "noreply@cx.byu.id"
+  "noreply@cx.byu.id",
+  "noreply@stockbit.com",
+  "contactus@stockbit.com"
 ];
 
 function extractCleanEmail(fromHeader) {
@@ -49,6 +51,157 @@ function relayGmailTransactions() {
 
   const query = 'newer_than:2d ' + TRUSTED_SENDER_QUERY;
   processGmailQuery(query, workerUrl, relaySecret, 30);
+}
+
+/**
+ * 1b. Sync Current Month Emails
+ * Menyelaraskan seluruh email transaksi bulan berjalan (tanggal 1 s.d. hari ini).
+ */
+function syncCurrentMonthEmails() {
+  const props = PropertiesService.getScriptProperties();
+  const workerUrl = props.getProperty("WORKER_URL");
+  const relaySecret = props.getProperty("GMAIL_RELAY_SECRET");
+
+  if (!workerUrl || !relaySecret) {
+    throw new Error("GMAIL_RELAY_CONFIG_MISSING");
+  }
+
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = ("0" + (now.getMonth() + 1)).slice(-2);
+  const startOfMonth = year + "/" + month + "/01";
+
+  const query = "after:" + startOfMonth + " " + TRUSTED_SENDER_QUERY;
+  console.log("Menyelaraskan email bulan berjalan dengan query: " + query);
+  processGmailQuery(query, workerUrl, relaySecret, 50);
+}
+
+/**
+ * 1c. Sync PDF Attachments to Google Drive
+ * Mengunggah lampiran PDF dari sender terpercaya ke folder Drive terkonfigurasi secara aman dan idempoten.
+ */
+function syncEmailPdfAttachmentsToDrive() {
+  const props = PropertiesService.getScriptProperties();
+  const folderId = props.getProperty("PDF_DRIVE_FOLDER_ID");
+
+  if (!folderId || !folderId.trim()) {
+    throw new Error("PDF_FOLDER_CONFIG_MISSING");
+  }
+
+  let folder;
+  try {
+    folder = DriveApp.getFolderById(folderId.trim());
+  } catch (e) {
+    throw new Error("PDF_DRIVE_FOLDER_NOT_FOUND");
+  }
+
+  if (!folder) {
+    throw new Error("PDF_DRIVE_FOLDER_NOT_FOUND");
+  }
+
+  const MAX_PDF_SIZE_BYTES = 15 * 1024 * 1024; // 15MB
+  const MAX_ATTACHMENTS_PER_MSG = 5;
+  const PDF_SYNC_LABEL = "aturuang/pdf-synced";
+
+  let pdfLabel = GmailApp.getUserLabelByName(PDF_SYNC_LABEL);
+  if (!pdfLabel) {
+    try {
+      pdfLabel = GmailApp.createLabel(PDF_SYNC_LABEL);
+    } catch (e) {
+      console.warn("Gagal membuat label " + PDF_SYNC_LABEL + ": " + e);
+    }
+  }
+
+  const query = "has:attachment filename:pdf -label:" + PDF_SYNC_LABEL + " " + TRUSTED_SENDER_QUERY;
+  const threads = GmailApp.search(query, 0, 20);
+
+  let totalUploaded = 0;
+  let totalSkipped = 0;
+  let messagesProcessed = 0;
+
+  for (let t = 0; t < threads.length; t++) {
+    const thread = threads[t];
+    const messages = thread.getMessages();
+    let threadAllSuccess = true;
+
+    for (let m = 0; m < messages.length; m++) {
+      const msg = messages[m];
+      const fromHeader = msg.getFrom();
+
+      // Strict exact-sender validation
+      if (!isSenderExactTrusted(fromHeader)) {
+        continue;
+      }
+
+      messagesProcessed++;
+      const attachments = msg.getAttachments({ includeInlineImages: false });
+      let pdfCount = 0;
+      let msgAllSuccess = true;
+
+      for (let a = 0; a < attachments.length; a++) {
+        const att = attachments[a];
+        const contentType = (att.getContentType() || "").toLowerCase();
+        const name = (att.getName() || "").toLowerCase();
+
+        // Validasi ekstensi dan mime type
+        if (contentType.indexOf("application/pdf") === -1 && !name.endsWith(".pdf")) {
+          continue;
+        }
+
+        pdfCount++;
+        if (pdfCount > MAX_ATTACHMENTS_PER_MSG) {
+          console.warn("Batas lampiran PDF per pesan terlampaui (maks 5). Melewati sisa lampiran untuk msg: " + msg.getId());
+          break;
+        }
+
+        const size = att.getSize();
+        if (size > MAX_PDF_SIZE_BYTES) {
+          console.warn("OVERSIZED_ATTACHMENT: Ukuran berkas (" + size + " bytes) melebihi batas 15MB untuk msg: " + msg.getId());
+          msgAllSuccess = false;
+          continue;
+        }
+
+        try {
+          // Hitung SHA-256 hash untuk idempotensi dan penamaan deterministik
+          const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, att.getBytes());
+          const hashHex = digest.map(function(b) {
+            return ("0" + (b & 0xFF).toString(16)).slice(-2);
+          }).join("");
+          const hashPrefix = hashHex.slice(0, 12);
+
+          const safeFileName = msg.getId() + "_att" + pdfCount + "_" + hashPrefix + ".pdf";
+
+          // Cek idempotensi: hindari duplikasi unggahan
+          const existingFiles = folder.getFilesByName(safeFileName);
+          if (existingFiles.hasNext()) {
+            totalSkipped++;
+          } else {
+            folder.createFile(att.copyBlob().setName(safeFileName));
+            totalUploaded++;
+          }
+        } catch (uploadErr) {
+          console.error("Gagal mengunggah lampiran PDF: " + uploadErr);
+          msgAllSuccess = false;
+        }
+      }
+
+      if (!msgAllSuccess) {
+        threadAllSuccess = false;
+      }
+    }
+
+    // Labeli thread hanya jika seluruh lampiran berhasil diselaraskan
+    if (threadAllSuccess && pdfLabel) {
+      thread.addLabel(pdfLabel);
+    }
+  }
+
+  console.log("Sinkronisasi PDF selesai: diunggah=" + totalUploaded + ", dilewati (idempoten)=" + totalSkipped + ", pesan=" + messagesProcessed);
+  return {
+    uploaded: totalUploaded,
+    skipped: totalSkipped,
+    messages_processed: messagesProcessed
+  };
 }
 
 /**
@@ -1152,12 +1305,12 @@ function runBcaQrisTargetedRepair_(maxItems) {
   const workerUrl =
     props.getProperty("WORKER_URL");
 
-  const relaySecret =
+  const repairSecret =
     props.getProperty(
-      "GMAIL_RELAY_SECRET"
+      "REPAIR_SECRET"
     );
 
-  if (!workerUrl || !relaySecret) {
+  if (!workerUrl || !repairSecret) {
     throw new Error(
       "BCA_QRIS_REPAIR_CONFIG_MISSING"
     );
@@ -1226,7 +1379,7 @@ function runBcaQrisTargetedRepair_(maxItems) {
       const next =
         postBcaQrisRepair_(
           workerUrl,
-          relaySecret,
+          repairSecret,
           {
             action: "next",
             limit: batchLimit,
@@ -1322,7 +1475,7 @@ function runBcaQrisTargetedRepair_(maxItems) {
         const repairResult =
           postBcaQrisRepair_(
             workerUrl,
-            relaySecret,
+            repairSecret,
             {
               action: "repair",
               message_id:
@@ -1485,7 +1638,7 @@ function assertBcaQrisRepairWorkerReady_(
 
 function postBcaQrisRepair_(
   workerUrl,
-  relaySecret,
+  repairSecret,
   payload
 ) {
   const rawBody =
@@ -1507,7 +1660,7 @@ function postBcaQrisRepair_(
   const signatureBytes =
     Utilities.computeHmacSha256Signature(
       toSign,
-      relaySecret,
+      repairSecret,
       Utilities.Charset.UTF_8
     );
 
@@ -1672,23 +1825,35 @@ function startBcaQrisAutoRepair() {
   const workerUrl =
     props.getProperty("WORKER_URL");
 
-  const relaySecret =
+  const repairSecret =
     props.getProperty(
-      "GMAIL_RELAY_SECRET"
+      "REPAIR_SECRET"
     );
 
-  if (!workerUrl || !relaySecret) {
+  if (!workerUrl || !repairSecret) {
     throw new Error(
       "BCA_QRIS_REPAIR_CONFIG_MISSING"
     );
   }
 
-  const email =
+  let email =
     String(
-      Session
-        .getEffectiveUser()
-        .getEmail() || ""
+      props.getProperty(
+        BCA_AUTO_EMAIL
+      ) ||
+      props.getProperty(
+        "REPAIR_NOTIFY_EMAIL"
+      ) ||
+      ""
     ).trim();
+
+  if (!email) {
+    try {
+      email = String(Session.getEffectiveUser().getEmail() || "").trim();
+    } catch (e) {
+      // Ignore if userinfo.email scope not present
+    }
+  }
 
   if (!email) {
     throw new Error(
@@ -1783,12 +1948,12 @@ function continueBcaQrisAutoRepair_() {
   const workerUrl =
     props.getProperty("WORKER_URL");
 
-  const relaySecret =
+  const repairSecret =
     props.getProperty(
-      "GMAIL_RELAY_SECRET"
+      "REPAIR_SECRET"
     );
 
-  if (!workerUrl || !relaySecret) {
+  if (!workerUrl || !repairSecret) {
     return failBcaQrisAutoRepair_(
       "BCA_QRIS_REPAIR_CONFIG_MISSING",
       null
@@ -1799,7 +1964,7 @@ function continueBcaQrisAutoRepair_() {
     const before =
       getBcaQrisRemaining_(
         workerUrl,
-        relaySecret
+        repairSecret
       );
 
     const initial =
@@ -1829,7 +1994,7 @@ function continueBcaQrisAutoRepair_() {
     const after =
       getBcaQrisRemaining_(
         workerUrl,
-        relaySecret
+        repairSecret
       );
 
     const repairedThisRun =
@@ -2074,12 +2239,12 @@ function stopBcaQrisAutoRepair() {
 
 function getBcaQrisRemaining_(
   workerUrl,
-  relaySecret
+  repairSecret
 ) {
   const response =
     postBcaQrisRepair_(
       workerUrl,
-      relaySecret,
+      repairSecret,
       {
         action: "next",
         limit: 1
@@ -2367,12 +2532,12 @@ function resumeBcaQrisAutoRepairAfterFix() {
       "WORKER_URL"
     );
 
-  const relaySecret =
+  const repairSecret =
     props.getProperty(
-      "GMAIL_RELAY_SECRET"
+      "REPAIR_SECRET"
     );
 
-  if (!workerUrl || !relaySecret) {
+  if (!workerUrl || !repairSecret) {
     throw new Error(
       "BCA_QRIS_REPAIR_CONFIG_MISSING"
     );
@@ -2385,7 +2550,7 @@ function resumeBcaQrisAutoRepairAfterFix() {
   const remaining =
     getBcaQrisRemaining_(
       workerUrl,
-      relaySecret
+      repairSecret
     );
 
   if (remaining !== 1079) {
