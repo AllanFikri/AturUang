@@ -170,6 +170,29 @@ except ImportError:
         def statement_html(con, month: str) -> str:
             return f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>Statement {month}</title></head><body><h1>Rekening Koran {month}</h1></body></html>"
 
+try:
+    from aturuang.merchant_classifier import (
+        init_merchant_rules_schema,
+        classify_merchant,
+        reclassify_all_transactions,
+        get_all_merchant_categories,
+        get_all_merchant_rules,
+        create_merchant_rule,
+        update_merchant_rule,
+        delete_merchant_rule,
+    )
+except ImportError:
+    from merchant_classifier import (
+        init_merchant_rules_schema,
+        classify_merchant,
+        reclassify_all_transactions,
+        get_all_merchant_categories,
+        get_all_merchant_rules,
+        create_merchant_rule,
+        update_merchant_rule,
+        delete_merchant_rule,
+    )
+
 DEFAULT_PORT = 5050
 CSS_FILE = WEB_ROOT / "css" / "styles.css"
 JS_FILE = WEB_ROOT / "js" / "app.js"
@@ -1605,6 +1628,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             time_ctx = get_time_context(con)
             curr_month = time_ctx["current_month"]
 
+            if path == "/api/merchant-categories":
+                ok, err, code = self._check_local_auth()
+                if not ok:
+                    return self.send_json({"error": err or "Unauthorized"}, status=code or 401)
+                init_merchant_rules_schema(con)
+                cats = get_all_merchant_categories(con)
+                return self.send_json({"status": "success", "categories": cats})
+
+            if path == "/api/merchant-rules":
+                ok, err, code = self._check_local_auth()
+                if not ok:
+                    return self.send_json({"error": err or "Unauthorized"}, status=code or 401)
+                init_merchant_rules_schema(con)
+                rules = get_all_merchant_rules(con)
+                return self.send_json({"status": "success", "rules": rules})
+
             if path == "/api/dashboard":
                 month = qs.get("month", [curr_month])[0]
                 return self.send_json(dashboard(con, month))
@@ -1896,6 +1935,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         try:
             with db_connect() as con:
+                if path == "/api/merchant-rules":
+                    ok, err, code = self._check_local_auth()
+                    if not ok:
+                        return self.send_json({"error": err or "Unauthorized"}, status=code or 401)
+                    init_merchant_rules_schema(con)
+                    backup_db()
+                    res, status_code = create_merchant_rule(con, payload)
+                    if status_code in (200, 201):
+                        con.commit()
+                    return self.send_json(res, status=status_code)
+
+                if path == "/api/merchant-rules/classify":
+                    ok, err, code = self._check_local_auth()
+                    if not ok:
+                        return self.send_json({"error": err or "Unauthorized"}, status=code or 401)
+                    init_merchant_rules_schema(con)
+                    m_name = str(payload.get("merchant_name", "")).strip()
+                    amt = float(payload.get("amount", 0) or 0)
+                    parent, child = classify_merchant(m_name, amt, db_path=con)
+                    return self.send_json({"status": "success", "parent_category": parent, "child_category": child})
+
+                if path == "/api/merchant-rules/apply-to-existing":
+                    ok, err, code = self._check_local_auth()
+                    if not ok:
+                        return self.send_json({"error": err or "Unauthorized"}, status=code or 401)
+                    init_merchant_rules_schema(con)
+                    dry_run = bool(payload.get("dry_run", True))
+                    if not dry_run:
+                        backup_db()
+                    res = reclassify_all_transactions(db_path=con, dry_run=dry_run)
+                    if not dry_run:
+                        con.commit()
+                    return self.send_json({"status": "success", **res})
+
+                if path.startswith("/api/merchant-rules/") and not path.endswith("/classify") and not path.endswith("/apply-to-existing"):
+                    ok, err, code = self._check_local_auth()
+                    if not ok:
+                        return self.send_json({"error": err or "Unauthorized"}, status=code or 401)
+                    try:
+                        rule_id = int(path.split("/")[3])
+                    except (IndexError, ValueError):
+                        return self.send_json({"error": "Invalid rule ID"}, status=400)
+                    init_merchant_rules_schema(con)
+                    backup_db()
+                    res, status_code = update_merchant_rule(con, rule_id, payload)
+                    if status_code == 200:
+                        con.commit()
+                    return self.send_json(res, status=status_code)
+
                 if path in {"/api/transaction", "/api/transaction/update"}:
                     tx = validate_tx(payload)
                     # Validate active accounts for money-moving transactions
@@ -2541,9 +2629,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self.send_error(404, "Not Found")
 
-    def do_DELETE(self) -> None:
-        parsed = urlparse(self.path)
+    def do_PUT(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path.startswith("/api/merchant-rules/"):
+            ok, err, code = self._check_local_auth()
+            if not ok:
+                return self.send_json({"error": err or "Unauthorized"}, status=code or 401)
+            try:
+                rule_id = int(path.split("/")[3])
+            except (IndexError, ValueError):
+                return self.send_json({"error": "Invalid rule ID"}, status=400)
+
+            try:
+                payload = self.read_json()
+            except Exception as e:
+                return self.send_json({"error": f"Invalid JSON: {e}"}, status=400)
+
+            with db_connect() as con:
+                init_merchant_rules_schema(con)
+                backup_db()
+                res, status_code = update_merchant_rule(con, rule_id, payload)
+                if status_code == 200:
+                    con.commit()
+                return self.send_json(res, status=status_code)
+
+        self.send_error(404, "Not Found")
+
+    def do_DELETE(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path.startswith("/api/merchant-rules/"):
+            ok, err, code = self._check_local_auth()
+            if not ok:
+                return self.send_json({"error": err or "Unauthorized"}, status=code or 401)
+            try:
+                rule_id = int(path.split("/")[3])
+            except (IndexError, ValueError):
+                return self.send_json({"error": "Invalid rule ID"}, status=400)
+
+            with db_connect() as con:
+                init_merchant_rules_schema(con)
+                backup_db()
+                res, status_code = delete_merchant_rule(con, rule_id)
+                if status_code == 200:
+                    con.commit()
+                return self.send_json(res, status=status_code)
+
         if path in ("/api/ai/settings/key", "/api/ai/config"):
             with db_connect() as con:
                 delete_gemini_api_key(con)
@@ -2561,6 +2693,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def run_app(port: int = DEFAULT_PORT, open_browser: bool = True) -> None:
     os.chdir(BASE_DIR)
     init_db()
+    init_merchant_rules_schema()
     server = None
     actual_port = port
     for p in range(port, port + 20):
@@ -2637,6 +2770,14 @@ __all__ = [
     "REVIEW_REASON_MISSING_SOURCE",
     "MIN_ALLOWED_TRANSACTION_AMOUNT",
     "MAX_ALLOWED_TRANSACTION_AMOUNT",
+    "classify_merchant",
+    "reclassify_all_transactions",
+    "init_merchant_rules_schema",
+    "get_all_merchant_categories",
+    "get_all_merchant_rules",
+    "create_merchant_rule",
+    "update_merchant_rule",
+    "delete_merchant_rule",
 ]
 
 
