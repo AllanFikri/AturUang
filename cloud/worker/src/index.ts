@@ -24,6 +24,273 @@ import {
   evaluateAutoApproval,
 } from "./domain";
 
+// ---------------------------------------------------------------------------
+// Gmail Edge Candidate Payload Builder & Canonical Mappings (FIX-WORKER-PARSER-DATE-V1)
+// ---------------------------------------------------------------------------
+
+export const CANONICAL_SENDER_MAP: Record<string, string> = {
+  "bca@bca.co.id": "BCA Main",
+  "noreply@jago.com": "Jago Main",
+  "no-reply@flip.id": "Flip",
+  "noreply@byu.id": "blu",
+  "noreply@cx.byu.id": "blu",
+  "info@shopee.co.id": "Shopee",
+  "info@mail.shopee.co.id": "Shopee",
+  "googleplay-noreply@google.com": "Google Play",
+  "no-reply@mailer-esb.com": "ESB",
+};
+
+export function mapSenderToAccount(sender?: string | null): { account: string; status?: "Review" } {
+  if (!sender || typeof sender !== "string") {
+    return { account: "Unknown", status: "Review" };
+  }
+  const key = sender.trim().toLowerCase();
+  const mapped = CANONICAL_SENDER_MAP[key];
+  if (mapped) {
+    return { account: mapped };
+  }
+  return { account: "Unknown", status: "Review" };
+}
+
+export const CANONICAL_FINANCIAL_CLASS_MAP: Record<string, string> = {
+  "Expense": "Expense",
+  "Income": "Income",
+  "Internal Transfer": "Transfer",
+  "Ignore": "Review",
+};
+
+export function mapFinancialClassToTxType(financialClass?: string | null): { txType: string; status?: "Review" } {
+  if (!financialClass || typeof financialClass !== "string") {
+    return { txType: "Unknown", status: "Review" };
+  }
+  const key = financialClass.trim();
+  const mapped = CANONICAL_FINANCIAL_CLASS_MAP[key];
+  if (mapped) {
+    if (mapped === "Review") {
+      return { txType: "Review", status: "Review" };
+    }
+    return { txType: mapped };
+  }
+  return { txType: "Unknown", status: "Review" };
+}
+
+export function handleEventKind(eventKind?: string | null): { eventKind: string; txTypeOverride?: string; status?: "Review" } {
+  if (!eventKind || typeof eventKind !== "string") {
+    return { eventKind: "Unknown", status: "Review" };
+  }
+  const key = eventKind.trim();
+  if (key === "MERCHANT_PAYMENT") {
+    return { eventKind: key };
+  }
+  if (key === "ALLOCATION_MOVEMENT") {
+    return { eventKind: key, txTypeOverride: "Transfer" };
+  }
+  if (key === "FAILED_ATTEMPT") {
+    return { eventKind: key, txTypeOverride: "Unknown", status: "Review" };
+  }
+  return { eventKind: key, status: "Review" };
+}
+
+export function parseOccurredAt(occurredAt?: string | null): { date: string | null; time: string; isValid: boolean } {
+  if (!occurredAt || typeof occurredAt !== "string") {
+    return { date: null, time: "12:00:00", isValid: false };
+  }
+  const trimmed = occurredAt.trim();
+  const match = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}:\d{2}:\d{2}))?/);
+  if (!match) {
+    return { date: null, time: "12:00:00", isValid: false };
+  }
+  const [_, y, m, d, t] = match;
+  const year = parseInt(y, 10);
+  const month = parseInt(m, 10);
+  const day = parseInt(d, 10);
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    return { date: null, time: "12:00:00", isValid: false };
+  }
+  const dtObj = new Date(`${y}-${m}-${d}T12:00:00Z`);
+  if (isNaN(dtObj.getTime())) {
+    return { date: null, time: "12:00:00", isValid: false };
+  }
+  const dateStr = `${y}-${m}-${d}`;
+  const timeStr = t || (trimmed.length >= 19 ? trimmed.slice(11, 19) : "12:00:00");
+  return { date: dateStr, time: timeStr, isValid: true };
+}
+
+export interface CandidateRowInput {
+  id: number;
+  message_id: string;
+  occurred_at?: string | null;
+  payload_hash?: string;
+  minimal_raw_payload?: string | null;
+  candidate_id?: number | null;
+  raw_event_id?: number | null;
+  tx_type?: string | null;
+  amount?: number | null;
+  account?: string | null;
+  to_account?: string | null;
+  category?: string | null;
+  money_context?: string | null;
+  date?: string | null;
+  time?: string | null;
+  candidate_status?: string | null;
+  confidence_score?: number | null;
+  reasons?: string | null;
+  sender?: string | null;
+}
+
+export function buildCandidateFromRow(row: CandidateRowInput) {
+  let minimal: any = {};
+  if (row.minimal_raw_payload) {
+    try {
+      minimal = JSON.parse(row.minimal_raw_payload);
+    } catch {}
+  }
+
+  // 1. raw_event_id: always row.id
+  const rawEventId = row.id;
+
+  // 2. date and time: from row.date/row.time or fallback to occurred_at
+  let candDate: string | null = row.date || null;
+  let candTime: string = row.time || "12:00:00";
+  let occurredAtValid = true;
+
+  if (!candDate) {
+    const parsedOccurred = parseOccurredAt(row.occurred_at);
+    if (parsedOccurred.isValid) {
+      candDate = parsedOccurred.date;
+      if (!row.time) {
+        candTime = parsedOccurred.time;
+      }
+    } else {
+      candDate = null;
+      occurredAtValid = false;
+    }
+  } else {
+    if (isNaN(new Date(candDate.trim()).getTime())) {
+      occurredAtValid = false;
+    }
+  }
+
+  // 3. account: mapped from sender
+  const sender = (row as any).sender || minimal.sender;
+  const senderMap = mapSenderToAccount(sender);
+  const candAccount = row.account || senderMap.account;
+
+  // 4. tx_type: mapped from financial_class & event_kind
+  const eventKindHandling = handleEventKind(minimal.event_kind);
+  const finClassMap = mapFinancialClassToTxType(minimal.financial_class);
+
+  let candTxType = row.tx_type || null;
+  if (!candTxType) {
+    if (eventKindHandling.txTypeOverride) {
+      candTxType = eventKindHandling.txTypeOverride;
+    } else {
+      candTxType = finClassMap.txType;
+    }
+  }
+
+  // 5. status
+  let candStatus: "Ready" | "Review" = "Ready";
+  if (
+    !occurredAtValid ||
+    senderMap.status === "Review" ||
+    finClassMap.status === "Review" ||
+    eventKindHandling.status === "Review"
+  ) {
+    candStatus = "Review";
+  }
+  if (row.candidate_status) {
+    candStatus = row.candidate_status as any;
+  }
+
+  // 6. amount
+  let candAmount: number | null = (row.amount !== null && row.amount !== undefined) ? row.amount : null;
+  if (candAmount === null) {
+    if (typeof minimal.amount === "number") {
+      candAmount = minimal.amount;
+    } else if (typeof minimal.amount === "string") {
+      const parsed = parseFloat(minimal.amount);
+      candAmount = isNaN(parsed) ? null : parsed;
+    }
+  }
+
+  // 7. Validation boundary (preserved from ce6ce6ff)
+  let isCandValid = false;
+  if (
+    rawEventId !== null &&
+    rawEventId !== undefined &&
+    typeof rawEventId === "number" &&
+    rawEventId > 0 &&
+    candDate !== null &&
+    candDate !== undefined &&
+    typeof candDate === "string" &&
+    candDate.trim() !== "" &&
+    !isNaN(new Date(candDate.trim()).getTime()) &&
+    candAmount !== null &&
+    candAmount !== undefined &&
+    typeof candAmount === "number" &&
+    !isNaN(candAmount) &&
+    isFinite(candAmount) &&
+    candAmount > 0 &&
+    candAmount % 1 === 0 &&
+    candAccount !== null &&
+    candAccount !== undefined &&
+    typeof candAccount === "string" &&
+    candAccount.trim() !== "" &&
+    candTxType !== null &&
+    candTxType !== undefined &&
+    typeof candTxType === "string" &&
+    candTxType.trim() !== "" &&
+    ["Income", "Expense", "Transfer", "Adjustment"].includes(candTxType.trim())
+  ) {
+    isCandValid = true;
+  }
+
+  const candidate = isCandValid ? {
+    raw_event_id: rawEventId,
+    tx_type: candTxType!,
+    amount: candAmount!,
+    account: candAccount,
+    to_account: null,
+    category: row.category || "Other",
+    money_context: row.money_context || "Personal",
+    date: candDate!,
+    time: candTime,
+    match_tier: candStatus === "Ready" ? "EXACT" : "REVIEW",
+    reconciliation_status: candStatus === "Ready" ? "RECONCILED" : "UNRESOLVED",
+    confidence_score: row.confidence_score !== null && row.confidence_score !== undefined ? row.confidence_score : (typeof minimal.confidence === "number" ? minimal.confidence : 1.0),
+    status: candStatus,
+    reasons: row.reasons || "Auto-parsed candidate",
+  } : undefined;
+
+  const item = {
+    id: row.id,
+    cursor: String(row.id),
+    message_id: row.message_id,
+    source: "gmail",
+    occurred_at: row.occurred_at || null,
+    payload_hash: row.payload_hash,
+    from: sender || "ebanking@bca.co.id",
+    sender: sender || "ebanking@bca.co.id",
+    subject: minimal.subject || `Transaksi ${row.message_id}`,
+    amount: isCandValid ? candAmount : (candAmount !== null ? candAmount : minimal.amount),
+    candidate,
+  };
+
+  return {
+    rawEventId,
+    candDate,
+    candTime,
+    candAmount,
+    candAccount,
+    candTxType,
+    candStatus,
+    isCandValid,
+    item,
+    candidate,
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -2197,82 +2464,11 @@ export default {
 
       let filteredCount = 0;
       const results = (rows.results || []).map((row) => {
-        let minimal: any = {};
-        if (row.minimal_raw_payload) {
-          try {
-            minimal = JSON.parse(row.minimal_raw_payload);
-          } catch {}
-        }
-
-        const rawEventId = row.raw_event_id;
-        const candDate = row.date;
-        const candAmount = row.amount;
-        const candAccount = row.account;
-        const candTxType = row.tx_type;
-
-        let isCandValid = false;
-        if (
-          rawEventId !== null &&
-          rawEventId !== undefined &&
-          typeof rawEventId === "number" &&
-          rawEventId > 0 &&
-          candDate !== null &&
-          candDate !== undefined &&
-          typeof candDate === "string" &&
-          candDate.trim() !== "" &&
-          !isNaN(new Date(candDate.trim()).getTime()) &&
-          candAmount !== null &&
-          candAmount !== undefined &&
-          typeof candAmount === "number" &&
-          !isNaN(candAmount) &&
-          isFinite(candAmount) &&
-          candAmount > 0 &&
-          candAmount % 1 === 0 &&
-          candAccount !== null &&
-          candAccount !== undefined &&
-          typeof candAccount === "string" &&
-          candAccount.trim() !== "" &&
-          candTxType !== null &&
-          candTxType !== undefined &&
-          typeof candTxType === "string" &&
-          candTxType.trim() !== "" &&
-          ["Income", "Expense", "Transfer", "Adjustment"].includes(candTxType.trim())
-        ) {
-          isCandValid = true;
-        }
-
-        if (!isCandValid) {
+        const built = buildCandidateFromRow(row);
+        if (!built.isCandValid) {
           filteredCount++;
         }
-
-        return {
-          id: row.id,
-          cursor: String(row.id),
-          message_id: row.message_id,
-          source: "gmail",
-          occurred_at: row.occurred_at,
-          payload_hash: row.payload_hash,
-          from: minimal.sender || "ebanking@bca.co.id",
-          sender: minimal.sender || "ebanking@bca.co.id",
-          subject: minimal.subject || `Transaksi ${row.message_id}`,
-          amount: isCandValid ? row.amount : (row.amount !== null ? row.amount : minimal.amount),
-          candidate: isCandValid ? {
-            raw_event_id: rawEventId,
-            tx_type: candTxType,
-            amount: row.amount,
-            account: candAccount,
-            to_account: row.to_account || undefined,
-            category: row.category || "Other",
-            money_context: row.money_context || "Personal",
-            date: candDate,
-            time: row.time || "12:00:00",
-            match_tier: "EXACT",
-            reconciliation_status: "RECONCILED",
-            confidence_score: row.confidence_score !== null && row.confidence_score !== undefined ? row.confidence_score : 1.0,
-            status: row.candidate_status || "Pending",
-            reasons: row.reasons || "Auto-parsed candidate",
-          } : undefined,
-        };
+        return built.item;
       });
 
       const responseBody = {
