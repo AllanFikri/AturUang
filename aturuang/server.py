@@ -695,7 +695,7 @@ def sync_edge_inbox(
         if isinstance(resp_data, list):
             messages = resp_data
         elif isinstance(resp_data, dict):
-            if "error" in resp_data and not any(k in resp_data for k in ("messages", "results", "items")):
+            if "error" in resp_data and not any(k in resp_data for k in ("messages", "results", "items", "candidates")):
                 res = {
                     "status": "unreachable",
                     "reason": "REMOTE_ERROR",
@@ -711,7 +711,17 @@ def sync_edge_inbox(
                 _last_edge_sync_info["is_stale"] = True
                 _last_edge_sync_info["last_result"] = res
                 return res
-            messages = resp_data.get("messages") or resp_data.get("results") or resp_data.get("items")
+
+            if isinstance(resp_data.get("results"), list):
+                messages = resp_data["results"]
+            elif isinstance(resp_data.get("messages"), list):
+                messages = resp_data["messages"]
+            elif isinstance(resp_data.get("items"), list):
+                messages = resp_data["items"]
+            elif isinstance(resp_data.get("candidates"), list):
+                messages = resp_data["candidates"]
+            else:
+                messages = None
         else:
             messages = None
 
@@ -1791,7 +1801,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if sec_site and sec_site not in ("same-origin", "none", "same-site"):
                 return self.send_json({"status": "error", "message": "Akses lintas-situs ditolak."}, status=403)
 
-            # Extract staging admin credential
+            # Check if request provides local authentication (e.g. from web UI via Option A)
+            has_local_auth = bool(
+                self.headers.get("X-AturUang-Auth")
+                or self.headers.get("X-CSRF-Token")
+                or ("aturuang_session" in (self.headers.get("Cookie") or ""))
+            )
+            is_local_authed, local_err, _ = self._check_local_auth()
+            if has_local_auth and not is_local_authed:
+                return self.send_json({
+                    "status": "error",
+                    "error": "INVALID_LOCAL_AUTH",
+                    "message": local_err or "Otorisasi lokal tidak valid.",
+                }, status=401)
+
+            # Extract staging admin credential if provided directly
             cred = ""
             auth_hdr = (self.headers.get("Authorization") or "").strip()
             if auth_hdr.lower().startswith("bearer "):
@@ -1808,31 +1832,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-            if not cred:
-                return self.send_json({
-                    "status": "error",
-                    "error": "MISSING_CREDENTIALS",
-                    "message": "Kredensial staging admin tidak ditemukan.",
-                }, status=401)
+            if is_local_authed and not cred:
+                # Option A: valid local session, local server injects CF secret from secrets store
+                url, cf_secret = get_edge_sync_config()
+                if not url or not cf_secret:
+                    return self.send_json({
+                        "status": "skipped",
+                        "reason": "CONFIG_MISSING",
+                        "message": "Cloudflare Worker URL atau secret belum dikonfigurasi.",
+                        "staged_count": 0,
+                        "auto_applied_count": 0,
+                    }, status=200)
 
-            if is_wrong_secret_type(cred):
-                return self.send_json({
-                    "status": "error",
-                    "error": "WRONG_SECRET_TYPE",
-                    "message": "Tipe secret salah: bukan STAGING_ADMIN_TOKEN.",
-                }, status=401)
+                if is_wrong_secret_type(cf_secret):
+                    return self.send_json({
+                        "status": "disabled",
+                        "reason": "WRONG_SECRET_TYPE",
+                        "message": "Tipe secret salah: bukan STAGING_ADMIN_TOKEN.",
+                        "staged_count": 0,
+                        "auto_applied_count": 0,
+                    }, status=200)
 
-            expected_staging_token = get_staging_admin_token()
-            if not expected_staging_token or not hmac.compare_digest(cred, expected_staging_token):
-                return self.send_json({
-                    "status": "error",
-                    "error": "INVALID_CREDENTIALS",
-                    "message": "Kredensial staging admin tidak valid.",
-                }, status=401)
+                cred = cf_secret
+            else:
+                if not cred:
+                    return self.send_json({
+                        "status": "error",
+                        "error": "MISSING_CREDENTIALS",
+                        "message": "Kredensial staging admin tidak ditemukan.",
+                    }, status=401)
+
+                if is_wrong_secret_type(cred):
+                    return self.send_json({
+                        "status": "error",
+                        "error": "WRONG_SECRET_TYPE",
+                        "message": "Tipe secret salah: bukan STAGING_ADMIN_TOKEN.",
+                    }, status=401)
+
+                expected_staging_token = get_staging_admin_token()
+                if not expected_staging_token or not hmac.compare_digest(cred, expected_staging_token):
+                    return self.send_json({
+                        "status": "error",
+                        "error": "INVALID_CREDENTIALS",
+                        "message": "Kredensial staging admin tidak valid.",
+                    }, status=401)
 
             try:
                 res = sync_edge_inbox(secret=cred)
-                return self.send_json(res, status=200)
+                safe_res = {k: v for k, v in res.items() if k not in ("secret", "token", "clean_secret")}
+                return self.send_json(safe_res, status=200)
             except Exception as e:
                 return self.send_json({
                     "status": "error",

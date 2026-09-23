@@ -4406,24 +4406,8 @@ async function pullFromCloud() {
     badge.style.color = '#38bdf8';
   }
   try {
-    let token = '';
-    if (typeof localStorage !== 'undefined') {
-      token = localStorage.getItem('aturuang_staging_token') || '';
-    }
-    if (!token && typeof prompt !== 'undefined') {
-      token = prompt('Masukkan Staging Admin Token:');
-      if (token && typeof localStorage !== 'undefined') {
-        localStorage.setItem('aturuang_staging_token', token.trim());
-      }
-    }
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) {
-      headers['Authorization'] = 'Bearer ' + token.trim();
-    }
     const res = await api('/api/sync/pull-cloud', {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ staging_admin_token: token ? token.trim() : '' }),
     });
     if (res && res.status === 'success') {
       await fetchAndRenderSyncStatus();
