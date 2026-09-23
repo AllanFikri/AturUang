@@ -775,7 +775,27 @@ def sync_edge_inbox(
                     except (ValueError, TypeError):
                         pass
 
-                payload_str = json.dumps(item, ensure_ascii=False)
+                candidate_obj = item.get("candidate")
+                if isinstance(candidate_obj, dict):
+                    payload_dict = dict(candidate_obj)
+                    root_cursor = item.get("cursor")
+                    if root_cursor is None and item.get("id") is not None:
+                        root_cursor = str(item.get("id"))
+                    root_meta = {
+                        "message_id": item.get("message_id"),
+                        "cursor": root_cursor,
+                        "cursor_id": item.get("id"),
+                        "occurred_at": item.get("occurred_at"),
+                        "sender": item.get("sender") or item.get("from"),
+                        "subject": item.get("subject"),
+                    }
+                    for k, v in root_meta.items():
+                        if v is not None and k not in payload_dict:
+                            payload_dict[k] = v
+                else:
+                    payload_dict = item
+
+                payload_str = json.dumps(payload_dict, ensure_ascii=False)
                 content_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
                 existing = con.execute(
