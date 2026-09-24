@@ -1640,52 +1640,192 @@ export function parseGmailIntelligence(
   // -----------------------------------------------------------------------
   // 3. FLIP (no-reply@flip.id)
   // -----------------------------------------------------------------------
-  if (cleanFrom.includes("flip.id")) {
-    const amount = parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
-    const refMatch = bodyText.match(/(?:id transaksi|transaksi id|ref(?:erence)?)\s*[:]?\s*([a-zA-Z0-9]+)/i);
-    const refId = refMatch ? refMatch[1] : null;
-    const destMatch = bodyText.match(/(?:ke|rekening tujuan)\s*[:]?\s*([a-zA-Z0-9\s]+)/i);
-    const destName = destMatch ? destMatch[1].trim() : "Penerima Flip";
+  function extractFlipReferenceId(
+    subject: string,
+    body: string
+  ): { id: string | null; kind: string | null } {
+    const combined = (subject || "") + "\n" + (body || "");
+    const patterns = [
+      { regex: /#FT\d{9}/i,        kind: "flip_transfer" },
+      { regex: /#W\d{9}/i,         kind: "flip_transfer_digital" },
+      { regex: /#R\d{8}/i,         kind: "flip_transfer_or_refund" },
+      { regex: /#INT\d{7}/i,       kind: "flip_international" },
+      { regex: /#BT\d{8}/i,        kind: "flip_bulk" },
+      { regex: /#QT-\d{20}/i,      kind: "flip_qris" },
+      { regex: /\bFT\d{9}\b/i,   kind: "flip_fallback" },
+    ];
+    for (const p of patterns) {
+      const m = combined.match(p.regex);
+      if (m) return { id: m[0].toUpperCase(), kind: p.kind };
+    }
+    return { id: null, kind: null };
+  }
 
-    const cand: ParsedCandidate = {
-      tx_type: "Expense",
-      amount,
-      account: "BCA Main",
-      to_account: null,
-      category: "Other / Miscellaneous",
-      money_context: "Personal",
-      person_name: destName,
-      date: wib.dateStr,
-      time: wib.timeStr,
-      confidence_score: 0.75,
-      reasons: `Flip: Transfer via intermediary Flip ke ${destName}.`,
-      status: "Pending",
-    };
+  if (cleanFrom.includes("flip.id")) {
+    // 1. Blacklist check BEFORE any parsing
+    const isCoinReward = /#TU\d{9}/i.test(subject + bodyText);
+    const isMarketingSubject =
+      /Koin|Coin|Cashback|Pemenang|Pemeliharaan|expired|sure you use saldo|Flip Coins will expire/i
+        .test(subject || "") ||
+      /sure you use saldo|Flip Coins will expire/i.test(bodyText || "");
+    const isMarketingSender =
+      cleanFrom.includes("hello@flip.id") ||
+      cleanFrom.includes("hello@mail.flip.id");
+    const isFailedAttempt =
+      /TRANSAKSI GAGAL DIPROSES/i.test(bodyText || "");
+
+    if (isCoinReward || isMarketingSubject || isMarketingSender || isFailedAttempt) {
+      return {
+        event_id: `flip_skip_${occurredAtWib.replace(/[^0-9]/g, "")}`,
+        occurred_at_wib: occurredAtWib,
+        status: "Ignored",
+        event_kind: (isFailedAttempt ? "FAILED_ATTEMPT" : "NON_TRANSACTION") as any,
+        financial_class: "Ignore",
+        financial_direction: "Neutral",
+        amount: 0,
+        currency: "IDR",
+        fee_amount: 0,
+        source_account_alias: null,
+        destination_account_alias: null,
+        destination_owner_type: "MERCHANT",
+        merchant_normalized: "Flip",
+        merchant_pan: null,
+        merchant_location: null,
+        counterparty_normalized: "Flip",
+        description_normalized: isFailedAttempt
+          ? "Flip Failed Transfer Notice"
+          : "Flip Non-Transaction Notice",
+        transaction_reference: null,
+        external_order_id: null,
+        confidence: 0.95,
+        recommended_action:
+          "Keep as lifecycle evidence; zero ledger mutation",
+        review_reason: isFailedAttempt
+          ? "Flip failed transfer; no completed charge."
+          : "Flip non-transaction notice.",
+        evidence_role: "LIFECYCLE_STATUS",
+        candidate: null,
+      };
+    }
+
+    // 2. Extract reference ID multi-format
+    const { id: refId, kind: refKind } =
+      extractFlipReferenceId(subject || "", bodyText || "");
+
+    // 3. Extract amount
+    const amount =
+      parseIndonesianAmount(bodyText) ||
+      parseIndonesianAmount(subject) ||
+      0;
+
+    // 4. Extract destination (strict regex, no over-capture)
+    const destMatch = bodyText.match(
+      /(?:destination name|recipient name|penerima|atas nama)\s*[\r\n:]+\s*([^\r\n]{3,60})/i
+    );
+    const destName = destMatch ? destMatch[1].trim() : null;
+
+    // 5. Detect refund / bulk / qris / international
+    const isRefund = /refund/i.test(subject || "");
+    const isBulk =
+      refKind === "flip_bulk" || /banyak tujuan/i.test(subject || "");
+    const isQris =
+      refKind === "flip_qris" || /QRIS Payment/i.test(subject || "");
+    const isInternational =
+      refKind === "flip_international" ||
+      /transfer to Malaysia|Flip Globe/i.test(subject || "");
+
+    // 6. Classify
+    let financialClass: string;
+    let eventKind: string;
+    let txType: string;
+    let category: string;
+
+    if (isRefund) {
+      financialClass = "Ignore";
+      eventKind = "REFUND_NOTICE";
+      txType = "Review";
+      category = "Other / Miscellaneous";
+    } else if (isQris) {
+      financialClass = "Expense";
+      eventKind = "MERCHANT_PAYMENT";
+      txType = "Expense";
+      category = "Makanan & Minuman / Cafe & Minuman";
+    } else if (isInternational) {
+      financialClass = "Expense";
+      eventKind = "INTERNATIONAL_PURCHASE";
+      txType = "Expense";
+      category = "Lain-lain / Lab Equipment";
+    } else if (isBulk) {
+      financialClass = "Expense";
+      eventKind = "BULK_TRANSFER";
+      txType = "Transfer";
+      category = "Transfer & Investasi / Transfer ke Teman";
+    } else {
+      financialClass = "Expense";
+      eventKind = "EXTERNAL_TRANSFER";
+      txType = "Transfer";
+      category = "Transfer & Investasi / Transfer ke Teman";
+    }
+
+    // 7. Build candidate (null for refund, null for zero amount)
+    const cand: ParsedCandidate | null =
+      amount > 0 && !isRefund
+        ? {
+            tx_type: txType as any,
+            amount,
+            account: "BCA Main",
+            to_account: null,
+            category,
+            money_context: "Personal",
+            person_name: destName,
+            date: wib.dateStr,
+            time: wib.timeStr,
+            confidence_score: refId ? 0.95 : 0.75,
+            reasons: refId
+              ? `Flip: ${eventKind} (${refId})${
+                  destName ? " ke " + destName : ""
+                }.`
+              : `Flip: ${eventKind} tanpa ID referensi.`,
+            status: refId ? "AutoApproved" : "Pending",
+          }
+        : null;
 
     return {
       event_id: refId ? `flip_${refId}` : `flip_${Date.now()}`,
       occurred_at_wib: occurredAtWib,
-      status: "Pending",
-      event_kind: "EXTERNAL_TRANSFER",
-      financial_class: "Pending Review",
-      financial_direction: "Debit",
+      status: refId && !isRefund ? "AutoApproved" : "Pending",
+      event_kind: eventKind as any,
+      financial_class: financialClass as any,
+      financial_direction: isRefund ? "Neutral" : "Debit",
       amount,
       currency: "IDR",
       fee_amount: 0,
       source_account_alias: "BCA Main",
       destination_account_alias: null,
-      destination_owner_type: "OTHER_PERSON",
-      merchant_normalized: null,
+      destination_owner_type: isRefund
+        ? "SELF"
+        : destName
+        ? "OTHER_PERSON"
+        : "UNKNOWN",
+      merchant_normalized: isQris ? destName : "Flip",
       merchant_pan: null,
       merchant_location: null,
-      counterparty_normalized: destName,
-      description_normalized: `Transfer Flip ke ${destName}`,
+      counterparty_normalized: destName || "Flip",
+      description_normalized: `Flip ${eventKind}${
+        refId ? " " + refId : ""
+      }`,
       transaction_reference: refId,
       external_order_id: refId,
-      confidence: 0.75,
-      recommended_action: "Correlate with bank debit and review recipient",
-      review_reason: "Flip transfer workflow requires recipient semantic confirmation.",
-      evidence_role: "INTERMEDIARY",
+      confidence: refId ? 0.95 : 0.75,
+      recommended_action: isRefund
+        ? "Correlate refund with original transaction via reference ID"
+        : "Record Flip transaction; dedup by reference ID",
+      review_reason: refId
+        ? isRefund
+          ? "Refund notice; reversal handled by correlation."
+          : null
+        : "Flip transaction without extractable reference ID.",
+      evidence_role: isRefund ? "LIFECYCLE_STATUS" : "PRIMARY_PAYMENT",
       candidate: cand,
     };
   }
