@@ -17,3 +17,11 @@
 
 ## Scope
 - Touch only files in prompt SCOPE. No silent expansion. Report BLOCKER instead.
+
+
+## Production Database Read Rule (added 2026-09-25 after incident)
+- ANY read of production DB MUST use URI: file:<path>?mode=ro
+- sqlite3.connect('runtime/money_tracks.db') without mode=ro is FORBIDDEN.
+- This applies to inspection scripts, delta analysis, forensic queries, and one-off python -c commands.
+- RW mode changes the file hash even for pure SELECT (freelist / page reorganization), breaking the hash invariant.
+- Violation = immediate STOP, report HASH_MUTATED_BY_READ.
