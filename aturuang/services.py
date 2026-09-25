@@ -2280,18 +2280,23 @@ def report_data(con: sqlite3.Connection, month: str | None = None) -> dict:
             ),
             2,
         )
-        expense = round(
-            float(
-                con.execute(
-                    """SELECT COALESCE(SUM(budget_effect),0) FROM transactions
-                       WHERE substr(date,1,7)=? AND transaction_type='Expense' AND money_context='Personal'
-                         AND status<>'Provisional Neutral' AND is_deleted=0
-                         AND description NOT LIKE '[Rekonsiliasi]%'""",
-                    (m,),
-                ).fetchone()[0]
-            ),
-            2,
-        )
+        expense_rows = con.execute(
+            """SELECT * FROM transactions
+               WHERE substr(date,1,7)=? AND transaction_type='Expense' AND money_context='Personal'
+                 AND status<>'Provisional Neutral' AND is_deleted=0
+                 AND description NOT LIKE '[Rekonsiliasi]%'""",
+            (m,),
+        ).fetchall()
+        expense_total = 0.0
+        for row in expense_rows:
+            rule_ver = row["budget_rule_version"] if "budget_rule_version" in row.keys() else "legacy"
+            if rule_ver == "legacy" or not rule_ver:
+                contribution = float(row["budget_effect"] or 0.0)
+            else:
+                excluded = row["exclude_from_budget"] if "exclude_from_budget" in row.keys() else 0
+                contribution = 0.0 if excluded else float(row["amount"] or 0.0)
+            expense_total += contribution
+        expense = round(expense_total, 2)
         research = round(
             float(
                 con.execute(
@@ -2914,9 +2919,13 @@ def detect_recurring_patterns(
             confidence = "high"
             reason = f"Terdeteksi {support}x dengan nominal sangat stabil (median {idr(med_amt)}) setiap ~{step} hari."
         elif support >= min_support:
-            classification = "Pola Belanja"
+            if tx_type == "Income":
+                classification = "Pola Pemasukan"
+                reason = f"Pola pemasukan berulang {support}x (median nominal {idr(med_amt)}, variasi ±{int(amt_cv*100)}%, interval ~{step} hari)."
+            else:
+                classification = "Pola Belanja"
+                reason = f"Pola belanja berulang {support}x (median nominal {idr(med_amt)}, variasi ±{int(amt_cv*100)}%, interval ~{step} hari)."
             confidence = "medium"
-            reason = f"Pola belanja berulang {support}x (median nominal {idr(med_amt)}, variasi ±{int(amt_cv*100)}%, interval ~{step} hari)."
         else:
             classification = "Abstain"
             confidence = "low"
