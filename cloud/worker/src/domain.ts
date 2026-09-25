@@ -1931,7 +1931,12 @@ export function parseGmailIntelligence(
     const isMarketingSender =
       cleanFrom.includes("hello@flip.id") ||
       cleanFrom.includes("hello@mail.flip.id");
-    const isFailedAttempt = /TRANSAKSI GAGAL DIPROSES/i.test(bodyText || "");
+    const isFailedAttempt =
+      /TRANSAKSI GAGAL DIPROSES/i.test(bodyText || "") ||
+      /Transaction Failed to Process/i.test(subject || "") ||
+      /TRANSACTION FAILED TO PROCESS|your transaction cannot be processed|cant receive transfer/i.test(
+        bodyText || ""
+      );
     const isSecurityAlert =
       /another device|new device|login to your account|change your password|security alert/i.test(
         subject || ""
@@ -1985,31 +1990,57 @@ export function parseGmailIntelligence(
       bodyText || ""
     );
 
+    // Detect request email ("Informasi transfer")
+    const isRequest =
+      /Informasi transfer ke/i.test(subject || "") ||
+      /INFORMASI TRANSAKSI|Kamu baru aja ngajuin transaksi/i.test(bodyText || "");
+
     // 3. Extract amount
-    const amount =
-      parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
+    let amount = 0;
+    if (isRequest) {
+      // SPEC R2: Extract from the FIRST "Jumlah Transfer" line in the body
+      const reqAmountMatch = (bodyText || "").match(
+        /Jumlah Transfer\s*[\r\n]+\s*Rp\s*([0-9.,]+)/i
+      );
+      if (reqAmountMatch) {
+        amount = parseIndonesianAmount(`Rp ${reqAmountMatch[1]}`) || 0;
+      }
+    } else {
+      // SPEC R3: Strip lines containing "Kode Unik" or "Unique Code" before amount regex runs
+      const cleanedBodyForAmount = (bodyText || "")
+        .replace(/(?:Kode Unik|Unique Code)[^\r\n]*(?:[\r\n]+\s*(?:Rp\.?\s*)?[0-9.,]+)?/gi, "")
+        .split(/\r?\n/)
+        .filter((line) => !/Kode Unik|Unique Code/i.test(line))
+        .join("\n");
+
+      amount =
+        parseIndonesianAmount(cleanedBodyForAmount) ||
+        parseIndonesianAmount(subject || "") ||
+        0;
+    }
 
     // 4. Extract destination / merchant (strict regex, no over-capture)
     const bodyToSearch = (bodyText || "") + "\n";
     let destinationNameRaw: string | null = null;
     const destNameMatch = bodyToSearch.match(
-      /Destination Name\s*[\r\n]+\s*(.+?)\s*[\r\n]/i
+      /(?:Destination Name|Beneficiary Name|Tujuan)\s*[\r\n]+\s*(.+?)\s*[\r\n]/i
     );
     if (destNameMatch) {
       destinationNameRaw = destNameMatch[1].trim();
     } else {
-      const beneMatch = bodyToSearch.match(
-        /Beneficiary Name\s*[\r\n]+\s*(.+?)\s*[\r\n]/i
+      const fallbackDestMatch = bodyText.match(
+        /(?:destination name|recipient name|penerima|atas nama|tujuan)\s*[\r\n:]+\s*([^\r\n]{3,60})/i
       );
-      if (beneMatch) {
-        destinationNameRaw = beneMatch[1].trim();
+      if (fallbackDestMatch) {
+        destinationNameRaw = fallbackDestMatch[1].trim();
+      } else {
+        const subjMatch = (subject || "").match(/Informasi transfer ke\s+([^\r\n]+)/i);
+        if (subjMatch) {
+          destinationNameRaw = subjMatch[1].trim();
+        }
       }
     }
-
-    const fallbackDestMatch = bodyText.match(
-      /(?:destination name|recipient name|penerima|atas nama)\s*[\r\n:]+\s*([^\r\n]{3,60})/i
-    );
-    const destName = destinationNameRaw || (fallbackDestMatch ? fallbackDestMatch[1].trim() : null);
+    const destName = destinationNameRaw;
     const destinationNameNormalized = normalizeOwnerName(destName);
 
     // 5. Detect refund / bulk / qris / international
@@ -2044,7 +2075,19 @@ export function parseGmailIntelligence(
     let txType: string;
     let category: string;
 
-    if (isRefund) {
+    if (isRequest) {
+      if (isSelf) {
+        financialClass = "Internal Transfer";
+        eventKind = "OWN_TRANSFER";
+        txType = "Transfer";
+        category = "Transfer & Investasi / Transfer ke Teman";
+      } else {
+        financialClass = "Expense";
+        eventKind = "EXTERNAL_TRANSFER";
+        txType = "Transfer";
+        category = "Transfer & Investasi / Transfer ke Teman";
+      }
+    } else if (isRefund) {
       financialClass = "Refund";
       eventKind = "REFUND";
       txType = "Reversal";
@@ -2080,7 +2123,10 @@ export function parseGmailIntelligence(
     let status: "Pending" | "AutoApproved" = "Pending";
     let confidence = 0.75;
 
-    if (isRefund) {
+    if (isRequest) {
+      status = "Pending";
+      confidence = 0.75;
+    } else if (isRefund) {
       status = refId ? "AutoApproved" : "Pending";
       confidence = refId ? 0.95 : 0.75;
     } else if (isQris) {
@@ -2140,21 +2186,30 @@ export function parseGmailIntelligence(
       throw new Error(`Flip parser produced invalid event_kind: ${eventKind}`);
     }
 
+    let destinationOwnerType: "SELF" | "MERCHANT" | "OTHER_PERSON" | "UNKNOWN";
+    if (isRefund || isSelf || eventKind === "OWN_TRANSFER") {
+      destinationOwnerType = "SELF";
+    } else if (isRequest) {
+      destinationOwnerType = "OTHER_PERSON";
+    } else if (isQris) {
+      destinationOwnerType = qrisMerchant ? "MERCHANT" : "UNKNOWN";
+    } else {
+      destinationOwnerType = destName ? "OTHER_PERSON" : "UNKNOWN";
+    }
+
     return {
       event_id: eventId,
       occurred_at_wib: occurredAtWib,
       status,
       event_kind: eventKind as any,
       financial_class: financialClass as any,
-      financial_direction: isRefund ? "Credit" : (isSelf ? "Neutral" : "Debit"),
+      financial_direction: isRefund ? "Credit" : (isSelf || eventKind === "OWN_TRANSFER" ? "Neutral" : "Debit"),
       amount,
       currency: "IDR",
       fee_amount: 0,
       source_account_alias: "BCA Main",
       destination_account_alias: null,
-      destination_owner_type: isRefund || isSelf
-        ? "SELF"
-        : (isQris ? (qrisMerchant ? "MERCHANT" : "UNKNOWN") : (destName ? "OTHER_PERSON" : "UNKNOWN")),
+      destination_owner_type: destinationOwnerType,
       merchant_normalized: merchantNormalized,
       merchant_pan: null,
       merchant_location: null,
@@ -2166,7 +2221,9 @@ export function parseGmailIntelligence(
       recommended_action: isRefund
         ? "Record Flip refund reversal; correlate with original debit"
         : "Record Flip transaction; dedup by reference ID",
-      review_reason: !refId
+      review_reason: isRequest
+        ? "Flip transaction request pending completion."
+        : !refId
         ? "Flip transaction without extractable reference ID."
         : isQris && !qrisMerchant
         ? "Flip QRIS payment without extractable merchant name."
