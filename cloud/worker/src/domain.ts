@@ -772,6 +772,219 @@ export const CANONICAL_EVENT_KIND_SET: ReadonlySet<string> = new Set([
   "NON_TRANSACTION",
 ]);
 
+// -------------------------------------------------------------------------
+// ESB E-Receipt Parser (no-reply@mailer-esb.com)
+// -------------------------------------------------------------------------
+export function parseEsbReceipt(
+  subject: string,
+  bodyText: string,
+  fromAddress: string,
+  occurredAt?: string,
+  _overrideEventKind?: string
+): CanonicalFinancialEvent {
+  const wib = getWibDate(occurredAt ? new Date(occurredAt) : new Date());
+  const occurredAtWib = occurredAt || `${wib.dateStr} ${wib.timeStr} WIB`;
+
+  const isBodyTooShort = !bodyText || bodyText.trim().length < 50;
+
+  // Order ID extraction
+  let orderId: string | null = null;
+  const orderMatch = (bodyText || "").match(
+    /#Order\s*[\r\n]+\s*\*([A-Z0-9]{8,20})\*\s+\d{2}-\d{2}-\d{4}/i
+  );
+  if (orderMatch) {
+    orderId = orderMatch[1].toUpperCase();
+  }
+
+  // Merchant extraction
+  let merchant: string | null = null;
+  const rejectTokens = [
+    "total spent",
+    "order details",
+    "order information",
+    "customer name",
+    "membership",
+    "table number",
+  ];
+
+  // Priority 1: Body regex (Variant A)
+  if (!isBodyTooShort) {
+    const bodyMatch = bodyText.match(
+      /\*([^*\n]{3,80})\*\s*[\r\n]+\s*Phone Number\s*:/i
+    );
+    if (bodyMatch) {
+      const candidateMerchant = bodyMatch[1]
+        .trim()
+        .replace(/\s+/g, " ")
+        .replace(/^\*+|\*+$/g, "")
+        .trim();
+      const isRejected = rejectTokens.some((tok) =>
+        candidateMerchant.toLowerCase().includes(tok)
+      );
+      if (!isRejected && candidateMerchant.length > 0) {
+        merchant = candidateMerchant;
+      }
+    }
+  }
+
+  // Priority 2: Subject regex (Variant A: "[E-Receipt] <merchant>")
+  if (!merchant && subject) {
+    const subjMatchA = subject.match(/^\s*\[E-Receipt\]\s*(.+?)\s*$/i);
+    if (subjMatchA) {
+      const candidateMerchant = subjMatchA[1]
+        .trim()
+        .replace(/\s+/g, " ")
+        .replace(/^\*+|\*+$/g, "")
+        .trim();
+      if (candidateMerchant.length > 0) {
+        merchant = candidateMerchant;
+      }
+    }
+  }
+
+  // Priority 3: Subject regex (Variant B: "Receipt from <merchant>")
+  if (!merchant && subject) {
+    const subjMatchB = subject.match(/^\s*Receipt from\s+(.+?)\s*$/i);
+    if (subjMatchB) {
+      const candidateMerchant = subjMatchB[1]
+        .trim()
+        .replace(/\s+/g, " ")
+        .replace(/^\*+|\*+$/g, "")
+        .trim();
+      if (candidateMerchant.length > 0) {
+        merchant = candidateMerchant;
+      }
+    }
+  }
+
+  // Amount extraction
+  let amount: number | null = null;
+  if (!isBodyTooShort) {
+    const totalSpentMatch = bodyText.match(
+      /Total Spent[\s\S]*?\*\s*Rp\s*([0-9.,]+)\s*\*/i
+    );
+    if (totalSpentMatch) {
+      amount = parseIndonesianAmount(totalSpentMatch[1]);
+    }
+    if (amount === null) {
+      const cleanedForAmount = bodyText
+        .replace(/Phone Number\s*:\s*[0-9+\s\-]+/gi, "")
+        .replace(/\b\d{2}-\d{2}-\d{4}\b/g, "")
+        .replace(/#Order\s*[\r\n]+\s*\*[A-Z0-9]+\*/gi, "");
+      const hasAmountIndicator = /(?:total|nominal|sebesar|rp\.?|idr)/i.test(cleanedForAmount);
+      if (hasAmountIndicator) {
+        amount = parseIndonesianAmount(cleanedForAmount);
+      }
+    }
+    if (amount !== null) {
+      amount = round2(amount);
+    }
+  }
+
+  // Status, confidence, review_reason, destination_owner_type, merchant_normalized
+  let status: "Pending" | "AutoApproved" = "Pending";
+  let confidence = 0.5;
+  let reviewReason: string | null = null;
+  let destinationOwnerType: "MERCHANT" | "UNKNOWN" = "UNKNOWN";
+  let merchantNormalized = "ESB";
+
+  if (isBodyTooShort) {
+    status = "Pending";
+    confidence = 0.3;
+    reviewReason = "ESB body too short to parse.";
+    destinationOwnerType = "UNKNOWN";
+    merchantNormalized = "ESB";
+    amount = 0;
+  } else if (amount === null || amount <= 0) {
+    status = "Pending";
+    confidence = 0.3;
+    reviewReason = "ESB amount not extractable.";
+    destinationOwnerType = merchant ? "MERCHANT" : "UNKNOWN";
+    merchantNormalized = merchant || "ESB";
+    amount = 0;
+  } else if (!merchant) {
+    status = "Pending";
+    confidence = 0.5;
+    reviewReason = "ESB receipt without extractable merchant name.";
+    destinationOwnerType = "UNKNOWN";
+    merchantNormalized = "ESB";
+  } else {
+    status = orderId ? "AutoApproved" : "Pending";
+    confidence = orderId ? 0.92 : 0.7;
+    reviewReason = null;
+    destinationOwnerType = "MERCHANT";
+    merchantNormalized = merchant;
+  }
+
+  const eventKind = _overrideEventKind || "MERCHANT_PAYMENT";
+  const financialClass = "Expense";
+  const financialDirection = "Debit";
+
+  // Mandatory guard
+  if (!CANONICAL_EVENT_KIND_SET.has(eventKind)) {
+    throw new Error(`ESB parser produced invalid event_kind: ${eventKind}`);
+  }
+
+  const eventId = orderId
+    ? `esb_${orderId}`
+    : `esb_noref_${fnv1a64Hex(
+        (subject || "") + "\n" + (bodyText || "") + "\n" + occurredAtWib
+      )}`;
+
+  const cand: ParsedCandidate | null =
+    amount > 0
+      ? {
+          tx_type: "Expense",
+          amount,
+          account: "BCA Main",
+          to_account: null,
+          category: "Other / Miscellaneous",
+          money_context: "Personal",
+          person_name: merchant,
+          date: wib.dateStr,
+          time: wib.timeStr,
+          confidence_score: confidence,
+          reasons: merchant
+            ? `ESB E-Receipt: Pembayaran ke ${merchant}${
+                orderId ? ` (${orderId})` : ""
+              }.`
+            : "ESB E-Receipt.",
+          status: status === "AutoApproved" ? "AutoApproved" : "Pending",
+        }
+      : null;
+
+  return {
+    event_id: eventId,
+    occurred_at_wib: occurredAtWib,
+    status: status as any,
+    event_kind: eventKind as any,
+    financial_class: financialClass as any,
+    financial_direction: financialDirection,
+    amount: amount || 0,
+    currency: "IDR",
+    fee_amount: 0,
+    source_account_alias: null,
+    destination_account_alias: null,
+    destination_owner_type: destinationOwnerType as any,
+    merchant_normalized: merchantNormalized,
+    merchant_pan: null,
+    merchant_location: null,
+    counterparty_normalized: merchantNormalized,
+    description_normalized: `ESB ${merchantNormalized}${
+      orderId ? " " + orderId : ""
+    }`,
+    transaction_reference: orderId,
+    external_order_id: orderId,
+    confidence,
+    recommended_action: orderId
+      ? "Record ESB merchant payment"
+      : "Review ESB transaction",
+    review_reason: reviewReason,
+    evidence_role: "PRIMARY_PAYMENT",
+    candidate: cand,
+  };
+}
+
 // =========================================================================
 // GMAIL TRANSACTION INTELLIGENCE V1 PARSER
 // =========================================================================
@@ -2144,39 +2357,13 @@ export function parseGmailIntelligence(
   // -----------------------------------------------------------------------
   // 6. ESB E-Receipt (no-reply@mailer-esb.com)
   // -----------------------------------------------------------------------
-  if (cleanFrom.includes("mailer-esb.com")) {
-    const amount = parseIndonesianAmount(bodyText) || 0;
-    const orderMatch = bodyText.match(/(?:order id|receipt no|no struk)\s*[:]?\s*([a-zA-Z0-9\-_]+)/i);
-    const orderId = orderMatch ? orderMatch[1] : null;
-    const mMatch = bodyText.match(/(?:merchant|resto|outlet|store)\s*[:]?\s*([a-zA-Z0-9\s\.,\-_]+)/i);
-    const merchant = mMatch ? mMatch[1].trim() : "ESB Restaurant";
-
-    return {
-      event_id: orderId ? `esb_${orderId}` : `esb_${Date.now()}`,
-      occurred_at_wib: occurredAtWib,
-      status: "Approved",
-      event_kind: "INVOICE_EVIDENCE",
-      financial_class: "Expense",
-      financial_direction: "Debit",
-      amount,
-      currency: "IDR",
-      fee_amount: 0,
-      source_account_alias: null,
-      destination_account_alias: null,
-      destination_owner_type: "MERCHANT",
-      merchant_normalized: merchant,
-      merchant_pan: null,
-      merchant_location: null,
-      counterparty_normalized: merchant,
-      description_normalized: `Struk Digital ESB: ${merchant}`,
-      transaction_reference: orderId,
-      external_order_id: orderId,
-      confidence: 0.90,
-      recommended_action: "Correlate with bank debit evidence",
-      review_reason: null,
-      evidence_role: "SECONDARY_RECEIPT",
-      candidate: null, // Secondary evidence: enriches bank debit
-    };
+  const esbFromEmail = (cleanFrom.match(/<([^>]+)>/)?.[1] || cleanFrom).trim();
+  if (
+    esbFromEmail === "no-reply@mailer-esb.com" ||
+    cleanFrom.includes("no-reply@mailer-esb.com") ||
+    cleanFrom.includes("mailer-esb.com")
+  ) {
+    return parseEsbReceipt(subject, bodyText, fromAddress, occurredAt);
   }
 
   // -----------------------------------------------------------------------
