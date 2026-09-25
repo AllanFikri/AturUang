@@ -80,3 +80,19 @@ Jangan gunakan:
 10. Pengulangan informasi baseline yang tidak berubah.
 
 Gunakan nomor urut sederhana dan kalimat normal. Laporan tetap boleh menyajikan detail teknis penting tanpa mengorbankan bukti demi memperpendek jawaban.
+
+## AturUang V3 Safety Overrides (added 2026-09-25)
+
+Bagian ini menambah aturan V12 di atas. Kalau ada konflik, aturan V3 menang.
+
+Production DB hash kanonik: 8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421. Hash before/after setiap stage wajib sama. Jangan pernah query production DB kecuali prompt mengizinkan read-only.
+
+Jangan buat migration 0008 atau lebih tinggi. D1 chain berhenti di 0007.
+
+Jangan push ke main atau feature/universal-ingestion-v1. Push hanya ke review branch. Fast-forward only, tanpa merge/squash/rebase/amend.
+
+Setiap prompt stage wajib punya SCOPE eksplisit. Jangan sentuh file di luar scope. Kalau ragu, report BLOCKER jangan ekspansi.
+
+Format laporan stage pakai KEY=VALUE lines only (bukan format 400-kata). Tidak ada prose, tidak ada narasi, tidak ada emoji. Wajib ada key: SUCCESS, STAGE, PRE_HEAD, FINAL_COMMIT, REVIEW_REMOTE_HEAD, OFFICIAL_REMOTE_HEAD, MAIN_REMOTE_HEAD, WORKTREE_CLEAN, LINEAR_HISTORY, CHANGED_FILES, PROD_DB_BEFORE, PROD_DB_AFTER, PRIVATE_ARTIFACT_COMMITTED, READY_FOR_INDEPENDENT_AUDIT, READY_FOR_PROMOTION, BLOCKER.
+
+Rules detail ada di .agents/rules/ (atr-safety, atr-git, atr-test, atr-privacy, atr-report). Skills reusable ada di .agents/skills/ (atr-preflight, atr-audit).

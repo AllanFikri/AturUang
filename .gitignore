@@ -53,3 +53,6 @@ Thumbs.db
 .vscode/
 .idea/
 update_source.json
+
+# AturUang handoff docs (internal, jangan di-commit)
+docs/ATURUANG_HANDOFF_*.txt
