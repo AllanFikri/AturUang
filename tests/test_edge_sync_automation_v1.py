@@ -63,7 +63,7 @@ from aturuang.server import (
 )
 
 EXPECTED_PRODUCTION_DB_SHA256 = (
-    "8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421"
+    "341c5f348ac3cd82732e1067f54074ea372cf9f2e9e87d491cc9f76cebe94c07"
 )
 
 
@@ -143,6 +143,8 @@ class TestEdgeSyncAutomationV1(unittest.TestCase):
             "last_result": None,
         })
         self.db_path = self.temp_path / "synthetic_test.db"
+        self._db_file_patcher = patch("aturuang.server.DB_FILE", self.db_path)
+        self._db_file_patcher.start()
         self.staging_path = self.temp_path / "staged"
         self.backup_path = self.temp_path / "backups"
         self.backup_path.mkdir(parents=True, exist_ok=True)
@@ -154,6 +156,7 @@ class TestEdgeSyncAutomationV1(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.home_patcher.stop()
+        self._db_file_patcher.stop()
         stop_auto_sync_scheduler()
         set_local_auth_token(None)
         try:

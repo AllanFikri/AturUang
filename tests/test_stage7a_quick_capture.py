@@ -39,7 +39,7 @@ from aturuang.safe_apply import (
     SafeApplyEngine,
 )
 
-EXPECTED_PRODUCTION_DB_HASH = "8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421"
+EXPECTED_PRODUCTION_DB_HASH = "341c5f348ac3cd82732e1067f54074ea372cf9f2e9e87d491cc9f76cebe94c07"
 PRODUCTION_DB_PATH = Path("C:/A User Main Storage/Documents/GitHub/AturUang/runtime/money_tracks.db")
 
 

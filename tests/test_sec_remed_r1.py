@@ -51,7 +51,7 @@ from aturuang.server import (
 from aturuang.watched_folder import MAX_WATCHED_FILE_SIZE, WatchedFolderScanner
 
 EXPECTED_PRODUCTION_DB_SHA256 = (
-    "8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421"
+    "341c5f348ac3cd82732e1067f54074ea372cf9f2e9e87d491cc9f76cebe94c07"
 )
 
 

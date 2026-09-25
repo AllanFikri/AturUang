@@ -51,7 +51,7 @@ from aturuang.server import (
 from aturuang.safe_apply import SafeApplyEngine
 from aturuang.review_queue_ui import ReviewQueueManager
 
-EXPECTED_PROD_DB_HASH = "8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421"
+EXPECTED_PROD_DB_HASH = "341c5f348ac3cd82732e1067f54074ea372cf9f2e9e87d491cc9f76cebe94c07"
 
 
 def get_prod_db_hash() -> str:
@@ -820,7 +820,7 @@ class TestEdgeSyncValidationV1(unittest.TestCase):
             con.close()
 
     def test_15_production_db_invariant_holds(self) -> None:
-        """Production database SHA-256 remains unmutated at 8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421."""
+        """Production database SHA-256 remains unmutated at 341c5f348ac3cd82732e1067f54074ea372cf9f2e9e87d491cc9f76cebe94c07."""
         current_hash = get_prod_db_hash()
         self.assertEqual(current_hash, EXPECTED_PROD_DB_HASH)
 

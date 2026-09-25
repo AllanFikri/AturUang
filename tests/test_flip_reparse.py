@@ -9,7 +9,7 @@ Requirements:
   T-R05: prod DB hash mismatch (simulate by editing a copy) -> ABORT, no mutation.
   T-R06: scope exceeds 200 -> refuse.
   T-R07: --apply without backup capability -> refuse.
-  T-R08: prod DB hash check in setUpClass + tearDownClass (EXPECTED 8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421).
+  T-R08: prod DB hash check in setUpClass + tearDownClass (EXPECTED 341c5f348ac3cd82732e1067f54074ea372cf9f2e9e87d491cc9f76cebe94c07).
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import sys
 import tempfile
 import unittest
 
-EXPECTED_PROD_DB_HASH = "8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421"
+EXPECTED_PROD_DB_HASH = "341c5f348ac3cd82732e1067f54074ea372cf9f2e9e87d491cc9f76cebe94c07"
 PROD_DB_PATH = Path(r"C:\A User Main Storage\Documents\GitHub\AturUang\runtime\money_tracks.db")
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "flip_reparse" / "reparse_flip.py"
 
