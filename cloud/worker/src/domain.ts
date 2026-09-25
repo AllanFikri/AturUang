@@ -1992,15 +1992,15 @@ export function parseGmailIntelligence(
 
     // Detect request email ("Informasi transfer")
     const isRequest =
-      /Informasi transfer ke/i.test(subject || "") ||
-      /INFORMASI TRANSAKSI|Kamu baru aja ngajuin transaksi/i.test(bodyText || "");
+      /Informasi transfer ke|Informasi Transaksi|Informasi Top Up/i.test(subject || "") ||
+      /INFORMASI TRANSAKSI|Kamu baru aja ngajuin transaksi|Kamu baru saja melakukan permintaan/i.test(bodyText || "");
 
     // 3. Extract amount
     let amount = 0;
     if (isRequest) {
-      // SPEC R2: Extract from the FIRST "Jumlah Transfer" line in the body
+      // SPEC R1: Extract from the FIRST "Jumlah Transfer" or "Nominal" line in the body
       const reqAmountMatch = (bodyText || "").match(
-        /Jumlah Transfer\s*[\r\n]+\s*Rp\s*([0-9.,]+)/i
+        /(?:Jumlah Transfer|Nominal)\s*[\r\n]+\s*Rp\s*([0-9.,]+)/i
       );
       if (reqAmountMatch) {
         amount = parseIndonesianAmount(`Rp ${reqAmountMatch[1]}`) || 0;
@@ -2023,13 +2023,13 @@ export function parseGmailIntelligence(
     const bodyToSearch = (bodyText || "") + "\n";
     let destinationNameRaw: string | null = null;
     const destNameMatch = bodyToSearch.match(
-      /(?:Destination Name|Beneficiary Name|Tujuan)\s*[\r\n]+\s*(.+?)\s*[\r\n]/i
+      /(?:Destination Name|Beneficiary Name|Tujuan|Nama Penerima)\s*[\r\n]+\s*(.+?)\s*[\r\n]/i
     );
     if (destNameMatch) {
       destinationNameRaw = destNameMatch[1].trim();
     } else {
       const fallbackDestMatch = bodyText.match(
-        /(?:destination name|recipient name|penerima|atas nama|tujuan)\s*[\r\n:]+\s*([^\r\n]{3,60})/i
+        /(?:destination name|recipient name|penerima|atas nama|tujuan|nama penerima)\s*[\r\n:]+\s*([^\r\n]{3,60})/i
       );
       if (fallbackDestMatch) {
         destinationNameRaw = fallbackDestMatch[1].trim();
@@ -2060,6 +2060,11 @@ export function parseGmailIntelligence(
       destinationNameNormalized !== "" &&
       OWNER_NAMES.has(destinationNameNormalized);
 
+    const isTopUpRequest =
+      isRequest &&
+      (/Informasi Top Up/i.test(subject || "") ||
+        /#TUFT\d+/i.test(bodyText || ""));
+
     // QRIS merchant extraction (A2_QRIS_HYBRID)
     let qrisMerchant: string | null = null;
     if (isQris) {
@@ -2076,7 +2081,12 @@ export function parseGmailIntelligence(
     let category: string;
 
     if (isRequest) {
-      if (isSelf) {
+      if (isTopUpRequest) {
+        financialClass = "Top-up";
+        eventKind = "TOPUP";
+        txType = "Top Up";
+        category = "Other / Miscellaneous";
+      } else if (isSelf) {
         financialClass = "Internal Transfer";
         eventKind = "OWN_TRANSFER";
         txType = "Transfer";
@@ -2187,7 +2197,7 @@ export function parseGmailIntelligence(
     }
 
     let destinationOwnerType: "SELF" | "MERCHANT" | "OTHER_PERSON" | "UNKNOWN";
-    if (isRefund || isSelf || eventKind === "OWN_TRANSFER") {
+    if (isRefund || isSelf || eventKind === "OWN_TRANSFER" || eventKind === "TOPUP") {
       destinationOwnerType = "SELF";
     } else if (isRequest) {
       destinationOwnerType = "OTHER_PERSON";
@@ -2197,13 +2207,24 @@ export function parseGmailIntelligence(
       destinationOwnerType = destName ? "OTHER_PERSON" : "UNKNOWN";
     }
 
+    let financialDirection: "Credit" | "Debit" | "Neutral";
+    if (isRefund) {
+      financialDirection = "Credit";
+    } else if (eventKind === "TOPUP") {
+      financialDirection = "Debit";
+    } else if (eventKind === "OWN_TRANSFER" || isSelf) {
+      financialDirection = "Neutral";
+    } else {
+      financialDirection = "Debit";
+    }
+
     return {
       event_id: eventId,
       occurred_at_wib: occurredAtWib,
       status,
       event_kind: eventKind as any,
       financial_class: financialClass as any,
-      financial_direction: isRefund ? "Credit" : (isSelf || eventKind === "OWN_TRANSFER" ? "Neutral" : "Debit"),
+      financial_direction: financialDirection,
       amount,
       currency: "IDR",
       fee_amount: 0,

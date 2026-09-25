@@ -271,6 +271,96 @@ class TestFlipParserV4RequestHardening(unittest.TestCase):
         self.assertEqual(ev.get("amount"), 0)
         self.assertIsNone(ev.get("candidate"))
 
+    # T-RH11: "Informasi Transaksi #FT..." subject, body containing "Nama Penerima" + "Nominal\nRp1.500.000" + "Kode Unik*\nRp385" + second "Nominal\nRp1.500.385" -> amount == 1500000, event_kind == "EXTERNAL_TRANSFER", status == "Pending"
+    def test_trh11_informasi_transaksi_nominal_nama_penerima(self) -> None:
+        subject = "Informasi Transaksi #FT123456789"
+        body = (
+            "INFORMASI TRANSAKSI\n"
+            "ID Transaksi\n"
+            "#FT123456789\n"
+            "Nama Penerima\n"
+            "SYNTHETIC EXTERNAL PERSON\n"
+            "Nominal\n"
+            "Rp1.500.000\n"
+            "Kode Unik*\n"
+            "Rp385\n"
+            "*Kode unik sebesar Rp385...\n"
+            "Nominal\n"
+            "Rp1.500.385\n"
+        )
+        ev = run_node_parse_gmail(subject, body)
+
+        self.assertEqual(ev.get("amount"), 1500000)
+        self.assertEqual(ev.get("event_kind"), "EXTERNAL_TRANSFER")
+        self.assertEqual(ev.get("financial_class"), "Expense")
+        self.assertEqual(ev.get("destination_owner_type"), "OTHER_PERSON")
+        self.assertEqual(ev.get("status"), "Pending")
+        self.assertEqual(ev.get("confidence"), 0.75)
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand.get("amount"), 1500000)
+        self.assertEqual(cand.get("person_name"), "SYNTHETIC EXTERNAL PERSON")
+
+    # T-RH12: "Informasi Top Up #FT..." subject, body containing "#TUFT608906177" + "Nominal\nRp15.000" + "Kode Unik*\nRp238" -> amount == 15000, event_kind == "TOPUP", financial_class == "Top-up", financial_direction == "Debit", status == "Pending"
+    def test_trh12_informasi_topup_tuft_prefix(self) -> None:
+        subject = "Informasi Top Up #FT608906177"
+        body = (
+            "INFORMASI TRANSAKSI\n"
+            "ID Transaksi\n"
+            "#TUFT608906177\n"
+            "Nominal\n"
+            "Rp15.000\n"
+            "Kode Unik*\n"
+            "Rp238\n"
+            "*Kode unik sebesar Rp238...\n"
+            "Nominal\n"
+            "Rp15.238\n"
+        )
+        ev = run_node_parse_gmail(subject, body)
+
+        self.assertEqual(ev.get("amount"), 15000)
+        self.assertEqual(ev.get("event_kind"), "TOPUP")
+        self.assertEqual(ev.get("financial_class"), "Top-up")
+        self.assertEqual(ev.get("financial_direction"), "Debit")
+        self.assertEqual(ev.get("destination_owner_type"), "SELF")
+        self.assertEqual(ev.get("status"), "Pending")
+        self.assertEqual(ev.get("confidence"), 0.75)
+        self.assertEqual(ev.get("transaction_reference"), "#FT608906177")
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand.get("tx_type"), "Top Up")
+        self.assertEqual(cand.get("category"), "Other / Miscellaneous")
+        self.assertEqual(cand.get("amount"), 15000)
+
+    # T-RH13: "Informasi Transaksi #FT..." subject, body with "Nama Penerima\nALLAN FIKRI MAHARDIKA SANTOSA" + "Nominal\nRp30.000" -> amount == 30000, event_kind == "OWN_TRANSFER", destination_owner_type == "SELF"
+    def test_trh13_informasi_transaksi_owner_self(self) -> None:
+        subject = "Informasi Transaksi #FT998811223"
+        body = (
+            "INFORMASI TRANSAKSI\n"
+            "ID Transaksi\n"
+            "#FT998811223\n"
+            "Nama Penerima\n"
+            "ALLAN FIKRI MAHARDIKA SANTOSA\n"
+            "Nominal\n"
+            "Rp30.000\n"
+            "Kode Unik*\n"
+            "Rp111\n"
+            "Nominal\n"
+            "Rp30.111\n"
+        )
+        ev = run_node_parse_gmail(subject, body)
+
+        self.assertEqual(ev.get("amount"), 30000)
+        self.assertEqual(ev.get("event_kind"), "OWN_TRANSFER")
+        self.assertEqual(ev.get("financial_class"), "Internal Transfer")
+        self.assertEqual(ev.get("destination_owner_type"), "SELF")
+        self.assertEqual(ev.get("financial_direction"), "Neutral")
+        self.assertEqual(ev.get("status"), "Pending")
+        self.assertEqual(ev.get("confidence"), 0.75)
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand.get("amount"), 30000)
+
 
 if __name__ == "__main__":
     unittest.main()
