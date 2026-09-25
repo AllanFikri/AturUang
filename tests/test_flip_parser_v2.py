@@ -17,9 +17,9 @@ Requirements:
   12. Blacklist "TRANSAKSI GAGAL DIPROSES" -> Ignore, FAILED_ATTEMPT
   13. Transfer normal -> event_kind EXTERNAL_TRANSFER, status AutoApproved
   14. QRIS -> event_kind MERCHANT_PAYMENT, category Other / Miscellaneous (rules classify later)
-  15. Malaysia -> event_kind INTERNATIONAL_PURCHASE, category Lab Equipment
-  16. Refund -> REFUND_REVERSAL, direction Credit, is_reversal True
-  17. Bulk -> event_kind BULK_TRANSFER
+  15. Malaysia -> event_kind EXTERNAL_TRANSFER, category Lab Equipment
+  16. Refund -> REFUND, direction Credit, is_reversal True
+  17. Bulk -> event_kind EXTERNAL_TRANSFER
   18. transaction_reference == external_order_id == extracted ID, event_id strips '#'
   19. Two emails same ID -> same event_id
   20. No ID -> status Pending
@@ -38,6 +38,11 @@ Requirements:
   33. No-ref Flip email with Unicode body produces event_id != 'flip_noref_' and length >= 27
   34. Two no-ref Flip emails with different Unicode bodies produce different event_id
   35. Refund Flip email has financial_class == "Refund", is_reversal == True, financial_direction == "Credit"
+  36. CANONICAL_EVENT_KIND_SET import and exactly 14 schema values
+  37. Refund schema properties (event_kind REFUND, is_reversal)
+  38. Malaysia schema properties (event_kind EXTERNAL_TRANSFER, category Lab Equipment)
+  39. Bulk schema properties (event_kind EXTERNAL_TRANSFER, category Transfer ke Teman)
+  40. All Flip fixtures conform to CANONICAL_EVENT_KIND_SET
 """
 from __future__ import annotations
 
@@ -106,6 +111,27 @@ import('{domain_file_uri}').then(m => {{
         check=True,
     )
     return proc.stdout.strip()
+
+
+def run_node_canonical_event_kind_set() -> list[str]:
+    domain_file_uri = DOMAIN_TS_PATH.as_uri()
+    script = f"""
+import('{domain_file_uri}').then(m => {{
+  const arr = Array.from(m.CANONICAL_EVENT_KIND_SET);
+  process.stdout.write(JSON.stringify(arr));
+}}).catch(err => {{
+  console.error(err);
+  process.exit(1);
+}});
+"""
+    proc = subprocess.run(
+        ["node", "--experimental-strip-types"],
+        input=script,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(proc.stdout)
 
 
 def run_node_parse_gmail(
@@ -262,18 +288,18 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertEqual(ev["candidate"]["category"], "Other / Miscellaneous")
         self.assertEqual(ev["candidate"]["status"], "AutoApproved")
 
-    # 15. Malaysia -> event_kind INTERNATIONAL_PURCHASE, category Lab Equipment
+    # 15. Malaysia -> event_kind EXTERNAL_TRANSFER, category Lab Equipment
     def test_15_international_purchase(self) -> None:
         ev = run_node_parse_gmail(
             "Flip Globe: transfer to Malaysia #INT1234567",
             "Transaksi pengiriman dana internasional berhasil.\nJumlah Rp 1.500.000\nPenerima: Universiti Malaya",
         )
-        self.assertEqual(ev["event_kind"], "INTERNATIONAL_PURCHASE")
+        self.assertEqual(ev["event_kind"], "EXTERNAL_TRANSFER")
         self.assertEqual(ev["financial_class"], "Expense")
         self.assertIsNotNone(ev.get("candidate"))
         self.assertEqual(ev["candidate"]["category"], "Lain-lain / Lab Equipment")
 
-    # 16. Refund -> REFUND_REVERSAL, direction Credit, is_reversal True
+    # 16. Refund -> REFUND, direction Credit, is_reversal True
     def test_16_refund(self) -> None:
         ev = run_node_parse_gmail(
             "Refund Transaksi #R12345678",
@@ -281,7 +307,7 @@ class TestFlipParserV2(unittest.TestCase):
         )
         self.assertEqual(ev["financial_class"], "Refund")
         self.assertEqual(ev["financial_direction"], "Credit")
-        self.assertEqual(ev["event_kind"], "REFUND_REVERSAL")
+        self.assertEqual(ev["event_kind"], "REFUND")
         self.assertTrue(ev.get("is_reversal"))
         self.assertEqual(ev["status"], "AutoApproved")
         self.assertIsNotNone(ev.get("candidate"))
@@ -289,13 +315,13 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertEqual(ev["candidate"]["tx_type"], "Reversal")
         self.assertEqual(ev["candidate"]["status"], "AutoApproved")
 
-    # 17. Bulk -> event_kind BULK_TRANSFER
+    # 17. Bulk -> event_kind EXTERNAL_TRANSFER
     def test_17_bulk_transfer(self) -> None:
         ev = run_node_parse_gmail(
             "Kirim uang banyak tujuan #BT12345678",
             "Semua transaksi berhasil diproses.\nJumlah Rp 500.000\nPenerima: Tim Project",
         )
-        self.assertEqual(ev["event_kind"], "BULK_TRANSFER")
+        self.assertEqual(ev["event_kind"], "EXTERNAL_TRANSFER")
         self.assertEqual(ev["financial_class"], "Expense")
         self.assertEqual(ev["status"], "AutoApproved")
 
@@ -396,7 +422,7 @@ class TestFlipParserV2(unittest.TestCase):
             "Pengembalian Dana Transaksi #R87654321",
             "Refund untuk transaksi #R87654321 telah berhasil diproses sebesar Rp 150.000.",
         )
-        self.assertEqual(ev["event_kind"], "REFUND_REVERSAL")
+        self.assertEqual(ev["event_kind"], "REFUND")
         self.assertEqual(ev["financial_class"], "Refund")
         self.assertEqual(ev["financial_direction"], "Credit")
         self.assertTrue(ev["is_reversal"])
@@ -515,11 +541,89 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertEqual(ev["financial_class"], "Refund")
         self.assertTrue(ev["is_reversal"])
         self.assertEqual(ev["financial_direction"], "Credit")
-        self.assertEqual(ev["event_kind"], "REFUND_REVERSAL")
+        self.assertEqual(ev["event_kind"], "REFUND")
         cand = ev.get("candidate")
         self.assertIsNotNone(cand)
         self.assertTrue(cand["is_reversal"])
         self.assertEqual(cand["tx_type"], "Reversal")
+
+    # 36. CANONICAL_EVENT_KIND_SET import and exactly 14 schema values
+    def test_36_canonical_event_kind_set_import_and_schema_values(self) -> None:
+        kinds = run_node_canonical_event_kind_set()
+        expected = {
+            "MERCHANT_PAYMENT",
+            "EXTERNAL_TRANSFER",
+            "INCOMING_TRANSFER",
+            "OWN_TRANSFER",
+            "TOPUP",
+            "CASH_WITHDRAWAL",
+            "ALLOCATION_MOVEMENT",
+            "INVESTMENT_MOVEMENT",
+            "REFUND",
+            "SUBSCRIPTION_CHARGE",
+            "DIGITAL_PURCHASE",
+            "INVOICE_EVIDENCE",
+            "FAILED_ATTEMPT",
+            "NON_TRANSACTION",
+        }
+        self.assertEqual(set(kinds), expected)
+        self.assertEqual(len(kinds), 14)
+
+    # 37. Refund email produces event_kind == "REFUND", is_reversal == True, candidate.is_reversal == True
+    def test_37_refund_schema_properties(self) -> None:
+        ev = run_node_parse_gmail(
+            "Refund Dana Transaksi #R55443322",
+            "Dana transaksi telah dikembalikan ke saldo Anda sebesar Rp 85.000.",
+        )
+        self.assertEqual(ev["event_kind"], "REFUND")
+        self.assertTrue(ev["is_reversal"])
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertTrue(cand["is_reversal"])
+
+    # 38. Malaysia email produces event_kind == "EXTERNAL_TRANSFER", category == "Lain-lain / Lab Equipment"
+    def test_38_malaysia_schema_properties(self) -> None:
+        ev = run_node_parse_gmail(
+            "Flip Globe transfer to Malaysia #INT9876543",
+            "Transaksi pengiriman dana internasional Rp 2.000.000 berhasil kepada Lab Vendor.",
+        )
+        self.assertEqual(ev["event_kind"], "EXTERNAL_TRANSFER")
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand["category"], "Lain-lain / Lab Equipment")
+
+    # 39. Bulk email produces event_kind == "EXTERNAL_TRANSFER", category == "Transfer & Investasi / Transfer ke Teman"
+    def test_39_bulk_schema_properties(self) -> None:
+        ev = run_node_parse_gmail(
+            "Kirim uang banyak tujuan #BT98765432",
+            "Semua transaksi berhasil diproses sebesar Rp 1.000.000.",
+        )
+        self.assertEqual(ev["event_kind"], "EXTERNAL_TRANSFER")
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand["category"], "Transfer & Investasi / Transfer ke Teman")
+
+    # 40. All Flip fixtures conform to CANONICAL_EVENT_KIND_SET
+    def test_40_all_flip_fixtures_in_canonical_event_kind_set(self) -> None:
+        valid_kinds = set(run_node_canonical_event_kind_set())
+        fixtures = [
+            ("Transaksi Berhasil", "Transaksi #FT650581795 selesai.\nJumlah Rp 50.000"),
+            ("QRIS Payment", "Pembayaran ke Cafe #QT-24112621595515247830 Rp 25.000\nPenerima: Cafe"),
+            ("Flip Globe: transfer to Malaysia #INT1234567", "Pengiriman dana berhasil Rp 1.500.000"),
+            ("Refund Transaksi #R12345678", "Dana telah dikembalikan Rp 100.000"),
+            ("Kirim uang banyak tujuan #BT12345678", "Transaksi berhasil Rp 500.000"),
+            ("Koin reward", "#TU123456789 Koin reward"),
+            ("Transaksi Gagal", "TRANSAKSI GAGAL DIPROSES gangguan bank"),
+            ("Halo", "Transfer tanpa kode referensi berhasil Rp 30.000"),
+            ("Info Flip", "Pengguna José 🎉 銀行 berhasil transfer Rp 10.000"),
+        ]
+        for subj, body in fixtures:
+            ev = run_node_parse_gmail(subj, body)
+            self.assertIn(
+                ev["event_kind"],
+                valid_kinds,
+                f"Fixture ({subj}) produced invalid event_kind: {ev.get('event_kind')}",
+            )
 
 
 if __name__ == "__main__":

@@ -755,6 +755,23 @@ export function fnv1a64Hex(input: string): string {
   return hash.toString(16).padStart(16, "0");
 }
 
+export const CANONICAL_EVENT_KIND_SET: ReadonlySet<string> = new Set([
+  "MERCHANT_PAYMENT",
+  "EXTERNAL_TRANSFER",
+  "INCOMING_TRANSFER",
+  "OWN_TRANSFER",
+  "TOPUP",
+  "CASH_WITHDRAWAL",
+  "ALLOCATION_MOVEMENT",
+  "INVESTMENT_MOVEMENT",
+  "REFUND",
+  "SUBSCRIPTION_CHARGE",
+  "DIGITAL_PURCHASE",
+  "INVOICE_EVIDENCE",
+  "FAILED_ATTEMPT",
+  "NON_TRANSACTION",
+]);
+
 // =========================================================================
 // GMAIL TRANSACTION INTELLIGENCE V1 PARSER
 // =========================================================================
@@ -1769,7 +1786,7 @@ export function parseGmailIntelligence(
 
     if (isRefund) {
       financialClass = "Refund";
-      eventKind = "REFUND_REVERSAL";
+      eventKind = "REFUND";
       txType = "Reversal";
       category = "Other / Miscellaneous";
     } else if (isQris) {
@@ -1779,12 +1796,12 @@ export function parseGmailIntelligence(
       category = "Other / Miscellaneous";
     } else if (isInternational) {
       financialClass = "Expense";
-      eventKind = "INTERNATIONAL_PURCHASE";
+      eventKind = "EXTERNAL_TRANSFER";
       txType = "Expense";
       category = "Lain-lain / Lab Equipment";
     } else if (isBulk) {
       financialClass = "Expense";
-      eventKind = "BULK_TRANSFER";
+      eventKind = "EXTERNAL_TRANSFER";
       txType = "Transfer";
       category = "Transfer & Investasi / Transfer ke Teman";
     } else {
@@ -1853,6 +1870,10 @@ export function parseGmailIntelligence(
     const counterpartyNormalized = isQris
       ? (qrisMerchant || "Flip")
       : (destName || "Flip");
+
+    if (!CANONICAL_EVENT_KIND_SET.has(eventKind)) {
+      throw new Error(`Flip parser produced invalid event_kind: ${eventKind}`);
+    }
 
     return {
       event_id: eventId,
