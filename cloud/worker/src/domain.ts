@@ -779,8 +779,7 @@ export function parseEsbReceipt(
   subject: string,
   bodyText: string,
   fromAddress: string,
-  occurredAt?: string,
-  _overrideEventKind?: string
+  occurredAt?: string
 ): CanonicalFinancialEvent {
   const wib = getWibDate(occurredAt ? new Date(occurredAt) : new Date());
   const occurredAtWib = occurredAt || `${wib.dateStr} ${wib.timeStr} WIB`;
@@ -916,7 +915,7 @@ export function parseEsbReceipt(
     merchantNormalized = merchant;
   }
 
-  const eventKind = _overrideEventKind || "MERCHANT_PAYMENT";
+  const eventKind = "MERCHANT_PAYMENT";
   const financialClass = "Expense";
   const financialDirection = "Debit";
 
@@ -936,7 +935,7 @@ export function parseEsbReceipt(
       ? {
           tx_type: "Expense",
           amount,
-          account: "BCA Main",
+          account: null as any,
           to_account: null,
           category: "Other / Miscellaneous",
           money_context: "Personal",

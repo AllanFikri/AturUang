@@ -9,7 +9,7 @@ Requirements:
   T05: Body merchant line matches reject token (Order Details, Customer Name, etc.) -> falls through to subject.
   T06: Body and subject both lack merchant -> status=Pending, destination_owner_type=UNKNOWN, review_reason set, confidence=0.50.
   T07: Amount extraction yields exact decimal, no float artifacts.
-  T08: event_kind guard: invalid event_kind throws "ESB parser produced invalid event_kind: ...".
+  T08: event_kind is canonical MERCHANT_PAYMENT.
   T09: event_id format with order_id -> esb_<ORDER_ID>.
   T10: event_id format without order_id -> esb_noref_<16 hex chars>.
   T11: transaction_reference == order_id and external_order_id == order_id when present; None when absent.
@@ -46,10 +46,8 @@ def run_node_parse_esb(
     body: str,
     from_address: str = "no-reply@mailer-esb.com",
     occurred_at: str = "2026-09-24T12:00:00Z",
-    override_event_kind: str | None = None,
 ) -> dict:
     domain_file_uri = DOMAIN_TS_PATH.as_uri()
-    override_arg = json.dumps(override_event_kind) if override_event_kind is not None else "undefined"
     script = f"""
 import('{domain_file_uri}').then(m => {{
   try {{
@@ -57,8 +55,7 @@ import('{domain_file_uri}').then(m => {{
       {json.dumps(subject)},
       {json.dumps(body)},
       {json.dumps(from_address)},
-      {json.dumps(occurred_at)},
-      {override_arg}
+      {json.dumps(occurred_at)}
     );
     process.stdout.write(JSON.stringify(ev));
   }} catch (err) {{
@@ -182,7 +179,7 @@ class TestEsbParserV1(unittest.TestCase):
         self.assertIsNotNone(res["candidate"])
         self.assertEqual(res["candidate"]["status"], "AutoApproved")
         self.assertEqual(res["candidate"]["tx_type"], "Expense")
-        self.assertEqual(res["candidate"]["account"], "BCA Main")
+        self.assertIsNone(res["candidate"]["account"])
         self.assertEqual(res["candidate"]["category"], "Other / Miscellaneous")
         self.assertEqual(res["candidate"]["money_context"], "Personal")
         self.assertEqual(res["candidate"]["person_name"], "Sushi Tei Grand Indonesia")
@@ -281,7 +278,7 @@ class TestEsbParserV1(unittest.TestCase):
         self.assertEqual(res["amount"], 123456.78)
         self.assertEqual(res["candidate"]["amount"], 123456.78)
 
-    def test_08_event_kind_guard_rejects_invalid_event_kind(self) -> None:
+    def test_08_event_kind_is_canonical(self) -> None:
         body = (
             "*Kopi Kenangan Senopati*\n"
             "Phone Number : 081234567890\n\n"
@@ -291,9 +288,10 @@ class TestEsbParserV1(unittest.TestCase):
             "* Rp 45.000 *\n"
             "Terima kasih atas pesanan Anda di ESB Resto!"
         )
-        with self.assertRaises(ValueError) as ctx:
-            run_node_parse_esb("[E-Receipt] Kopi Kenangan", body, override_event_kind="INVALID_KIND")
-        self.assertIn("ESB parser produced invalid event_kind: INVALID_KIND", str(ctx.exception))
+        res = run_node_parse_esb("[E-Receipt] Kopi Kenangan", body)
+        self.assertEqual(res["event_kind"], "MERCHANT_PAYMENT")
+        canonical_kinds = run_node_canonical_event_kind_set()
+        self.assertIn("MERCHANT_PAYMENT", canonical_kinds)
 
     def test_09_event_id_format_with_order_id(self) -> None:
         body = (
