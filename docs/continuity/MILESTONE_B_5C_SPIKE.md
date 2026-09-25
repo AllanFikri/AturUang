@@ -96,3 +96,27 @@ This spike investigates the architectural integration of the Phase 5C Minimal Se
 - Production DB Hash Before: `8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421`
 - Production DB Hash After: `8afc95829d0fa160b3d34efd6834a98aae6231262683f82ba85f01997c736421`
 - Status: INTACT (Unmodified).
+
+---
+
+## Repair A (2026-09-25)
+
+- R1 result: reverted (.git/info/exclude restored to default state, no line matching ATURUANG_HANDOFF remains).
+- R2 signatures:
+  - `interpret_single_decision(decision: EvidenceMatchDecision, record: SafeEvidenceRecord | None, group: EconomicEventGroup | None) -> SemanticDecision`
+    Docstring: Applies ordered deterministic rules to interpret a single evidence decision.
+    Input structure: Requires dataclass `EvidenceMatchDecision` (fields: `evidence_key: str`, `match_tier: MatchTier`, `match_relation: MatchRelation | None`, `group_key: str | None`, `reason_codes: tuple[MatchReasonCode, ...]`, `is_auto_link_eligible: bool`), optional `SafeEvidenceRecord` (`evidence_key: str`, `source_document_id: str`, `source_registry_id: str`, `event_role: EventRole`, `row_fingerprint: str`, etc.), and optional `EconomicEventGroup` (`group_key: str`, `match_tier: MatchTier`, `match_relation: MatchRelation`, `member_evidence_keys: tuple[str, ...]`, `reason_codes: tuple[MatchReasonCode, ...]`, `is_auto_link_eligible: bool`).
+  - `interpret_evidence_semantics(match_plan: EvidenceMatchPlan, evidence_records: Mapping[str, SafeEvidenceRecord] | Sequence[SafeEvidenceRecord]) -> SemanticInterpretationPlan`
+    Docstring: Interprets validated match plan and evidence records into deterministic semantics.
+    Input structure: Requires dataclass `EvidenceMatchPlan` (`matcher_contract_version: str`, `decisions: tuple[EvidenceMatchDecision, ...]`, `groups: tuple[EconomicEventGroup, ...]`, `diagnostics: tuple[SafeDiagnostic, ...]`), and collection of `SafeEvidenceRecord`.
+  - Matching dependency: Requires Phase 5A matching output first (`R2_REQUIRES_MATCHING=True`). Cannot be constructed from a raw database row alone.
+- R3 example input:
+  - Sanitized valid input constructing `SafeEvidenceRecord` (`evidence_key='a'*64`, `source_document_id='doc-test-001'`, `source_registry_id='reg-test-001'`, `event_role=EventRole.CASH_MOVEMENT`, `row_fingerprint='b'*64`, `amount=Decimal('50000.00')`, `currency='IDR'`, `direction=EventDirection.OUTFLOW`, `status=SourceEventStatus.POSTED`) and `EvidenceMatchDecision` (`evidence_key='a'*64`, `match_tier=MatchTier.UNMATCHED`, `match_relation=None`, `group_key=None`, `reason_codes=()`, `is_auto_link_eligible=False`).
+  - Execution result: Evaluated via `interpret_single_decision` to `SemanticDecision(evidence_key='a'*64, semantic_type=TransactionSemanticType.EXPENSE, source_evidence_keys=('a'*64,), reason_code='UNMATCHED_CASH_OUTFLOW', rule_applied='RULE_8_UNMATCHED_CASH_OUTFLOW', is_confirmed=True)`. Passed all runtime and dataclass validation checks.
+- R4 result: blocked (`SPIKE_BLOCKED_BY_MATCHING_DEPENDENCY=True`, `R4_SPIKE_BLOCKED=True`).
+  - Description: Phase 5C minimal semantics functions operate strictly on Phase 5A matching contract dataclasses (`EvidenceMatchDecision`, `SafeEvidenceRecord`, `EconomicEventGroup`, `EvidenceMatchPlan`) with validated 64-character hex digests and matching enums. They cannot directly process raw database rows or transaction entities.
+  - Recommendation: Wire 5C via lightweight adapter for Quick Capture single transactions (mapping transaction entities to synthetic evidence records and decisions), and wire 5C via matching pipeline for Import Center batch reconciliation. Stopped per instructions; did not proceed to R5.
+- R5 mismatch: N/A/20 (Blocked by matching dependency; real 5C API was not invoked on raw DB rows due to input type incompatibility, and fabricated classifiers are strictly prohibited).
+- R5 examples: NONE
+- Difference from previous S5: In the initial spike (commit 4ee6e93), S5 reported an 8/20 mismatch count produced by a fabricated keyword heuristic script located in a scratch file outside the repository, rather than calling the authoritative Phase 5C API. In Repair A, direct inspection and execution of the genuine Phase 5C module (`aturuang/ingestion_semantics.py`) proves that its public API exclusively consumes Phase 5A matching structures (`EvidenceMatchDecision`, `EvidenceMatchPlan`, `SafeEvidenceRecord`) and cannot ingest raw database rows. Because fabricating a surrogate classifier violates fail-closed rules and real 5C requires upstream matching data, the original S5 metric was invalid and has been superseded by the discovery of the matching dependency block.
+
