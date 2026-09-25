@@ -1640,19 +1640,99 @@ export function parseGmailIntelligence(
   // -----------------------------------------------------------------------
   // 3. FLIP (no-reply@flip.id)
   // -----------------------------------------------------------------------
+  function sha256(ascii: string): string {
+    function rightRotate(value: number, amount: number): number {
+      return (value >>> amount) | (value << (32 - amount));
+    }
+    const mathPow = Math.pow;
+    const maxWord = mathPow(2, 32);
+    let i: number, j: number;
+    let result = "";
+    const words: number[] = [];
+    const asciiBitLength = ascii.length * 8;
+    const hash: number[] = [];
+    const k: number[] = [];
+    let primeCounter = 0;
+
+    const isComposite: Record<number, number> = {};
+    for (let candidate = 2; primeCounter < 64; candidate++) {
+      if (!isComposite[candidate]) {
+        for (i = 0; i < 313; i += candidate) {
+          isComposite[i] = candidate;
+        }
+        hash[primeCounter] = (mathPow(candidate, 0.5) * maxWord) | 0;
+        k[primeCounter++] = (mathPow(candidate, 1 / 3) * maxWord) | 0;
+      }
+    }
+
+    ascii += "\x80";
+    while (ascii.length % 64 - 56) ascii += "\x00";
+    for (i = 0; i < ascii.length; i++) {
+      j = ascii.charCodeAt(i);
+      if (j >> 8) return "";
+      words[i >> 2] |= j << ((3 - (i % 4)) * 8);
+    }
+    words[words.length] = (asciiBitLength / maxWord) | 0;
+    words[words.length] = asciiBitLength | 0;
+
+    for (j = 0; j < words.length; ) {
+      const w = words.slice(j, (j += 16));
+      const oldHash = hash.slice();
+
+      for (i = 0; i < 64; i++) {
+        const w15 = w[i - 15],
+          w2 = w[i - 2];
+        const a = hash[0],
+          e = hash[4];
+        const temp1 =
+          hash[7] +
+          (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25)) +
+          ((e & hash[5]) ^ (~e & hash[6])) +
+          k[i] +
+          ((w[i] =
+            i < 16
+              ? w[i]
+              : (w[i - 16] +
+                  (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3)) +
+                  w[i - 7] +
+                  (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))) |
+                0) |
+            0);
+        const temp2 =
+          (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22)) +
+          ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+
+        hash.unshift((temp1 + temp2) | 0);
+        hash[4] = (hash[4] + temp1) | 0;
+      }
+
+      for (i = 0; i < 8; i++) {
+        hash[i] = (hash[i] + oldHash[i]) | 0;
+      }
+    }
+
+    for (i = 0; i < 8; i++) {
+      for (let i2 = 3; i2 >= 0; i2--) {
+        const b = (hash[i] >> (i2 * 8)) & 255;
+        result += (b < 16 ? "0" : "") + b.toString(16);
+      }
+    }
+    return result;
+  }
+
   function extractFlipReferenceId(
     subject: string,
     body: string
   ): { id: string | null; kind: string | null } {
     const combined = (subject || "") + "\n" + (body || "");
     const patterns = [
-      { regex: /#FT\d{9}/i,        kind: "flip_transfer" },
-      { regex: /#W\d{9}/i,         kind: "flip_transfer_digital" },
-      { regex: /#R\d{8}/i,         kind: "flip_transfer_or_refund" },
-      { regex: /#INT\d{7}/i,       kind: "flip_international" },
-      { regex: /#BT\d{8}/i,        kind: "flip_bulk" },
-      { regex: /#QT-\d{20}/i,      kind: "flip_qris" },
-      { regex: /\bFT\d{9}\b/i,   kind: "flip_fallback" },
+      { regex: /#FT\d{9}/i, kind: "flip_transfer" },
+      { regex: /#W\d{9}/i, kind: "flip_transfer_digital" },
+      { regex: /#R\d{8}/i, kind: "flip_transfer_or_refund" },
+      { regex: /#INT\d{7}/i, kind: "flip_international" },
+      { regex: /#BT\d{8}/i, kind: "flip_bulk" },
+      { regex: /#QT-\d{20}/i, kind: "flip_qris" },
+      { regex: /\bFT\d{9}\b/i, kind: "flip_fallback" },
     ];
     for (const p of patterns) {
       const m = combined.match(p.regex);
@@ -1665,14 +1745,13 @@ export function parseGmailIntelligence(
     // 1. Blacklist check BEFORE any parsing
     const isCoinReward = /#TU\d{9}/i.test(subject + bodyText);
     const isMarketingSubject =
-      /Koin|Coin|Cashback|Pemenang|Pemeliharaan|expired|sure you use saldo|Flip Coins will expire/i
-        .test(subject || "") ||
-      /sure you use saldo|Flip Coins will expire/i.test(bodyText || "");
+      /Koin|Coin|Cashback|Pemenang|Pemeliharaan|expired|sure you use saldo|Flip Coins will expire/i.test(
+        subject || ""
+      ) || /sure you use saldo|Flip Coins will expire/i.test(bodyText || "");
     const isMarketingSender =
       cleanFrom.includes("hello@flip.id") ||
       cleanFrom.includes("hello@mail.flip.id");
-    const isFailedAttempt =
-      /TRANSAKSI GAGAL DIPROSES/i.test(bodyText || "");
+    const isFailedAttempt = /TRANSAKSI GAGAL DIPROSES/i.test(bodyText || "");
 
     if (isCoinReward || isMarketingSubject || isMarketingSender || isFailedAttempt) {
       return {
@@ -1698,8 +1777,7 @@ export function parseGmailIntelligence(
         transaction_reference: null,
         external_order_id: null,
         confidence: 0.95,
-        recommended_action:
-          "Keep as lifecycle evidence; zero ledger mutation",
+        recommended_action: "Keep as lifecycle evidence; zero ledger mutation",
         review_reason: isFailedAttempt
           ? "Flip failed transfer; no completed charge."
           : "Flip non-transaction notice.",
@@ -1709,23 +1787,25 @@ export function parseGmailIntelligence(
     }
 
     // 2. Extract reference ID multi-format
-    const { id: refId, kind: refKind } =
-      extractFlipReferenceId(subject || "", bodyText || "");
+    const { id: refId, kind: refKind } = extractFlipReferenceId(
+      subject || "",
+      bodyText || ""
+    );
 
     // 3. Extract amount
     const amount =
-      parseIndonesianAmount(bodyText) ||
-      parseIndonesianAmount(subject) ||
-      0;
+      parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
 
-    // 4. Extract destination (strict regex, no over-capture)
+    // 4. Extract destination / merchant (strict regex, no over-capture)
     const destMatch = bodyText.match(
       /(?:destination name|recipient name|penerima|atas nama)\s*[\r\n:]+\s*([^\r\n]{3,60})/i
     );
     const destName = destMatch ? destMatch[1].trim() : null;
 
     // 5. Detect refund / bulk / qris / international
-    const isRefund = /refund/i.test(subject || "");
+    const isRefund =
+      /refund|pengembalian dana/i.test(subject || "") ||
+      /refund|pengembalian dana/i.test(bodyText || "");
     const isBulk =
       refKind === "flip_bulk" || /banyak tujuan/i.test(subject || "");
     const isQris =
@@ -1734,6 +1814,15 @@ export function parseGmailIntelligence(
       refKind === "flip_international" ||
       /transfer to Malaysia|Flip Globe/i.test(subject || "");
 
+    // QRIS merchant extraction (A2_QRIS_HYBRID)
+    let qrisMerchant: string | null = null;
+    if (isQris) {
+      const qrisMatch = bodyText.match(
+        /(?:merchant(?:\s*name)?|penerima|kepada|atas nama|destination name|recipient name)\s*[\r\n:]+\s*([^\r\n]{3,60})/i
+      );
+      qrisMerchant = qrisMatch ? qrisMatch[1].trim() : null;
+    }
+
     // 6. Classify
     let financialClass: string;
     let eventKind: string;
@@ -1741,15 +1830,15 @@ export function parseGmailIntelligence(
     let category: string;
 
     if (isRefund) {
-      financialClass = "Ignore";
-      eventKind = "REFUND_NOTICE";
-      txType = "Review";
+      financialClass = "Expense";
+      eventKind = "REFUND_REVERSAL";
+      txType = "Reversal";
       category = "Other / Miscellaneous";
     } else if (isQris) {
       financialClass = "Expense";
       eventKind = "MERCHANT_PAYMENT";
       txType = "Expense";
-      category = "Makanan & Minuman / Cafe & Minuman";
+      category = "Other / Miscellaneous";
     } else if (isInternational) {
       financialClass = "Expense";
       eventKind = "INTERNATIONAL_PURCHASE";
@@ -1767,36 +1856,73 @@ export function parseGmailIntelligence(
       category = "Transfer & Investasi / Transfer ke Teman";
     }
 
-    // 7. Build candidate (null for refund, null for zero amount)
+    // Status & confidence determination
+    let status: "Pending" | "AutoApproved" = "Pending";
+    let confidence = 0.75;
+
+    if (isRefund) {
+      status = refId ? "AutoApproved" : "Pending";
+      confidence = refId ? 0.95 : 0.75;
+    } else if (isQris) {
+      if (!qrisMerchant) {
+        status = "Pending";
+        confidence = 0.60;
+      } else {
+        status = refId ? "AutoApproved" : "Pending";
+        confidence = refId ? 0.95 : 0.75;
+      }
+    } else {
+      status = refId ? "AutoApproved" : "Pending";
+      confidence = refId ? 0.95 : 0.75;
+    }
+
+    // 7. Build candidate (A1_REFUND_IS_REVERSAL: refund creates candidate with is_reversal: true)
     const cand: ParsedCandidate | null =
-      amount > 0 && !isRefund
-        ? {
+      amount > 0
+        ? ({
             tx_type: txType as any,
             amount,
             account: "BCA Main",
             to_account: null,
             category,
             money_context: "Personal",
-            person_name: destName,
+            person_name: isQris ? qrisMerchant : destName,
             date: wib.dateStr,
             time: wib.timeStr,
-            confidence_score: refId ? 0.95 : 0.75,
+            confidence_score: confidence,
             reasons: refId
               ? `Flip: ${eventKind} (${refId})${
-                  destName ? " ke " + destName : ""
+                  (isQris ? qrisMerchant : destName)
+                    ? " ke " + (isQris ? qrisMerchant : destName)
+                    : ""
                 }.`
               : `Flip: ${eventKind} tanpa ID referensi.`,
-            status: refId ? "AutoApproved" : "Pending",
-          }
+            status,
+            ...(isRefund ? { is_reversal: true } : {}),
+          } as any)
         : null;
 
+    // A3 & A4: Event ID formatting
+    // A3: No '#' symbol in event_id for referenced events
+    // A4: Stable hash without Date.now() for unreferenced events
+    const eventId = refId
+      ? `flip_${refId.replace(/^#/, "")}`
+      : `flip_noref_${sha256(
+          (subject || "") + "\n" + (bodyText || "") + "\n" + occurredAtWib
+        ).slice(0, 16)}`;
+
+    const merchantNormalized = isQris ? (qrisMerchant || "Flip") : "Flip";
+    const counterpartyNormalized = isQris
+      ? (qrisMerchant || "Flip")
+      : (destName || "Flip");
+
     return {
-      event_id: refId ? `flip_${refId}` : `flip_${Date.now()}`,
+      event_id: eventId,
       occurred_at_wib: occurredAtWib,
-      status: refId && !isRefund ? "AutoApproved" : "Pending",
+      status,
       event_kind: eventKind as any,
       financial_class: financialClass as any,
-      financial_direction: isRefund ? "Neutral" : "Debit",
+      financial_direction: isRefund ? "Credit" : "Debit",
       amount,
       currency: "IDR",
       fee_amount: 0,
@@ -1804,30 +1930,27 @@ export function parseGmailIntelligence(
       destination_account_alias: null,
       destination_owner_type: isRefund
         ? "SELF"
-        : destName
-        ? "OTHER_PERSON"
-        : "UNKNOWN",
-      merchant_normalized: isQris ? destName : "Flip",
+        : (isQris ? (qrisMerchant ? "MERCHANT" : "UNKNOWN") : (destName ? "OTHER_PERSON" : "UNKNOWN")),
+      merchant_normalized: merchantNormalized,
       merchant_pan: null,
       merchant_location: null,
-      counterparty_normalized: destName || "Flip",
-      description_normalized: `Flip ${eventKind}${
-        refId ? " " + refId : ""
-      }`,
+      counterparty_normalized: counterpartyNormalized,
+      description_normalized: `Flip ${eventKind}${refId ? " " + refId : ""}`,
       transaction_reference: refId,
       external_order_id: refId,
-      confidence: refId ? 0.95 : 0.75,
+      confidence,
       recommended_action: isRefund
-        ? "Correlate refund with original transaction via reference ID"
+        ? "Record Flip refund reversal; correlate with original debit"
         : "Record Flip transaction; dedup by reference ID",
-      review_reason: refId
-        ? isRefund
-          ? "Refund notice; reversal handled by correlation."
-          : null
-        : "Flip transaction without extractable reference ID.",
-      evidence_role: isRefund ? "LIFECYCLE_STATUS" : "PRIMARY_PAYMENT",
+      review_reason: !refId
+        ? "Flip transaction without extractable reference ID."
+        : isQris && !qrisMerchant
+        ? "Flip QRIS payment without extractable merchant name."
+        : null,
+      evidence_role: "PRIMARY_PAYMENT",
       candidate: cand,
-    };
+      ...(isRefund ? { is_reversal: true } : {}),
+    } as any;
   }
 
   // -----------------------------------------------------------------------

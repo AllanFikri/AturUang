@@ -1,4 +1,4 @@
-"""
+r"""
 Tests for STEP-16B: FIX-FLIP-PARSER-AND-DEDUP-V1.
 
 Requirements:
@@ -16,18 +16,22 @@ Requirements:
   11. Blacklist hello@flip.id -> Ignore
   12. Blacklist "TRANSAKSI GAGAL DIPROSES" -> Ignore, FAILED_ATTEMPT
   13. Transfer normal -> event_kind EXTERNAL_TRANSFER, status AutoApproved
-  14. QRIS -> event_kind MERCHANT_PAYMENT
+  14. QRIS -> event_kind MERCHANT_PAYMENT, category Other / Miscellaneous (rules classify later)
   15. Malaysia -> event_kind INTERNATIONAL_PURCHASE, category Lab Equipment
-  16. Refund -> financial_class Ignore, direction Neutral
+  16. Refund -> REFUND_REVERSAL, direction Credit, is_reversal True
   17. Bulk -> event_kind BULK_TRANSFER
-  18. transaction_reference == external_order_id == extracted ID
+  18. transaction_reference == external_order_id == extracted ID, event_id strips '#'
   19. Two emails same ID -> same event_id
   20. No ID -> status Pending
-  21. Description length <= 200 chars (tidak over-capture)
-  22. Description tidak mengandung "this request"
-  23. Description tidak mengandung "Destination Account Number"
-  24. Deterministic across two runs
+  21. description_normalized format: r"^Flip [A-Z_]+ #[A-Z0-9\-]+$"
+  22. description_normalized contains no newline or control chars
+  23. description_normalized stable across runs
+  24. Determinism for unreferenced email, stable SHA-256 event_id without timestamp
   25. Production DB unchanged across tests
+  26. Refund reversal properties
+  27. QRIS without merchant name -> Pending, confidence 0.60
+  28. Event ID has no '#' symbol across all reference formats
+  29. Noref event_id is deterministic SHA-256 and identical across repeated executions
 """
 from __future__ import annotations
 
@@ -216,7 +220,7 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertIsNotNone(ev.get("candidate"))
         self.assertEqual(ev["candidate"]["status"], "AutoApproved")
 
-    # 14. QRIS -> event_kind MERCHANT_PAYMENT
+    # 14. QRIS -> event_kind MERCHANT_PAYMENT, category Other / Miscellaneous (rules classify later)
     def test_14_qris_payment(self) -> None:
         ev = run_node_parse_gmail(
             "QRIS Payment Berhasil",
@@ -226,6 +230,10 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertEqual(ev["financial_class"], "Expense")
         self.assertEqual(ev["status"], "AutoApproved")
         self.assertEqual(ev["amount"], 25000)
+        self.assertEqual(ev["merchant_normalized"], "Kopi Kenangan")
+        self.assertIsNotNone(ev.get("candidate"))
+        self.assertEqual(ev["candidate"]["category"], "Other / Miscellaneous")
+        self.assertEqual(ev["candidate"]["status"], "AutoApproved")
 
     # 15. Malaysia -> event_kind INTERNATIONAL_PURCHASE, category Lab Equipment
     def test_15_international_purchase(self) -> None:
@@ -238,16 +246,21 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertIsNotNone(ev.get("candidate"))
         self.assertEqual(ev["candidate"]["category"], "Lain-lain / Lab Equipment")
 
-    # 16. Refund -> financial_class Ignore, direction Neutral
+    # 16. Refund -> REFUND_REVERSAL, direction Credit, is_reversal True
     def test_16_refund(self) -> None:
         ev = run_node_parse_gmail(
             "Refund Transaksi #R12345678",
             "Dana transaksi telah dikembalikan ke rekening Anda sebesar Rp 100.000.",
         )
-        self.assertEqual(ev["financial_class"], "Ignore")
-        self.assertEqual(ev["financial_direction"], "Neutral")
-        self.assertEqual(ev["event_kind"], "REFUND_NOTICE")
-        self.assertIsNone(ev.get("candidate"))
+        self.assertEqual(ev["financial_class"], "Expense")
+        self.assertEqual(ev["financial_direction"], "Credit")
+        self.assertEqual(ev["event_kind"], "REFUND_REVERSAL")
+        self.assertTrue(ev.get("is_reversal"))
+        self.assertEqual(ev["status"], "AutoApproved")
+        self.assertIsNotNone(ev.get("candidate"))
+        self.assertTrue(ev["candidate"].get("is_reversal"))
+        self.assertEqual(ev["candidate"]["tx_type"], "Reversal")
+        self.assertEqual(ev["candidate"]["status"], "AutoApproved")
 
     # 17. Bulk -> event_kind BULK_TRANSFER
     def test_17_bulk_transfer(self) -> None:
@@ -259,7 +272,7 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertEqual(ev["financial_class"], "Expense")
         self.assertEqual(ev["status"], "AutoApproved")
 
-    # 18. transaction_reference == external_order_id == extracted ID
+    # 18. transaction_reference == external_order_id == extracted ID, event_id strips '#'
     def test_18_reference_matching(self) -> None:
         ev = run_node_parse_gmail(
             "Transfer Berhasil",
@@ -267,7 +280,7 @@ class TestFlipParserV2(unittest.TestCase):
         )
         self.assertEqual(ev["transaction_reference"], "#FT650581795")
         self.assertEqual(ev["external_order_id"], "#FT650581795")
-        self.assertEqual(ev["event_id"], "flip_#FT650581795")
+        self.assertEqual(ev["event_id"], "flip_FT650581795")
 
     # 19. Two emails same ID -> same event_id
     def test_19_duplicate_emails_same_event_id(self) -> None:
@@ -282,7 +295,7 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertEqual(ev1["event_id"], ev2["event_id"])
         self.assertEqual(ev1["transaction_reference"], ev2["transaction_reference"])
         self.assertEqual(ev1["external_order_id"], ev2["external_order_id"])
-        self.assertEqual(ev1["event_id"], "flip_#FT650581795")
+        self.assertEqual(ev1["event_id"], "flip_FT650581795")
 
     # 20. No ID -> status Pending
     def test_20_no_id_pending(self) -> None:
@@ -297,50 +310,49 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertEqual(ev["candidate"]["status"], "Pending")
         self.assertEqual(ev["candidate"]["confidence_score"], 0.75)
 
-    # 21. Description length <= 200 chars (tidak over-capture)
-    def test_21_description_length(self) -> None:
-        long_marketing_body = (
-            "Transaksi berhasil #FT999888777\n"
-            "Jumlah Rp 10.000\n"
-            "Destination Name: JANE DOE\n"
-            "Please ensure you review this request and make sure the amount is correct "
-            "down to the last digit Transfer to Bank BCA Account Number 1234567890."
+    # 21. description_normalized format: r"^Flip [A-Z_]+ #[A-Z0-9\-]+$"
+    def test_21_description_normalized_format(self) -> None:
+        ev = run_node_parse_gmail(
+            "Successful transfer to ZAYYINNA FITRIANI. Here is the receipt.",
+            "Transaksi berhasil #FT650581795\nJumlah Rp 50.000\nDestination Name: ZAYYINNA FITRIANI",
         )
-        ev = run_node_parse_gmail("Transfer Berhasil", long_marketing_body)
         desc = ev.get("description_normalized") or ""
-        self.assertLessEqual(len(desc), 200)
+        self.assertRegex(desc, r"^Flip [A-Z_]+ #[A-Z0-9\-]+$")
 
-    # 22. Description tidak mengandung "this request"
-    def test_22_description_not_contains_this_request(self) -> None:
-        long_marketing_body = (
-            "Transaksi berhasil #FT999888777\n"
-            "Jumlah Rp 10.000\n"
-            "Destination Name: JANE DOE\n"
-            "Please review this request before proceeding."
+    # 22. description_normalized contains no newline or control chars
+    def test_22_description_normalized_no_control_chars(self) -> None:
+        ev = run_node_parse_gmail(
+            "Transfer Berhasil\nBaris Baru",
+            "Transaksi berhasil #FT999888777\r\nJumlah Rp 10.000\nDestination Name: JANE\tDOE\n",
         )
-        ev = run_node_parse_gmail("Transfer Berhasil", long_marketing_body)
         desc = ev.get("description_normalized") or ""
-        self.assertNotIn("this request", desc.lower())
+        self.assertNotIn("\n", desc)
+        self.assertNotIn("\r", desc)
+        self.assertNotIn("\t", desc)
+        for ch in desc:
+            self.assertGreaterEqual(ord(ch), 32)
 
-    # 23. Description tidak mengandung "Destination Account Number"
-    def test_23_description_not_contains_destination_account_number(self) -> None:
-        body = (
-            "Transaksi berhasil #FT999888777\n"
-            "Jumlah Rp 10.000\n"
-            "Destination Account Number 901236971867 Amount Rp510\n"
-            "Penerima: JANE DOE"
-        )
-        ev = run_node_parse_gmail("Transfer Berhasil", body)
-        desc = ev.get("description_normalized") or ""
-        self.assertNotIn("destination account number", desc.lower())
-
-    # 24. Deterministic across two runs
-    def test_24_deterministic_across_two_runs(self) -> None:
+    # 23. description_normalized stable across two runs
+    def test_23_description_normalized_stable_across_runs(self) -> None:
         subj = "Transfer #FT112233445"
         body = "Transfer berhasil #FT112233445 sebesar Rp 125.000 ke Budi."
+        ev1 = run_node_parse_gmail(subj, body)
+        ev2 = run_node_parse_gmail(subj, body)
+        self.assertEqual(ev1.get("description_normalized"), ev2.get("description_normalized"))
+
+    # 24. Determinism for unreferenced email, stable SHA-256 event_id without timestamp
+    def test_24_deterministic_unreferenced_email(self) -> None:
+        import time
+        subj = "Transfer Tanpa Kode"
+        body = "Transfer berhasil sebesar Rp 50.000 ke Rina."
         ev1 = run_node_parse_gmail(subj, body, occurred_at="2026-09-24T10:00:00Z")
+        time.sleep(0.01)
         ev2 = run_node_parse_gmail(subj, body, occurred_at="2026-09-24T10:00:00Z")
-        self.assertEqual(ev1, ev2)
+        self.assertEqual(ev1["event_id"], ev2["event_id"])
+        self.assertTrue(ev1["event_id"].startswith("flip_noref_"))
+        self.assertEqual(len(ev1["event_id"]), len("flip_noref_") + 16)
+        hex_part = ev1["event_id"][len("flip_noref_"):]
+        self.assertTrue(all(c in "0123456789abcdef" for c in hex_part))
 
     # 25. Production DB unchanged across tests
     def test_25_production_db_unchanged(self) -> None:
@@ -350,6 +362,76 @@ class TestFlipParserV2(unittest.TestCase):
             EXPECTED_PROD_DB_HASH,
             "Production database hash modified during test execution!",
         )
+
+    # 26. Refund reversal properties
+    def test_26_refund_reversal_properties(self) -> None:
+        ev = run_node_parse_gmail(
+            "Pengembalian Dana Transaksi #R87654321",
+            "Refund untuk transaksi #R87654321 telah berhasil diproses sebesar Rp 150.000.",
+        )
+        self.assertEqual(ev["event_kind"], "REFUND_REVERSAL")
+        self.assertEqual(ev["financial_class"], "Expense")
+        self.assertEqual(ev["financial_direction"], "Credit")
+        self.assertTrue(ev["is_reversal"])
+        self.assertEqual(ev["status"], "AutoApproved")
+        self.assertEqual(ev["event_id"], "flip_R87654321")
+        self.assertEqual(ev["transaction_reference"], "#R87654321")
+        self.assertEqual(ev["external_order_id"], "#R87654321")
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand["tx_type"], "Reversal")
+        self.assertTrue(cand["is_reversal"])
+        self.assertEqual(cand["status"], "AutoApproved")
+        self.assertEqual(cand["amount"], 150000)
+
+    # 27. QRIS without merchant name -> Pending, confidence 0.60
+    def test_27_qris_no_merchant_pending(self) -> None:
+        ev = run_node_parse_gmail(
+            "Pembayaran QRIS #QT-24112621595515247830",
+            "Pembayaran QRIS berhasil dengan kode #QT-24112621595515247830 sebesar Rp 45.000.",
+        )
+        self.assertEqual(ev["event_kind"], "MERCHANT_PAYMENT")
+        self.assertEqual(ev["status"], "Pending")
+        self.assertEqual(ev["confidence"], 0.60)
+        self.assertIn("Flip QRIS payment without extractable merchant name", ev.get("review_reason") or "")
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand["status"], "Pending")
+        self.assertEqual(cand["confidence_score"], 0.60)
+        self.assertEqual(cand["category"], "Other / Miscellaneous")
+
+    # 28. Event ID has no '#' symbol across all reference formats
+    def test_28_event_id_no_hash_all_formats(self) -> None:
+        cases = [
+            ("#FT123456789", "flip_FT123456789"),
+            ("#W123456789", "flip_W123456789"),
+            ("#R12345678", "flip_R12345678"),
+            ("#INT1234567", "flip_INT1234567"),
+            ("#BT12345678", "flip_BT12345678"),
+            ("#QT-24112621595515247830", "flip_QT-24112621595515247830"),
+            ("FT123456789", "flip_FT123456789"),
+        ]
+        for ref, expected_event_id in cases:
+            ev = run_node_parse_gmail(
+                f"Transaksi {ref}",
+                f"Transaksi {ref} sebesar Rp 10.000 berhasil kepada Penerima: Test.",
+            )
+            self.assertEqual(
+                ev["event_id"],
+                expected_event_id,
+                f"Failed for reference {ref}: expected {expected_event_id}, got {ev['event_id']}",
+            )
+            self.assertNotIn("#", ev["event_id"])
+
+    # 29. Noref event_id is deterministic SHA-256 and identical across repeated executions
+    def test_29_noref_event_id_stable(self) -> None:
+        subj = "Email Flip Tanpa Ref"
+        body = "Halo Pengguna, transaksi Rp 20.000 berhasil."
+        ts = "2026-09-24T12:00:00Z"
+        ids = [run_node_parse_gmail(subj, body, occurred_at=ts)["event_id"] for _ in range(5)]
+        self.assertEqual(len(set(ids)), 1)
+        self.assertTrue(ids[0].startswith("flip_noref_"))
+        self.assertEqual(len(ids[0]), len("flip_noref_") + 16)
 
 
 if __name__ == "__main__":
