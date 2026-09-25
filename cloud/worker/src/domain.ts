@@ -772,6 +772,19 @@ export const CANONICAL_EVENT_KIND_SET: ReadonlySet<string> = new Set([
   "NON_TRANSACTION",
 ]);
 
+export const OWNER_NAMES: ReadonlySet<string> = new Set([
+  "ALLAN FIKRI MAHARDIKA SANTOSA",
+]);
+
+export function normalizeOwnerName(name?: string | null): string {
+  if (!name) return "";
+  return name
+    .toUpperCase()
+    .replace(/[^A-Z0-9\s]/g, "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
 // -------------------------------------------------------------------------
 // ESB E-Receipt Parser (no-reply@mailer-esb.com)
 // -------------------------------------------------------------------------
@@ -1919,8 +1932,21 @@ export function parseGmailIntelligence(
       cleanFrom.includes("hello@flip.id") ||
       cleanFrom.includes("hello@mail.flip.id");
     const isFailedAttempt = /TRANSAKSI GAGAL DIPROSES/i.test(bodyText || "");
+    const isSecurityAlert =
+      /another device|new device|login to your account|change your password|security alert/i.test(
+        subject || ""
+      ) ||
+      /a new device is trying to login|another device is trying to login/i.test(
+        bodyText || ""
+      );
 
-    if (isCoinReward || isMarketingSubject || isMarketingSender || isFailedAttempt) {
+    if (
+      isCoinReward ||
+      isMarketingSubject ||
+      isMarketingSender ||
+      isFailedAttempt ||
+      isSecurityAlert
+    ) {
       return {
         event_id: `flip_skip_${occurredAtWib.replace(/[^0-9]/g, "")}`,
         occurred_at_wib: occurredAtWib,
@@ -1964,10 +1990,27 @@ export function parseGmailIntelligence(
       parseIndonesianAmount(bodyText) || parseIndonesianAmount(subject) || 0;
 
     // 4. Extract destination / merchant (strict regex, no over-capture)
-    const destMatch = bodyText.match(
+    const bodyToSearch = (bodyText || "") + "\n";
+    let destinationNameRaw: string | null = null;
+    const destNameMatch = bodyToSearch.match(
+      /Destination Name\s*[\r\n]+\s*(.+?)\s*[\r\n]/i
+    );
+    if (destNameMatch) {
+      destinationNameRaw = destNameMatch[1].trim();
+    } else {
+      const beneMatch = bodyToSearch.match(
+        /Beneficiary Name\s*[\r\n]+\s*(.+?)\s*[\r\n]/i
+      );
+      if (beneMatch) {
+        destinationNameRaw = beneMatch[1].trim();
+      }
+    }
+
+    const fallbackDestMatch = bodyText.match(
       /(?:destination name|recipient name|penerima|atas nama)\s*[\r\n:]+\s*([^\r\n]{3,60})/i
     );
-    const destName = destMatch ? destMatch[1].trim() : null;
+    const destName = destinationNameRaw || (fallbackDestMatch ? fallbackDestMatch[1].trim() : null);
+    const destinationNameNormalized = normalizeOwnerName(destName);
 
     // 5. Detect refund / bulk / qris / international
     const isRefund =
@@ -1980,6 +2023,11 @@ export function parseGmailIntelligence(
     const isInternational =
       refKind === "flip_international" ||
       /transfer to Malaysia|Flip Globe/i.test(subject || "");
+    const isSelf =
+      !isRefund &&
+      !isQris &&
+      destinationNameNormalized !== "" &&
+      OWNER_NAMES.has(destinationNameNormalized);
 
     // QRIS merchant extraction (A2_QRIS_HYBRID)
     let qrisMerchant: string | null = null;
@@ -2006,6 +2054,11 @@ export function parseGmailIntelligence(
       eventKind = "MERCHANT_PAYMENT";
       txType = "Expense";
       category = "Other / Miscellaneous";
+    } else if (isSelf) {
+      financialClass = "Internal Transfer";
+      eventKind = "OWN_TRANSFER";
+      txType = "Transfer";
+      category = "Transfer & Investasi / Transfer ke Teman";
     } else if (isInternational) {
       financialClass = "Expense";
       eventKind = "EXTERNAL_TRANSFER";
@@ -2093,13 +2146,13 @@ export function parseGmailIntelligence(
       status,
       event_kind: eventKind as any,
       financial_class: financialClass as any,
-      financial_direction: isRefund ? "Credit" : "Debit",
+      financial_direction: isRefund ? "Credit" : (isSelf ? "Neutral" : "Debit"),
       amount,
       currency: "IDR",
       fee_amount: 0,
       source_account_alias: "BCA Main",
       destination_account_alias: null,
-      destination_owner_type: isRefund
+      destination_owner_type: isRefund || isSelf
         ? "SELF"
         : (isQris ? (qrisMerchant ? "MERCHANT" : "UNKNOWN") : (destName ? "OTHER_PERSON" : "UNKNOWN")),
       merchant_normalized: merchantNormalized,
