@@ -226,3 +226,24 @@ The project must remain continuable across new ChatGPT/GPT conversations
 without relying on hidden chat memory.
 
 Logs must never contain secrets or unnecessary personal financial data.
+
+## ADR-022 - Archive Orphan Modules (5C, 5D, Stage 8)
+
+Date: 2026-09-25
+Status: Accepted
+
+Context:
+Three modules were detected as orphan (0 non-test caller) during V2.1 audit and confirmed during Milestone B spike.
+
+Decision:
+Archive (delete from working tree, restore via git if needed).
+
+Rationale:
+- 5C exposes only 6 semantic classes (not the 16 planned in Grand Design Appendix A). Wiring requires Phase 5A matching pipeline (4-7 day effort) for marginal gain over existing heuristics.
+- 5D has no production caller; import_center.py uses a rows // 2 placeholder.
+- Stage 8 is functionally covered by safe_apply.py + review_queue_ui.py.
+- Total ~1,550 lines of dead code removed.
+
+Consequences:
+Restore via `git checkout <sha>:<path>` if needed. Reconciliation gap (rows // 2) remains open; tracked as backlog item.
+
