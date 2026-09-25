@@ -26,12 +26,18 @@ Requirements:
   21. description_normalized format: r"^Flip [A-Z_]+ #[A-Z0-9\-]+$"
   22. description_normalized contains no newline or control chars
   23. description_normalized stable across runs
-  24. Determinism for unreferenced email, stable SHA-256 event_id without timestamp
+  24. Determinism for unreferenced email, stable FNV-1a64Hex event_id without timestamp
   25. Production DB unchanged across tests
   26. Refund reversal properties
   27. QRIS without merchant name -> Pending, confidence 0.60
   28. Event ID has no '#' symbol across all reference formats
-  29. Noref event_id is deterministic SHA-256 and identical across repeated executions
+  29. Noref event_id is deterministic FNV-1a64Hex and identical across repeated executions
+  30. fnv1a64Hex stable across two runs for same input, differs for different inputs
+  31. fnv1a64Hex handles empty string and ASCII (hello world)
+  32. fnv1a64Hex handles Unicode: "José 🎉 銀行"
+  33. No-ref Flip email with Unicode body produces event_id != 'flip_noref_' and length >= 27
+  34. Two no-ref Flip emails with different Unicode bodies produce different event_id
+  35. Refund Flip email has financial_class == "Refund", is_reversal == True, financial_direction == "Credit"
 """
 from __future__ import annotations
 
@@ -79,6 +85,27 @@ process.stdout.write(JSON.stringify(res));
         check=True,
     )
     return json.loads(proc.stdout)
+
+
+def run_node_fnv1a64_hex(text: str) -> str:
+    domain_file_uri = DOMAIN_TS_PATH.as_uri()
+    script = f"""
+import('{domain_file_uri}').then(m => {{
+  const h = m.fnv1a64Hex({json.dumps(text)});
+  process.stdout.write(h);
+}}).catch(err => {{
+  console.error(err);
+  process.exit(1);
+}});
+"""
+    proc = subprocess.run(
+        ["node", "--experimental-strip-types"],
+        input=script,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip()
 
 
 def run_node_parse_gmail(
@@ -252,7 +279,7 @@ class TestFlipParserV2(unittest.TestCase):
             "Refund Transaksi #R12345678",
             "Dana transaksi telah dikembalikan ke rekening Anda sebesar Rp 100.000.",
         )
-        self.assertEqual(ev["financial_class"], "Expense")
+        self.assertEqual(ev["financial_class"], "Refund")
         self.assertEqual(ev["financial_direction"], "Credit")
         self.assertEqual(ev["event_kind"], "REFUND_REVERSAL")
         self.assertTrue(ev.get("is_reversal"))
@@ -370,7 +397,7 @@ class TestFlipParserV2(unittest.TestCase):
             "Refund untuk transaksi #R87654321 telah berhasil diproses sebesar Rp 150.000.",
         )
         self.assertEqual(ev["event_kind"], "REFUND_REVERSAL")
-        self.assertEqual(ev["financial_class"], "Expense")
+        self.assertEqual(ev["financial_class"], "Refund")
         self.assertEqual(ev["financial_direction"], "Credit")
         self.assertTrue(ev["is_reversal"])
         self.assertEqual(ev["status"], "AutoApproved")
@@ -423,7 +450,7 @@ class TestFlipParserV2(unittest.TestCase):
             )
             self.assertNotIn("#", ev["event_id"])
 
-    # 29. Noref event_id is deterministic SHA-256 and identical across repeated executions
+    # 29. Noref event_id is deterministic FNV-1a64Hex and identical across repeated executions
     def test_29_noref_event_id_stable(self) -> None:
         subj = "Email Flip Tanpa Ref"
         body = "Halo Pengguna, transaksi Rp 20.000 berhasil."
@@ -432,6 +459,67 @@ class TestFlipParserV2(unittest.TestCase):
         self.assertEqual(len(set(ids)), 1)
         self.assertTrue(ids[0].startswith("flip_noref_"))
         self.assertEqual(len(ids[0]), len("flip_noref_") + 16)
+
+    # 30. fnv1a64Hex stable across two runs for same input, differs for different inputs
+    def test_30_fnv1a64_hex_stability_and_difference(self) -> None:
+        h1 = run_node_fnv1a64_hex("test input string")
+        h2 = run_node_fnv1a64_hex("test input string")
+        h3 = run_node_fnv1a64_hex("different input string")
+        self.assertEqual(h1, h2)
+        self.assertNotEqual(h1, h3)
+
+    # 31. fnv1a64Hex handles empty string and ASCII (hello world)
+    def test_31_fnv1a64_hex_empty_and_ascii(self) -> None:
+        h_empty = run_node_fnv1a64_hex("")
+        self.assertEqual(len(h_empty), 16)
+        self.assertNotEqual(h_empty, "")
+        self.assertTrue(all(c in "0123456789abcdef" for c in h_empty))
+
+        h_ascii = run_node_fnv1a64_hex("hello world")
+        self.assertEqual(len(h_ascii), 16)
+        self.assertTrue(all(c in "0123456789abcdef" for c in h_ascii))
+
+    # 32. fnv1a64Hex handles Unicode: "José 🎉 銀行"
+    def test_32_fnv1a64_hex_unicode(self) -> None:
+        unicode_str = "José 🎉 銀行"
+        h_unicode = run_node_fnv1a64_hex(unicode_str)
+        self.assertEqual(len(h_unicode), 16)
+        self.assertNotEqual(h_unicode, "")
+        self.assertTrue(all(c in "0123456789abcdef" for c in h_unicode))
+        h_ascii = run_node_fnv1a64_hex("hello world")
+        self.assertNotEqual(h_unicode, h_ascii)
+
+    # 33. No-ref Flip email with Unicode body produces event_id != 'flip_noref_' and length >= 27
+    def test_33_noref_unicode_event_id_format(self) -> None:
+        ev = run_node_parse_gmail("Flip Info", "Terima kasih José 🎉 銀行 telah bertransaksi.")
+        event_id = ev.get("event_id") or ""
+        self.assertNotEqual(event_id, "flip_noref_")
+        self.assertGreaterEqual(len(event_id), 27)
+        self.assertTrue(event_id.startswith("flip_noref_"))
+        hex_suffix = event_id[len("flip_noref_"):]
+        self.assertEqual(len(hex_suffix), 16)
+        self.assertTrue(all(c in "0123456789abcdef" for c in hex_suffix))
+
+    # 34. Two no-ref Flip emails with different Unicode bodies produce different event_id
+    def test_34_two_noref_different_unicode_produce_different_event_id(self) -> None:
+        ev1 = run_node_parse_gmail("Info Flip", "Pengguna José 🎉 銀行 berhasil transfer Rp 10.000")
+        ev2 = run_node_parse_gmail("Info Flip", "Pengguna Kopi ☕ & Roti 🍞 berhasil transfer Rp 10.000")
+        self.assertNotEqual(ev1["event_id"], ev2["event_id"])
+
+    # 35. Refund Flip email has financial_class == "Refund", is_reversal == True, financial_direction == "Credit"
+    def test_35_refund_financial_class_reversal_direction(self) -> None:
+        ev = run_node_parse_gmail(
+            "Refund Transaksi Flip #R99887766",
+            "Dana transaksi pengembalian telah diproses Rp 250.000.",
+        )
+        self.assertEqual(ev["financial_class"], "Refund")
+        self.assertTrue(ev["is_reversal"])
+        self.assertEqual(ev["financial_direction"], "Credit")
+        self.assertEqual(ev["event_kind"], "REFUND_REVERSAL")
+        cand = ev.get("candidate")
+        self.assertIsNotNone(cand)
+        self.assertTrue(cand["is_reversal"])
+        self.assertEqual(cand["tx_type"], "Reversal")
 
 
 if __name__ == "__main__":
