@@ -24,6 +24,7 @@ SOURCE_MAP = {
     "shopeepay_ocr":      Path(r"H:\My Drive\Money Tracks\Mutasi ShopeePay"),
     "jago_statement":     Path(r"H:\My Drive\Money Tracks\Mutasi Rekening Jago"),
     "seabank_statement":  Path(r"H:\My Drive\Money Tracks\Mutasi Seabank"),
+    "bca_statement":      Path(r"H:\My Drive\Money Tracks\Mutasi Rekening BCA"),
 }
 
 # Alias untuk user-friendly CLI
@@ -31,6 +32,7 @@ SOURCE_ALIAS = {
     "shopeepay": "shopeepay_ocr",
     "jago": "jago_statement",
     "seabank": "seabank_statement",
+    "bca": "bca_statement",
 }
 
 
@@ -180,7 +182,7 @@ def cmd_status(con):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Preview tanpa pindah file")
-    parser.add_argument("--source", type=str, choices=["shopeepay", "jago", "seabank", "all"], help="Source tertentu")
+    parser.add_argument("--source", type=str, choices=["shopeepay", "jago", "seabank", "bca", "all"], help="Source tertentu")
     parser.add_argument("--status", action="store_true", help="Lihat status root vs archive")
     args = parser.parse_args()
     
