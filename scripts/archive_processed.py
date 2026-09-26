@@ -1,4 +1,4 @@
-﻿"""
+"""
 archive_processed.py — pindahkan file yang sudah diproses ke folder _archive.
 
 Cara kerja:
@@ -21,9 +21,16 @@ from pathlib import Path
 DB = Path(r"C:\A User Main Storage\Documents\GitHub\AturUang-activation-v1\runtime\money_tracks.db")
 
 SOURCE_MAP = {
-    "shopeepay": Path(r"H:\My Drive\Money Tracks\Mutasi ShopeePay"),
-    "jago":      Path(r"H:\My Drive\Money Tracks\Mutasi Rekening Jago"),
-    "seabank":   Path(r"H:\My Drive\Money Tracks\Mutasi Seabank"),
+    "shopeepay_ocr":      Path(r"H:\My Drive\Money Tracks\Mutasi ShopeePay"),
+    "jago_statement":     Path(r"H:\My Drive\Money Tracks\Mutasi Rekening Jago"),
+    "seabank_statement":  Path(r"H:\My Drive\Money Tracks\Mutasi Seabank"),
+}
+
+# Alias untuk user-friendly CLI
+SOURCE_ALIAS = {
+    "shopeepay": "shopeepay_ocr",
+    "jago": "jago_statement",
+    "seabank": "seabank_statement",
 }
 
 
@@ -173,7 +180,7 @@ def cmd_status(con):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Preview tanpa pindah file")
-    parser.add_argument("--source", type=str, choices=list(SOURCE_MAP.keys()) + ["all"], help="Source tertentu")
+    parser.add_argument("--source", type=str, choices=["shopeepay", "jago", "seabank", "all"], help="Source tertentu")
     parser.add_argument("--status", action="store_true", help="Lihat status root vs archive")
     args = parser.parse_args()
     
@@ -185,7 +192,9 @@ def main():
         if args.source == "all" or not args.source:
             sources = list(SOURCE_MAP.keys())
         else:
-            sources = [args.source]
+            # Terjemahkan alias (shopeepay -> shopeepay_ocr)
+            key = SOURCE_ALIAS.get(args.source, args.source)
+            sources = [key]
         cmd_archive(con, sources=sources, dry_run=args.dry_run)
     
     con.close()
