@@ -34,6 +34,15 @@ WATCH_FOLDERS = [
         "auto_apply": True,
     },
     {
+        "path": Path(r"H:\My Drive\Money Tracks\Mutasi Rekening BCA"),
+        "patterns": ["3680432880_*.pdf"],
+        "source_type": "bca_statement",
+        "parser": "bca_reparse_v2.py",
+        "parser_args": ["--apply"],
+        "manual_command": "python scripts\\bca_reparse_v2.py --apply",
+        "destructive": False,
+    },
+    {
         "path": Path(r"H:\My Drive\Money Tracks\Mutasi Rekening Jago"),
         "patterns": ["Jago_monthly_statement_*.pdf"],
         "source_type": "jago_statement",
