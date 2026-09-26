@@ -2932,6 +2932,23 @@ function renderReports() {
     )
     .join('');
 
+  // V3-STEP-104: Lifetime / period total row
+  const sumIncome = dataList.reduce((a, x) => a + (Number(x.income) || 0), 0);
+  const sumExpense = dataList.reduce((a, x) => a + (Number(x.expense) || 0), 0);
+  const sumSurplus = dataList.reduce((a, x) => a + (Number(x.surplus) || 0), 0);
+  const sumResearch = dataList.reduce((a, x) => a + (Number(x.research) || 0), 0);
+  const sumProvisional = dataList.reduce((a, x) => a + (Number(x.provisional) || 0), 0);
+  const totalRowLabel = pKind === 'yearly' ? 'TOTAL SEMUA TAHUN' : pKind === 'trimester' ? 'TOTAL SEMUA PERIODE' : 'TOTAL SEMUA BULAN';
+  $('reportMonthlyFooter').innerHTML =
+    `<tr style="font-weight:700;border-top:2px solid var(--border);background:rgba(255,255,255,0.02)">
+      <td><b>${totalRowLabel}</b></td>
+      <td class="amount good">${money(sumIncome)}</td>
+      <td class="amount bad">${money(sumExpense)}</td>
+      <td class="amount ${sumSurplus >= 0 ? 'good' : 'bad'}">${money(sumSurplus)}</td>
+      <td class="amount">${money(sumResearch)}</td>
+      <td class="amount warn">${money(sumProvisional)}</td>
+    </tr>`;
+
   // Financial Health Indicators & Daily Pulse (Gaya Jago / myBCA / Jenius)
   const totalInc = dataList.reduce((acc, x) => acc + x.income, 0);
   const totalExp = dataList.reduce((acc, x) => acc + x.expense, 0);
