@@ -19,13 +19,17 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from aturuang.ingestion_bridge import process_single_file
 
 from aturuang.import_center import ImportCenterManager, ImportBatch, ImportBatchItem
 from aturuang.review_queue_ui import ReviewQueueManager, ReviewItem
 
 DEFAULT_WATCHED_ROOT = Path(os.getenv("ATURUANG_WATCHED_FOLDER_PATH", r"H:\My Drive\Money Tracks"))
-SUPPORTED_EXTENSIONS = frozenset({".csv", ".pdf"})
+SUPPORTED_EXTENSIONS = frozenset({".csv", ".pdf", ".jpg"})
+BRIDGE_SUPPORTED_PROVIDERS = frozenset({"bca", "jago", "blu", "gopay", "seabank", "shopeepay"})
 MAX_WATCHED_FILE_SIZE = 50 * 1024 * 1024  # 50 MB safety limit to prevent OOM / DoS
 
 PROVIDER_SUBFOLDER_RULES: list[tuple[str, str]] = [
@@ -257,6 +261,44 @@ class WatchedFolderScanner:
                 continue
 
             provider = resolve_provider_from_path(rel_path)
+
+            if os.getenv("ATURUANG_USE_BRIDGE") == "1" and provider in BRIDGE_SUPPORTED_PROVIDERS:
+                from aturuang.ingestion_bridge import process_single_file
+
+                result = process_single_file(str(self.db_path), str(file_path), provider, dry_run=False)
+                for err in result.get("errors", []):
+                    diagnostics.append(sanitize_diagnostics(f"BRIDGE_ERROR: {err}"))
+                for diag in result.get("diagnostics", []):
+                    if isinstance(diag, dict):
+                        diagnostics.append(sanitize_diagnostics(f"BRIDGE_DIAG: {diag.get('code')}: {diag.get('message')}"))
+                    else:
+                        diagnostics.append(sanitize_diagnostics(str(diag)))
+
+                items_queued_for_file = result.get("queued", 0)
+                items_applied = result.get("applied", 0)
+                batch_id = f"bridge_{file_hash[:16]}"
+                batch_status = (
+                    "APPLIED"
+                    if items_applied > 0 and items_queued_for_file == 0
+                    else "PARTIAL"
+                    if items_applied > 0
+                    else "REVIEW_REQUIRED"
+                    if items_queued_for_file > 0
+                    else "SKIPPED"
+                )
+                self.record_processed_file(
+                    file_hash=file_hash,
+                    filename=file_path.name,
+                    relative_path=str(rel_path),
+                    provider=provider,
+                    batch_id=batch_id,
+                    status=batch_status,
+                    item_count=items_queued_for_file + items_applied,
+                )
+                new_files_count += 1
+                self.processed_count += 1
+                total_items_queued += items_queued_for_file
+                continue
 
             try:
                 batch = self.import_manager.process_batch(
