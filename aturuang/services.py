@@ -2274,6 +2274,7 @@ def report_data(con: sqlite3.Connection, month: str | None = None) -> dict:
                     """SELECT COALESCE(SUM(amount),0) FROM transactions
                        WHERE substr(date,1,7)=? AND transaction_type='Income' AND money_context='Personal'
                          AND status<>'Provisional Neutral' AND is_deleted=0
+                         AND COALESCE(exclude_from_budget,0)=0
                          AND description NOT LIKE '[Rekonsiliasi]%'""",
                     (m,),
                 ).fetchone()[0]
